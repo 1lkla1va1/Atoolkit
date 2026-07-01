@@ -1244,7 +1244,7 @@ if __name__ == "__main__":
     # 焊进真实失败模式：frontmatter target 是完整 URL(含 host:port)、无 CELL 行、
     # type 用带空格的复合写法(`越权 / IDOR`、`任意文件上传`)；seed 矩阵行用相对路径。
     # 修复前：① host 没剥 → endpoint 永远配不上相对路径种子行；② 类名带空格/同义词对不齐 → 命中 0。
-    st_d = CognitiveState(sid="d", target="http://t.example:9000")
+    st_d = CognitiveState(sid="d", target="http://test.linglongsec.com:9000")
     seed_eps = ["/api/user-info", "/api/pull-content", "/api/upload-image",
                 "/api/get-users", "/api/system-log", "/api/update-bug-status",
                 "/api/my-bugs/{id}"]
@@ -1252,14 +1252,14 @@ if __name__ == "__main__":
     total_before = len(st_d.matrix)
     real_reports = [
         # (target 完整 URL, type 复合带空格, 期望命中的列名)
-        ("http://t.example:9000/api/user-info",       "越权 / IDOR",           "越权/IDOR"),
-        ("http://t.example:9000/api/pull-content",    "SSRF / 未授权内网访问",  "SSRF"),
-        ("http://t.example:9000/api/upload-image",    "任意文件上传",          "文件读取/穿越"),
-        ("http://t.example:9000/api/upload-image",    "存储型 XSS / 任意文件上传", "XSS"),
-        ("http://t.example:9000/api/update-bug-status", "越权 / 业务逻辑",      "越权/IDOR"),
-        ("http://t.example:9000/api/get-users",       "未授权访问 / 敏感信息泄露", "未授权访问"),
-        ("http://t.example:9000/api/my-bugs/123",     "越权 / IDOR",           "越权/IDOR"),
-        ("http://t.example:9000/api/system-log",      "越权 / 敏感信息泄露",    "越权/IDOR"),
+        ("http://test.linglongsec.com:9000/api/user-info",       "越权 / IDOR",           "越权/IDOR"),
+        ("http://test.linglongsec.com:9000/api/pull-content",    "SSRF / 未授权内网访问",  "SSRF"),
+        ("http://test.linglongsec.com:9000/api/upload-image",    "任意文件上传",          "文件读取/穿越"),
+        ("http://test.linglongsec.com:9000/api/upload-image",    "存储型 XSS / 任意文件上传", "XSS"),
+        ("http://test.linglongsec.com:9000/api/update-bug-status", "越权 / 业务逻辑",      "越权/IDOR"),
+        ("http://test.linglongsec.com:9000/api/get-users",       "未授权访问 / 敏感信息泄露", "未授权访问"),
+        ("http://test.linglongsec.com:9000/api/my-bugs/123",     "越权 / IDOR",           "越权/IDOR"),
+        ("http://test.linglongsec.com:9000/api/system-log",      "越权 / 敏感信息泄露",    "越权/IDOR"),
     ]
     hit = 0
     for tgt, typ, _expect in real_reports:

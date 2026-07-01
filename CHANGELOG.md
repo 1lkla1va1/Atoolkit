@@ -66,14 +66,15 @@
 
 ## v2.6 — 2026-06-24
 
-首次在真实授权靶场验证逼出的改动：**`run.py` 支持 Bearer 鉴权**。
+首次接触真实授权靶场（linglongsec SRC 平台）逼出的改动：**`run.py` 支持 Bearer 鉴权**。
 
 - 真实靶场用 `Authorization: Bearer <JWT>`，原 `run.py` 只接 `--cookie`。新增 `--bearer`（会话凭据）与 `--auth-scheme {cookie,bearer}`（复验身份凭据注入方式）。
 - 复验身份按 scheme 构造 `{"Authorization": "Bearer …"}` 或 `{"Cookie": …}`，对接 verify.py 的 AUTH_HEADERS 剥离。
-- 实测验证 NEED_INPUT 协议生效：靶场 JWT 为短时效 access token，过期即 `401 Token has expired`，外壳停手要新凭据（不伪造、不自登）。
-- 实测验证 L8 越界-host 拦截：报告 host 不在授权列表 → rejected。
-- 接口面经 recon 抽取后进入待测清单（越权重点按参数/角色语义推断风险标签）。
+- 实测验证 NEED_INPUT 协议生效：靶场 JWT 为 15min 时效 access token，过期即 `401 Token has expired`，外壳停手要新凭据（不伪造、不自登）。
+- 实测验证 L8 越界-host 拦截：报告 host 不在授权列表 → rejected（dry-run 对真 target 复现）。
+- 已从靶场 JS 块挖出接口面（越权重点）：get-users/sub-users/approve-user/update-bug-status/system-log/addresses/my-bugs/user-info…
 
+> 待新鲜 token 到位即可对 §9 九条清单实跑。建议提供两个账号 token 以做 verify_idor 水平越权复验。
 
 ---
 
