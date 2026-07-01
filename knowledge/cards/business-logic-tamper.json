@@ -1,0 +1,32 @@
+{
+  "id": "business-logic-tamper",
+  "title": "业务逻辑篡改",
+  "description": "覆盖金额、库存、优惠、积分、抽奖、退款、回调等跨步骤业务一致性风险。",
+  "match": {
+    "vuln_classes": ["业务逻辑"],
+    "params": ["amount", "price", "refund_amount", "use_points", "discount", "coupon", "quantity", "balance", "stock", "order_time", "callback", "recharge", "lottery", "probability"],
+    "keywords": ["refund", "payment", "points", "coupon", "recharge", "lottery"]
+  },
+  "dimensions": [
+    "客户端可控字段与服务端计算结果是否一致",
+    "跨步骤状态流转是否只能由服务端可信事件推进",
+    "重复提交、取消、退款、回调之间是否存在状态竞争",
+    "优惠、库存、积分、余额是否以服务端账本为准"
+  ],
+  "false_negative_rules": [
+    "只覆盖正常下单链路不能证明负向充分",
+    "只看 HTTP 状态码不能证明账本状态未变",
+    "只测单个金额或单个库存边界不能覆盖业务规则"
+  ],
+  "evidence_required": [
+    "baseline",
+    "variant_result",
+    "server_state",
+    "final_accounting"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 4,
+    "min_response_count": 2,
+    "required_evidence_types": ["baseline", "variant_result", "server_state"]
+  }
+}

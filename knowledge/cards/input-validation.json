@@ -1,0 +1,32 @@
+{
+  "id": "input-validation",
+  "title": "输入校验",
+  "description": "覆盖搜索、排序、过滤、分页、类型转换、边界值和服务端错误处理。",
+  "match": {
+    "vuln_classes": ["SQLi", "XSS", "SSRF"],
+    "params": ["keyword", "search", "q", "sort", "orderBy", "filter", "page", "size", "type", "status", "url", "path"],
+    "keywords": ["search", "query", "filter", "sort", "orderby", "keyword"]
+  },
+  "dimensions": [
+    "输入类型、长度、字符类别和枚举范围是否由服务端校验",
+    "排序、过滤、分页字段是否使用服务端固定字段集",
+    "错误响应是否稳定且不泄露内部实现",
+    "同一参数在列表、详情、导出链路中的校验是否一致"
+  ],
+  "false_negative_rules": [
+    "只测正常输入不能证明输入校验闭合",
+    "只看页面无报错不能证明后端处理稳定",
+    "只测一个参数不能覆盖同类入口的校验差异"
+  ],
+  "evidence_required": [
+    "baseline",
+    "boundary_result",
+    "type_result",
+    "error_handling"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 3,
+    "min_response_count": 2,
+    "required_evidence_types": ["baseline", "boundary_result", "type_result"]
+  }
+}

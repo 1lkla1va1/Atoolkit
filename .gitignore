@@ -1,0 +1,17 @@
+# 运行期产物（每次会话隔离的证据/临时目录，不入库）
+runs/
+*.session.json
+
+# graphify 内部增量状态（产物 graph.* / GRAPH_REPORT.md 保留入库）
+knowledge-base/graphify-out/cache/
+knowledge-base/graphify-out/.graphify_*
+
+# python
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
+
+# 临时抽取产物
+*_extract.txt

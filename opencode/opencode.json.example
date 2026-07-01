@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "//instructions": "opencode 自动读取 AGENTS.md；此处显式列出以防自动发现失效。可指向项目根或全局副本。",
+  "instructions": ["AGENTS.md"],
+
+  "//permission": "硬约束地板（替代 Codex 沙箱）。opencode 没有出站 host 白名单，授权范围仍需外壳/代理收口。",
+  "permission": {
+    "//bash": "对 shell 命令默认要人确认，让危险/越界命令有人工闸（等价 Codex approval=on-failure 的兜底意图）。",
+    "bash": "ask",
+    "//edit": "测试目录内允许改写（落盘证据/报告到 runs/）；如担心误写源码可改为 ask。",
+    "edit": "allow",
+    "//webfetch": "SRC 必须联网发包；webfetch/网络型工具放行。注意这≠host 白名单，越界靠外壳/代理拦。",
+    "webfetch": "allow"
+  },
+
+  "//model": "换模型只改这里（具体可选模型以你的 opencode provider 配置为准）。",
+  "model": "anthropic/claude-opus-4-8"
+}
