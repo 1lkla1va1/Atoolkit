@@ -97,6 +97,65 @@ def extract_poc(report_md: str) -> Request | None:
     return None
 
 
+def extract_poc_from_file(path: str | pathlib.Path) -> Request | None:
+    """从 curl 脚本或 raw HTTP 文件中抽出第一条请求。"""
+    import pathlib as _pathlib
+
+    text = _pathlib.Path(path).read_text(encoding="utf-8", errors="ignore")
+    if "curl" in text:
+        lines = []
+        capture = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if "curl" in stripped:
+                capture = True
+            if capture:
+                lines.append(stripped.rstrip("\\").strip())
+                if not stripped.endswith("\\"):
+                    break
+        if lines:
+            return parse_curl(" ".join(lines))
+    m = re.search(r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)\s+HTTP/", text, re.I | re.M)
+    if not m:
+        return None
+    req = Request(m.group(1).upper(), m.group(2))
+    for header, value in re.findall(r"^([A-Za-z-]+):\s*(.+)$", text, re.M):
+        req.headers[header] = value.strip()
+    host = req.headers.get("Host", "")
+    if host and req.url.startswith("/"):
+        req.url = "https://" + host + req.url
+    sep = "\r\n\r\n" if "\r\n\r\n" in text else "\n\n"
+    if sep in text and req.method.upper() not in ("GET", "HEAD", "OPTIONS"):
+        req.body = text.split(sep, 1)[1]
+    return req
+
+
+def extract_poc_from_finding(finding: dict, finding_dir: str | pathlib.Path) -> Request | None:
+    """优先从 finding.poc.file 抽 PoC，失败时回退 proof_packets[].request_file。"""
+    import pathlib as _pathlib
+
+    fdir = _pathlib.Path(finding_dir).resolve()
+    run_dir = fdir.parents[1] if fdir.parent.name == "findings" and len(fdir.parents) > 1 else fdir.parent
+    try:
+        from engine.reporting.schema import resolve_finding_file
+    except ImportError:
+        from reporting.schema import resolve_finding_file
+
+    poc = finding.get("poc") if isinstance(finding.get("poc"), dict) else {}
+    if poc.get("file"):
+        req = extract_poc_from_file(resolve_finding_file(fdir, poc.get("file"), run_dir))
+        if req:
+            return req
+    for packet in finding.get("proof_packets") or []:
+        if isinstance(packet, dict) and packet.get("request_file"):
+            req = extract_poc_from_file(resolve_finding_file(fdir, packet.get("request_file"), run_dir))
+            if req:
+                return req
+    return None
+
+
 # ── Transport：真实(urllib) 与 测试(mock)────────────────────────────────
 def urllib_transport(req: Request) -> Response:
     t0 = time.time()

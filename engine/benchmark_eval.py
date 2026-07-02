@@ -110,6 +110,35 @@ def _path_without_query(endpoint: str) -> str:
     return _strip_base(endpoint).split("#", 1)[0].split("?", 1)[0].rstrip("/") or "/"
 
 
+# ── 占位符归一化（镜像 orchestrator._norm_path 的 ID 段折叠语义）──────────────
+# 把路径分段里的「ID-like 段」折叠成 {}，使 oracle 抽象行 /api/orders/{id} 与报告
+# 具体 id 形态 /api/orders/1001 同格匹配。语义段（detail/list/info/login 等）不折叠
+# ——/api/order/detail 不会误命中 /api/orders/{id}。仅作 _endpoint_match 的额外 match
+# 路径（OR），不改写 oracle/finding 的真实 endpoint 文案，不影响 exact/endswith。
+_BEC_UUID_RE = re.compile(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+    r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+_BEC_HEXID_RE = re.compile(r'^[0-9a-fA-F]{12,}$')        # 长十六进制 id（mongo ObjectId 等）
+_BEC_PLACEHOLDER_RE = re.compile(r'^[\{<].*[\}>]$')      # 已是占位符 {id} / <id>
+
+
+def _norm_path_placeholders(endpoint: str) -> str:
+    """剥 query 后，把路径分段中的 ID-like 段（纯数字 / uuid / 长hex / {..}<..> 占位符）
+    折叠成 {}。语义段不折叠，防空端点/语义段误匹配。"""
+    path = _path_without_query(endpoint)
+    segs: list[str] = []
+    for seg in path.split("/"):
+        if seg == "":
+            segs.append(seg)
+            continue
+        if (seg.isdigit() or _BEC_UUID_RE.match(seg) or _BEC_HEXID_RE.match(seg)
+                or _BEC_PLACEHOLDER_RE.match(seg)):
+            segs.append("{}")
+        else:
+            segs.append(seg)
+    return "/".join(segs)
+
+
 def _endpoint_match(expected: str, observed: str) -> bool:
     exp = _path_without_query(expected)
     obs = _path_without_query(observed)
@@ -117,12 +146,15 @@ def _endpoint_match(expected: str, observed: str) -> bool:
         return False
     if exp == obs:
         return True
-    return obs.endswith(exp) or exp.endswith(obs)
+    if obs.endswith(exp) or exp.endswith(obs):
+        return True
+    # 占位符归一匹配：/api/orders/1001 ↔ /api/orders/{id}（ID 段折叠成 {}）。
+    return _norm_path_placeholders(expected) == _norm_path_placeholders(observed)
 
 
 def _extract_endpoint_fragments(text: str) -> list[str]:
     fragments: list[str] = []
-    for match in re.finditer(r"(?:https?://[^\s'\"<>]+|/[A-Za-z0-9_./%?=&:+-]+)", text or ""):
+    for match in re.finditer(r"(?:https?://[^\s'\"<>]+|/[A-Za-z0-9_./%?=&:+{}-]+)", text or ""):
         fragments.append(_strip_base(match.group(0).rstrip(".,，。)）]】")))
     return fragments
 

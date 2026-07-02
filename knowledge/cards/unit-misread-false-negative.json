@@ -1,0 +1,33 @@
+{
+  "id": "unit-misread-false-negative",
+  "title": "单位误读误判",
+  "description": "金额或数量单位换算误判为阴性；需按多单位与服务端账本交叉核对。",
+  "match": {
+    "vuln_classes": ["业务逻辑"],
+    "params": ["amount", "price", "refund_amount", "use_points", "discount", "coupon", "quantity", "balance", "stock", "recharge", "probability"],
+    "keywords": ["amount", "price", "quantity", "refund", "discount", "coupon", "balance", "stock", "recharge", "points", "unit"]
+  },
+  "dimensions": [
+    "金额或数量是否按最小单位与最大单位分别换算核对",
+    "客户端单位与服务端账本单位是否一致",
+    "小数位、精度、舍入是否以服务端账本为准",
+    "负数、零、超大值是否按业务单位正确归账"
+  ],
+  "false_negative_rules": [
+    "单一单位读数不能证明金额或数量逻辑闭合",
+    "客户端单位不等于服务端账本单位，需多单位交叉核对",
+    "只看 HTTP 状态码不能证明账本状态未变"
+  ],
+  "evidence_required": [
+    "unit_normalization",
+    "baseline",
+    "variant_result",
+    "server_state",
+    "final_accounting"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 4,
+    "min_response_count": 2,
+    "required_evidence_types": ["unit_normalization", "server_state", "final_accounting"]
+  }
+}

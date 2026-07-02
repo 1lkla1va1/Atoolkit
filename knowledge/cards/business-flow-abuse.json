@@ -1,0 +1,38 @@
+{
+  "id": "business-flow-abuse",
+  "title": "业务流程滥用",
+  "description": "覆盖多步状态流转（下单→支付→退款→取消；注册→验证→登录→重置）中的状态依赖、顺序绕过、并发竞争与跨步骤一致性问题。payload-free，只列状态依赖证据要求。",
+  "match": {
+    "vuln_classes": ["业务逻辑", "认证绕过/枚举"],
+    "endpoints": ["order", "pay", "refund", "cancel", "recharge", "register", "login", "reset", "verify", "callback", "notify"],
+    "keywords": ["refund", "cancel", "pay", "recharge", "callback", "notify", "state", "status", "transition", "flow", "order"]
+  },
+  "dimensions": [
+    "跨步骤状态流转是否只能由服务端可信事件推进（不可跳步/回退）",
+    "取消已退款单、退款已取消单等逆序操作是否被服务端拒绝",
+    "并发提交（支付+取消、重复退款）是否存在竞争窗口",
+    "回调/通知的状态校验是否依赖客户端可控字段"
+  ],
+  "false_negative_rules": [
+    "只覆盖正常下单链路不能证明状态流转闭合",
+    "只测单步骤不能证明跨步骤状态依赖安全",
+    "只看 HTTP 状态码不能证明业务状态未非法变更",
+    "不测并发/逆序不能证明竞争与回退安全"
+  ],
+  "evidence_required": [
+    "baseline_flow",
+    "state_transition_proof",
+    "server_state_check",
+    "concurrency_probe"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 4,
+    "min_response_count": 2,
+    "required_evidence_types": ["baseline_flow", "state_transition_proof", "server_state_check"]
+  },
+  "positive_depth_floor": {
+    "min_depth": 2,
+    "min_vectors": 3,
+    "note": "流程滥用：≥3 状态依赖向量（逆序/跳步/并发/回调篡改），达 depth_score 2 才许 proof_ready"
+  }
+}

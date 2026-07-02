@@ -20,23 +20,48 @@ engine/orchestrator.py —— 模型无关编排外壳的心脏。
 """
 from __future__ import annotations
 import re, time, json, pathlib
+from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict, fields
 from typing import Iterator, Protocol
 
 try:                                  # 支持「脚本直跑」与「包内导入」两种方式
-    from enforce import (guardian_check, triage, extract_executed_cmds,
+    from enforce import (guardian_check, guardian_check_finding, triage, extract_executed_cmds,
                          classify_action, is_authorized_host, finalize,
                          ACCEPTED, BLOCK, CONFIRM)
     from ledger import CoverageLedger, derive_coverage, surfaces_from_legacy_cell
-    from knowledge import load_cards, match_cards, render_skill_hint, resolve_negative_state
+    from knowledge import (load_cards, match_cards, render_skill_hint, resolve_negative_state,
+                           negative_sufficient, positive_depth_floor_for, risk_dimensions_for)
     from session_gate import evaluate_session_gate
+    from dedupe import aggregate_findings
+    from surface import extract_endpoint_paths, is_saturated
+    from planner import HIGH_VALUE_TAGS, plan_surfaces
+    from reporting.collect import collect_structured_findings
+    from reporting.render_md import render_final_report, render_coverage_gaps
+    from candidate import (CandidateLedger, parse_candidate_lines, parse_triage_lines,
+                           parse_reprobe_lines, parse_spread_lines, compute_depth_score,
+                           recompute_depth_score, compute_coverage_gaps, coverage_gaps_nonempty,
+                           top_work_queue, render_dimension_checklist, render_work_queue,
+                           render_proof_ready_block, PROPOSED, TRIAGING, PROOF_READY,
+                           CONFIRMED, REFUTED, BLOCKED, DUPLICATE)
 except ImportError:
-    from engine.enforce import (guardian_check, triage, extract_executed_cmds,
+    from engine.enforce import (guardian_check, guardian_check_finding, triage, extract_executed_cmds,
                                 classify_action, is_authorized_host, finalize,
                                 ACCEPTED, BLOCK, CONFIRM)
     from engine.ledger import CoverageLedger, derive_coverage, surfaces_from_legacy_cell
-    from engine.knowledge import load_cards, match_cards, render_skill_hint, resolve_negative_state
+    from engine.knowledge import (load_cards, match_cards, render_skill_hint, resolve_negative_state,
+                                  negative_sufficient, positive_depth_floor_for, risk_dimensions_for)
     from engine.session_gate import evaluate_session_gate
+    from engine.dedupe import aggregate_findings
+    from engine.surface import extract_endpoint_paths, is_saturated
+    from engine.planner import HIGH_VALUE_TAGS, plan_surfaces
+    from engine.reporting.collect import collect_structured_findings
+    from engine.reporting.render_md import render_final_report, render_coverage_gaps
+    from engine.candidate import (CandidateLedger, parse_candidate_lines, parse_triage_lines,
+                                  parse_reprobe_lines, parse_spread_lines, compute_depth_score,
+                                  recompute_depth_score, compute_coverage_gaps, coverage_gaps_nonempty,
+                                  top_work_queue, render_dimension_checklist, render_work_queue,
+                                  render_proof_ready_block, PROPOSED, TRIAGING, PROOF_READY,
+                                  CONFIRMED, REFUTED, BLOCKED, DUPLICATE)
 
 STATUS_RE = re.compile(r'^\s*(VULN_FOUND|LOW_ROI|NEED_INPUT|ERROR)\s*$', re.M)
 
@@ -251,6 +276,23 @@ def _listify(v) -> list:
     return v if isinstance(v, list) else [v]
 
 
+def _cell_risk_tags(cell: dict) -> list[str]:
+    surface = cell.get("surface") if isinstance(cell.get("surface"), dict) else {}
+    return [str(x).lower() for x in _listify(surface.get("risk_tags")) + _listify(cell.get("risk_tags"))]
+
+
+def _cell_high_value(cell: dict) -> bool:
+    tags = set(_cell_risk_tags(cell))
+    hay = f"{cell.get('endpoint', '')} {cell.get('vuln', '')} {cell.get('feature', '')}".lower()
+    return bool(tags & HIGH_VALUE_TAGS) or any(
+        x in hay for x in (
+            "auth", "认证", "login", "register", "password", "token", "session",
+            "pay", "payment", "refund", "recharge", "amount", "order", "admin",
+            "ssrf", "upload", "file", "越权", "idor",
+        )
+    )
+
+
 def _merge_surface(old: dict | None, new: dict | None) -> dict:
     merged = dict(old or {})
     for key, value in (new or {}).items():
@@ -420,34 +462,49 @@ class CognitiveState:
             for c in self.matrix.values()
         )
 
-    def next_untested(self, n: int = 6) -> list[dict]:
-        """② feature-aware：优先推完「已开工(已有闭格)但未完」的 feature，再起新 feature，
-        同 feature 的未覆盖格聚在一起——只排「建议顺序」，不改闭合判定。
-        load 兜底：老 state.json 的 cell 无 `feature` 键 → 现场按 endpoint 启发式补。"""
+    def next_untested(self, n: int = 8) -> list[dict]:
+        """高价值 surface 队列：浅阴性/next_actions 最先，高价值面其次，
+        已开工 feature 内未闭格优先。只排「建议顺序」，不改闭合判定。"""
         def _feat(c):
             return c.get("feature") or _feature_of(c["endpoint"])
         def _priority(c):
             if c["state"] == SHALLOW_NEGATIVE:
                 return 0
-            if c["state"] == UNTESTED and not c.get("needs"):
+            if c.get("next_actions"):
                 return 1
-            if c.get("needs"):
+            if c["state"] == UNTESTED and not c.get("needs") and _cell_high_value(c):
                 return 2
-            return 3
-        todo = [c for c in self.matrix.values() if _priority(c) < 3]
+            if c["state"] == UNTESTED and not c.get("needs"):
+                return 3
+            if c.get("needs"):
+                return 4
+            return 5
+        todo = [c for c in self.matrix.values() if _priority(c) < 5]
         if not todo:
             return []
         started = {_feat(c) for c in self.matrix.values()
                    if c["state"] not in (UNTESTED, SHALLOW_NEGATIVE)}
-        # 稳定排序：已开工 feature(0) 先于未开工(1)；同档按 feature 名聚合，组内保持插入序。
-        todo.sort(key=lambda c: (_priority(c), 0 if _feat(c) in started else 1, _feat(c)))
+        todo.sort(key=lambda c: (
+            _priority(c),
+            0 if _feat(c) in started else 1,
+            _feat(c),
+            c.get("endpoint", ""),
+            c.get("vuln", ""),
+        ))
         return todo[:n]
 
     # —— 状态并进（每轮把模型输出 + 已落盘证据 + 覆盖回填并进系统）——
     def update(self, text: str, evidence: dict, maintain_matrix: bool = True,
-               cards: list[dict] | None = None) -> list[str]:
+               cards: list[dict] | None = None,
+               candidate_ledger: "CandidateLedger | None" = None,
+               surface_ctx: dict | None = None) -> list[str]:
         """把模型本轮输出 + 已落盘证据并进状态。返回本轮闭格说明（供日志）。
-        maintain_matrix=False（无 endpoint 来源的退化模式）时不维护矩阵，保持旧行为。"""
+        maintain_matrix=False（无 endpoint 来源的退化模式）时不维护矩阵，保持旧行为。
+
+        v6.1: 若传入 candidate_ledger，解析 DIM/TRIAGE/REPROBE/SPREAD 协议行，
+        调用 CandidateLedger.apply() 落盘候选 + 回填 surface 候选统计（§10.2）。
+        surface_ctx 提供 DIM 行的 surface 绑定上下文（surface_id/endpoint/method/param）。
+        """
         for m in re.findall(r'(?:假设|怀疑|可能存在)[:：]\s*(.+)', text):
             h = m.strip()[:120]
             if h and all(h != x.get("text") for x in self.hypotheses):
@@ -457,6 +514,10 @@ class CognitiveState:
 
         notes: list[str] = []
         if not maintain_matrix:
+            if candidate_ledger:
+                notes.extend(candidate_ledger.apply(
+                    text, turn=self.turn, cards=cards,
+                    link_callback=None))
             return notes
         # 模型 CELL: 行声明的 (endpoint, 类) —— endpoint 的权威来源（优先级最高，见 S1）。
         # 报告正文常只含具体 id 形态(/api/orders/1001)，靠 CELL 声明的矩阵行端点定位真格。
@@ -471,6 +532,15 @@ class CognitiveState:
                 if ok:
                     notes.append(f"[PASS] {msg}")
                 # 映射失败(无对应 seed 格)：丢弃该闭格动作，留 untested，绝不新增幽灵格
+        # 1b) structured finding(positive)：只有 validation accepted 的 normalized finding 才能闭格。
+        for nf in evidence.get("normalized_findings", []):
+            ep = nf.get("endpoint", "")
+            vc = nf.get("vuln_class") or nf.get("class") or nf.get("root_cause", "")
+            if ep and vc:
+                ok, msg = self.set_cell(ep, vc, POSITIVE, reason="已出 structured finding",
+                                        evidence=nf.get("evidence_file", "finding.json"))
+                if ok:
+                    notes.append(f"[PASS] {msg}")
         # 2) 负向留证(negative_*.md / 覆盖日志)：吃负向通道，让「已测无注入」也能闭格
         for neg in evidence.get("negatives", []):
             ep, vc = neg.get("endpoint", ""), neg.get("vuln", "")
@@ -515,6 +585,11 @@ class CognitiveState:
                         next_actions=["补充 negative_*.md，至少 3 个独立向量与响应证据"],
                         require_evidence=False,
                     )
+        # v6.1 §10.2: 解析 DIM/TRIAGE/REPROBE/SPREAD 协议行 → 候选落盘 + 回填 surface
+        if candidate_ledger:
+            notes.extend(candidate_ledger.apply(
+                text, turn=self.turn, cards=cards,
+                surface_ctx=surface_ctx))
         return notes
 
     def inject_directive(self, s: str):
@@ -528,27 +603,29 @@ class CognitiveState:
         s = self.matrix_stats()
         sym = {POSITIVE: "PASS", NEGATIVE_WITH_EVIDENCE: "NEG",
                SHALLOW_NEGATIVE: "≈", SKIPPED: "SKIP", UNTESTED: "·"}
-        # 按 endpoint 聚合成清单
-        by_ep: dict[str, list] = {}
-        for cell in self.matrix.values():
-            by_ep.setdefault(cell["endpoint"], []).append(cell)
-        lines = []
-        for ep in sorted(by_ep):
-            tags = " ".join(f"{c['vuln']}={sym.get(c['state'], '?')}" for c in by_ep[ep])
-            lines.append(f"  - {ep}: {tags}")
         nxt = self.next_untested()
+        queue_lines = []
+        for idx, c in enumerate(nxt, start=1):
+            actions = c.get("next_actions") or []
+            action_s = f"；next={actions[0]}" if actions else ""
+            hv_s = "；high-value" if _cell_high_value(c) else ""
+            queue_lines.append(
+                f"  {idx}. {c['endpoint']} × {c['vuln']} [{sym.get(c['state'], '?')}]{hv_s}{action_s}"
+            )
+        queue_s = "\n".join(queue_lines) if queue_lines else "  （无，全格已闭合）"
         nxt_s = "；".join(f"{c['endpoint']}×{c['vuln']}" for c in nxt) or "（无，全格已闭合）"
         return (
-            "## 覆盖台账（攻击面 × 漏洞类 · 系统维护 · 待测疆域非测试顺序）\n"
+            "## 覆盖台账（攻击面 × 漏洞类 · 系统维护 · Top 队列）\n"
             f"- 进度: 闭合 {s['closed']}/{s['total']}　(PASS={s[POSITIVE]} "
             f"NEG={s[NEGATIVE_WITH_EVIDENCE]} SHALLOW={s[SHALLOW_NEGATIVE]} "
             f"SKIP={s[SKIPPED]} 未测={s[UNTESTED]} OPEN={s['open_risk']} NEEDS={s['needs_account']})\n"
-            + "\n".join(lines) + "\n"
-            f"- ⚙ 尚未覆盖（自主选序，先测哪格你定）: {nxt_s}\n"
+            "- ⚙ 本轮只注入 Top 8 待测队列（浅阴性/next_actions/高价值面优先）：\n"
+            f"{queue_s}\n"
+            f"- ⚙ 尚未覆盖（Top 8，自主选序，逐项产出 finding 包 / negative_*.md / CELL SKIP）: {nxt_s}\n"
             "- ⚙ 状态含义：已充分测无利用 → negative_with_evidence（NEG）；"
             "浅测无果/证据不足 → shallow_negative（≈，不闭合，需 next_actions）。\n"
             "- ⚙ 单格收口方式（三选一，物理证据为准）：\n"
-            "    · 出报告 → `report_*.md`（PASS，证据=报告）\n"
+            "    · 确认漏洞 → `findings/finding_<id>/finding.json` + request/response/poc（PASS，证据=finding 包）\n"
             "    · 已测无利用 → `negative_*.md`（NEG，需含 `endpoint:`/`vuln:`/`vectors:` + 响应证据片段）\n"
             "    · 跳过 → 输出一行 `CELL: <endpoint> | <类> | SKIP | <理由>`\n"
             "- ⚙ 闭一格后用一行声明结论：`CELL: <endpoint> | <类> | PASS|NEG|SKIP | <理由>`，"
@@ -648,7 +725,11 @@ def _report_cell(rep: dict, cell_decls: list | None = None) -> tuple[str, str]:
 
 
 # ── 证据采集（确定性，与模型无关）────────────────────────────────────────
-_SETUP_FILES = {"state.json", "authz.md", "cookies.txt", "events.jsonl"}  # 会话输入/状态/日志，非证据
+_SETUP_FILES = {
+    "state.json", "authz.md", "cookies.txt", "events.jsonl", "summary.json",
+    "final_report.md", "coverage-ledger.json", "inventory.json",
+    "candidate-ledger.json", "coverage_gaps.md",
+}  # 会话输入/状态/日志/汇总，非证据进展
 
 
 def count_evidence_files(workdir: pathlib.Path) -> int:
@@ -657,10 +738,16 @@ def count_evidence_files(workdir: pathlib.Path) -> int:
     连大 JS bundle / .http 也被无谓读全文；这里只 iterdir 计数，O(目录项) 无读盘。"""
     if not workdir.exists():
         return 0
-    return sum(1 for f in workdir.iterdir() if f.is_file() and f.name not in _SETUP_FILES)
+    count = sum(1 for f in workdir.iterdir() if f.is_file() and f.name not in _SETUP_FILES)
+    findings_dir = workdir / "findings"
+    if findings_dir.exists():
+        for f in findings_dir.glob("finding_*/*"):
+            if f.is_file() and f.name not in _SETUP_FILES:
+                count += 1
+    return count
 
 
-def harvest_evidence(workdir: pathlib.Path) -> dict:
+def harvest_evidence(workdir: pathlib.Path, authorized_hosts: list[str] | None = None) -> dict:
     """采集三类：report_*.md(阳性) / negative_*.md(阴性留证) / 其它原始证据文件。
     负向通道是支柱 2 的核心修复：让「已测无注入」也留档、能进矩阵，不再蒸发。
     F1：只对 .md 候选读全文；其它文件（大 JS bundle / .http 原始包等）只记名不读，
@@ -679,9 +766,21 @@ def harvest_evidence(workdir: pathlib.Path) -> dict:
                 negatives.append(_parse_negative(txt, str(f)))
             elif "severity" in txt[:200]:
                 reports.append({"text": txt, "fm": _fm(txt), "body": _body(txt), "file": str(f)})
+        findings_dir = workdir / "findings"
+        if findings_dir.exists():
+            for f in sorted(findings_dir.glob("finding_*/*")):
+                if f.is_file() and f.name not in _SETUP_FILES:
+                    files.append(str(f))
+    structured = collect_structured_findings(workdir, authorized_hosts=authorized_hosts)
     return {"reports": [r["text"] for r in reports],   # 兼容旧 triage 入参（list[str]）
             "report_objs": reports,                    # 带解析的报告对象（供矩阵映射）
-            "negatives": negatives, "files": files}
+            "negatives": negatives, "files": files,
+            "finding_objs": structured["finding_objs"],
+            "finding_validation": {
+                "accepted": structured["accepted"],
+                "rejected": structured["rejected"],
+            },
+            "normalized_findings": structured["normalized"]}
 
 
 def _fm(txt: str) -> dict:
@@ -780,12 +879,16 @@ def _log_event(wd: pathlib.Path, event: dict) -> None:
         pass
 
 
-def _sync_coverage_ledger(state: CognitiveState, wd: pathlib.Path) -> CoverageLedger:
+def _sync_coverage_ledger(state: CognitiveState, wd: pathlib.Path,
+                          candidates: list[dict] | None = None) -> CoverageLedger:
     """Persist coverage-ledger.json as the run's authoritative coverage artifact.
 
     The old matrix still drives prompt compatibility; this sync layer migrates
     and merges it into the new endpoint/method/param/role/risk-tag ledger so
     existing closed cells are visible to session-gate and offline evaluation.
+
+    v6.1: if a candidate list is provided, backfill each surface's
+    candidate_count/deepest_status/depth_score from it (§4.2 双向耦合).
     """
     path = pathlib.Path(wd) / "coverage-ledger.json"
     metadata = {"sid": state.sid, "target": state.target, "source": "orchestrator"}
@@ -812,6 +915,9 @@ def _sync_coverage_ledger(state: CognitiveState, wd: pathlib.Path) -> CoverageLe
         migrated = CoverageLedger.from_state(asdict(state))
         for surface in migrated.surfaces:
             ledger.add_surface(surface)
+    # v6.1 §4.2: backfill candidate-aware columns from the candidate ledger
+    if candidates:
+        ledger.backfill_from_candidates(candidates)
     ledger.metadata.update({
         "sid": state.sid,
         "target": state.target,
@@ -820,6 +926,71 @@ def _sync_coverage_ledger(state: CognitiveState, wd: pathlib.Path) -> CoverageLe
     })
     ledger.save(path)
     return ledger
+
+
+def _discover_and_register_endpoints(
+    text: str, state: "CognitiveState", inventory_path: pathlib.Path,
+    auth_flow_enabled: bool, verbose: bool,
+) -> list[str]:
+    """P1-3: 从模型回复抽 endpoint 路径，与 inventory/state.matrix 比对；新 endpoint
+    经 ``plan_surfaces`` 补风险格进 matrix，并标 ``discovered_during_testing=true``、
+    ``source="discovered_in_testing"`` 追加进 inventory.json。
+
+    inventory 不存在则跳过（无台账可比对，--endpoints-only/ad-hoc 路径无 bootstrap 台账）。
+    务实战现：只抽 ``/api/*`` 与 ``*.php`` 路径字面量（``surface.extract_endpoint_paths``），
+    用 ``_norm_path`` 归一比对防 ``/api/orders/1001`` 与 ``/api/orders/{id}`` 重复登记。
+    返回新登记的 endpoint 列表（供事件日志）。
+    """
+    if not inventory_path.exists():
+        return []
+    candidates = extract_endpoint_paths(text)
+    if not candidates:
+        return []
+    try:
+        inv_data = json.loads(inventory_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    inv_records = inv_data.get("endpoints") if isinstance(inv_data, dict) else inv_data
+    if not isinstance(inv_records, list):
+        inv_records = []
+    known_norm: set[str] = set()
+    for rec in inv_records:
+        ep = rec.get("endpoint", "") if isinstance(rec, dict) else str(rec)
+        if ep:
+            known_norm.add(_norm_path(ep))
+    for cell in state.matrix.values():
+        ep = cell.get("endpoint", "")
+        if ep:
+            known_norm.add(_norm_path(ep))
+    new_eps: list[str] = []
+    for ep in candidates:
+        nep = _norm_path(ep)
+        if nep in known_norm:
+            continue
+        known_norm.add(nep)                       # 防本轮重复登记
+        new_eps.append(ep)
+    if not new_eps:
+        return []
+    # 补风险格进 matrix：经 plan_surfaces 补 roles/risk_tags/params，与 run.py seed 同形
+    state.seed_matrix(plan_surfaces(new_eps), enable_auth_flow_column=auth_flow_enabled)
+    # 追加进 inventory（discovered_during_testing=true, source=discovered_in_testing）
+    now_iso = datetime.fromtimestamp(time.time(), tz=timezone.utc).isoformat()
+    for ep in new_eps:
+        inv_records.append({
+            "endpoint": ep,
+            "method": "GET",                      # 模型文本抽取无 method 上下文，默认 GET
+            "source": "discovered_in_testing",
+            "last_seen": now_iso,
+            "discovered_during_testing": True,
+        })
+    saturated = is_saturated(inv_records)
+    inventory_path.write_text(
+        json.dumps({"endpoints": inv_records, "saturation_reached": saturated},
+                   ensure_ascii=False, indent=2), encoding="utf-8")
+    if verbose:
+        shown = "；".join(new_eps[:5])
+        print(f"            [discovery] 新登记 endpoint {len(new_eps)} 个: {shown}  饱和={saturated}")
+    return new_eps
 
 
 def _knowledge_hint_for_state(state: CognitiveState, cards: list[dict] | None) -> str:
@@ -836,6 +1007,94 @@ def _knowledge_hint_for_state(state: CognitiveState, cards: list[dict] | None) -
     return render_skill_hint(selected)
 
 
+def _surface_neg_obj(surface: dict) -> dict | None:
+    """Build a knowledge.negative_sufficient negative-evidence object from a
+    ledger surface, if it carries one. Mirrors session_gate._negative_obj_from_surface."""
+    neg = surface.get("negative")
+    if isinstance(neg, dict):
+        return neg
+    obj = {
+        "vectors": _listify(surface.get("vectors")),
+        "response_count": int(surface.get("response_count", 0) or 0),
+        "evidence_types": _listify(surface.get("evidence_types")),
+        "identities": _listify(surface.get("identities")),
+    }
+    if any(obj[k] for k in ("vectors", "response_count", "evidence_types", "identities")):
+        return obj
+    return None
+
+
+def _build_candidate_block(state: "CognitiveState", candidate_ledger: "CandidateLedger | None",
+                           cards: list[dict] | None, *, candidate_top_n: int = 8) -> str:
+    """v6.1 §10.2: 构造 candidate_block 注入 assemble_prompt。
+
+    - recall 相：注入 Top surface 的风险维应答表（§3.1）
+    - 非 recall 相：注入 Top N 候选工作队列（§5 优先级）
+    - proof 保底：注入达 depth_floor 待证候选清单（§5）
+    """
+    if not candidate_ledger or not candidate_ledger.candidates:
+        # 无候选时：对 Top surface 注入风险维应答表（recall 相）
+        if state.matrix and cards:
+            blocks: list[str] = []
+            for cell in state.next_untested(3):
+                surface = {
+                    "endpoint": cell.get("endpoint", ""),
+                    "risk_tags": _cell_risk_tags(cell),
+                    "vuln": cell.get("vuln", ""),
+                    "params": _listify((cell.get("surface") or {}).get("params")),
+                }
+                blocks.append(render_dimension_checklist(surface, cards))
+            return "\n\n".join(blocks) if blocks else ""
+        return ""
+    parts: list[str] = []
+    # 工作队列（§5 优先级）
+    wq = render_work_queue(candidate_ledger.candidates, candidate_top_n)
+    if wq:
+        parts.append(wq)
+    # proof 保底（§5）
+    pr = render_proof_ready_block(candidate_ledger.candidates)
+    if pr:
+        parts.append(pr)
+    return "\n\n".join(parts)
+
+
+def _current_surface_ctx(state: "CognitiveState", cards: list[dict] | None) -> dict | None:
+    """v6.1: 构造当前正在测的 surface 的绑定上下文（供 DIM 行解析）。
+
+    取 next_untested 的第一个格，构建 surface_id/endpoint/method/param/depth_floor。
+    depth_floor 从 knowledge 卡派生（§6.1）。
+    """
+    nxt = state.next_untested(1)
+    if not nxt:
+        return None
+    cell = nxt[0]
+    surface = cell.get("surface") if isinstance(cell.get("surface"), dict) else {}
+    endpoint = cell.get("endpoint", "")
+    method = str(surface.get("method") or cell.get("method") or "GET").upper()
+    param = ""
+    params = _listify(surface.get("params")) or _listify(surface.get("param"))
+    if params:
+        param = str(params[0])
+    roles = surface.get("roles") or cell.get("needed_roles") or ["unknown"]
+    risk_tags = _cell_risk_tags(cell)
+    # build surface_id (reuse ledger.make_surface_id via import-free local form)
+    sid_parts = [method, endpoint]
+    if param:
+        sid_parts.append(param)
+    sid_parts.append(f"[{','.join(roles) if isinstance(roles, list) else roles}]")
+    if risk_tags:
+        sid_parts.append("{" + ",".join(risk_tags) + "}")
+    surface_id = " ".join(sid_parts)
+    # depth_floor from cards
+    depth_floor = 1
+    if cards:
+        depth_floor = positive_depth_floor_for(
+            {"endpoint": endpoint, "risk_tags": risk_tags, "vuln": cell.get("vuln", ""),
+             "params": params}, cards)
+    return {"surface_id": surface_id, "endpoint": endpoint, "method": method,
+            "param": param, "depth_floor": depth_floor}
+
+
 # ── 主循环（§3 + 支柱 1：不首洞即停，覆盖闭合/预算/危险闸三选一终止）──────
 def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: str,
                 workdir: str, authorized_hosts: list[str],
@@ -846,7 +1105,14 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                 vuln_classes: list[str] | None = None,
                 enable_auth_flow_column: bool | None = None,
                 resume: bool = False,
-                verbose: bool = True) -> dict:
+                verbose: bool = True,
+                # v6.1 §10.3 flags
+                candidate_top_n: int = 8,
+                loop_mode: str = "recall-first",
+                adversarial_pass: bool = False,
+                lens: list[str] | None = None,
+                proof_budget_floor: float = 0.3,
+                no_flow_surfaces: bool = False) -> dict:
     """verify_fn(report_md) -> verify.VerifyResult，可选：对 accepted 报告做确定性重放复验。
     owned_ids：本会话自有对象 id，改删类命中其中则自动放行。
     confirm_policy："halt"=改删他人/未知 id 时熔断停手交人工(默认)；"allow"=放行(信任场景)。
@@ -859,6 +1125,7 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
     sid = pathlib.Path(workdir).name
     wd = pathlib.Path(workdir); wd.mkdir(parents=True, exist_ok=True)
     ev_dir = str(wd.resolve())                            # 钉死的落盘绝对目录
+    inventory_path = wd / "inventory.json"                # P1-3：endpoint 台账（与 coverage-ledger.json 同目录）
     state_path = wd / "state.json"
     resumed = bool(resume and state_path.exists())
     auth_flow_enabled = (vuln_classes is None) if enable_auth_flow_column is None else enable_auth_flow_column
@@ -879,6 +1146,9 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
     has_matrix = bool(state.matrix)
     coverage_ledger = _sync_coverage_ledger(state, wd)
     knowledge_cards = load_cards() if has_matrix else []
+    # v6.1: 候选台账 —— 落盘 candidate-ledger.json，不全在对话里（§4.1）
+    candidate_ledger_path = wd / "candidate-ledger.json"
+    candidate_ledger = CandidateLedger.load(candidate_ledger_path) if has_matrix else None
     last_progress = time.time()
     last_marker = None
     _log_event(wd, {"ev": "start", "target": target, "resumed": resumed,
@@ -890,8 +1160,12 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         state.turn = turn
         dynamic_hint = _knowledge_hint_for_state(state, knowledge_cards)
         combined_hint = "\n\n".join(x for x in (skill_hint, dynamic_hint) if x)
+        # v6.1 §10.2: 构造 candidate_block（风险维应答表/工作队列/proof保底）
+        candidate_block = _build_candidate_block(state, candidate_ledger, knowledge_cards,
+                                                  candidate_top_n=candidate_top_n)
         prompt = assemble_prompt(core_skill, authz, target, state,
-                                 skill_hint=combined_hint, evidence_dir=ev_dir)
+                                 skill_hint=combined_hint, evidence_dir=ev_dir,
+                                 candidate_block=candidate_block)
         prev = count_evidence_files(wd)                       # S3：本轮跑模型「之前」的证据计数（F1：只数不读，免一次全量 harvest）
         text_parts = []
         try:                                                  # 流式中断（网络波动/适配器异常）→ 抢救本轮
@@ -922,26 +1196,43 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
             # 中途断流：抢救本轮——已落盘证据本就独立于流(模型自己写的)，这里把已抓文本并进状态、
             # 采证、存盘、记日志，再走 _conclude 把已证报告过一遍 Guardian，标 interrupted（可 --resume 续）。
             text = "".join(text_parts)
-            evidence = harvest_evidence(wd)
-            state.update(text, evidence, maintain_matrix=has_matrix, cards=knowledge_cards)
+            evidence = harvest_evidence(wd, authorized_hosts=authorized_hosts)
+            state.update(text, evidence, maintain_matrix=has_matrix, cards=knowledge_cards,
+                         candidate_ledger=candidate_ledger)
             state.save(state_path)
-            coverage_ledger = _sync_coverage_ledger(state, wd)
+            if candidate_ledger is not None:
+                candidate_ledger.save(candidate_ledger_path)
+            coverage_ledger = _sync_coverage_ledger(
+                state, wd, candidates=candidate_ledger.candidates if candidate_ledger else None)
             _log_event(wd, {"ev": "interrupt", "turn": turn, "error": repr(e)[:300],
                             "files": len(evidence["files"]),
                             "coverage": state.matrix_stats() if has_matrix else None,
                             "coverage_ledger": derive_coverage(coverage_ledger)})
             if verbose:
                 print(f"  [turn {turn}] ⚠ 流式中断已抢救: {repr(e)[:120]} → 收口（可 --resume 续）")
-            out = _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn)
+            out = _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
+                            candidate_ledger=candidate_ledger, cards=knowledge_cards)
             out.update(status="interrupted", interrupted=True, error=repr(e)[:300])
             return out
         text = "".join(text_parts)
 
-        evidence = harvest_evidence(wd)                       # N1：本轮跑模型「之后」采集一次，复用
+        evidence = harvest_evidence(wd, authorized_hosts=authorized_hosts)  # N1：本轮跑模型「之后」采集一次，复用
+        # P1-3：深测中新发现 endpoint —— 先 seed 进 matrix，使本轮 CELL/报告能闭到新格。
+        # 无 inventory（--endpoints-only/ad-hoc）或无矩阵时跳过，保持旧行为。
+        if has_matrix:
+            _discover_and_register_endpoints(text, state, inventory_path, auth_flow_enabled, verbose)
+        # v6.1: 构造当前 surface_ctx（DIM 行的 surface 绑定上下文）
+        _surface_ctx = _current_surface_ctx(state, knowledge_cards) if has_matrix else None
         notes = state.update(text, evidence, maintain_matrix=has_matrix,
-                             cards=knowledge_cards)  # 并进状态 + 回填矩阵 → 闭格说明
+                             cards=knowledge_cards,
+                             candidate_ledger=candidate_ledger,
+                             surface_ctx=_surface_ctx)  # 并进状态 + 回填矩阵 → 闭格说明
         state.save(wd / "state.json")
-        coverage_ledger = _sync_coverage_ledger(state, wd)
+        if candidate_ledger is not None:
+            candidate_ledger.save(candidate_ledger_path)
+        coverage_ledger = _sync_coverage_ledger(
+            state, wd,
+            candidates=candidate_ledger.candidates if candidate_ledger else None)
         if made_progress(prev, evidence) or notes:            # 本轮新增证据 or 新闭格 → 进展刷新计时
             last_progress = time.time()
         if verbose:
@@ -956,11 +1247,13 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         if marker:
             last_marker = marker.group(1)
             if not has_matrix:                                # 退化：无矩阵 → 旧行为，首个标记即结
-                return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn)
+                return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
+                                 candidate_ledger=candidate_ledger, cards=knowledge_cards)
             # 有矩阵：VULN_FOUND/LOW_ROI 不立即 return。
             # NEED_INPUT/ERROR 视为「需人工/系统中断」→ 仍然立即收口（属终止②的人工/系统侧）。
             if last_marker in ("NEED_INPUT", "ERROR"):
-                return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn)
+                return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
+                                 candidate_ledger=candidate_ledger, cards=knowledge_cards)
             # 否则：注入「继续下一未覆盖格」指令，进入下一轮（支柱 1 的机制化「继续测试」）
             nxt = state.next_untested()
             if nxt:
@@ -975,7 +1268,8 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         # ① 覆盖矩阵全格闭合 → 收口终止
         if has_matrix and state.matrix_closed():
             if verbose: print(f"  [turn {turn}] ✅ 覆盖矩阵全格闭合 → 收口")
-            return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn)
+            return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
+                             candidate_ledger=candidate_ledger, cards=knowledge_cards)
 
         if time.time() - last_progress > no_progress_timeout: # ⚙ 无进展切向（不终止，仅推动）
             state.inject_directive("无进展超时，立刻切换到下一未覆盖格，重读速查卡")
@@ -986,20 +1280,24 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         st = state.matrix_stats()
         print(f"  [budget] 达到轮数上限 {max_turns}，矩阵闭合 {st['closed']}/{st['total']} → 收口")
     state.restart_with(summary="达到轮数上限，按已落盘证据与覆盖台账收口")
-    return _conclude(last_marker, harvest_evidence(wd), wd, state, authorized_hosts, max_turns, verify_fn)
+    return _conclude(last_marker, harvest_evidence(wd, authorized_hosts=authorized_hosts),
+                     wd, state, authorized_hosts, max_turns, verify_fn,
+                     candidate_ledger=candidate_ledger, cards=knowledge_cards)
 
 
 # ── Prompt 拼装（§4：约束放头尾，易变放中间）──────────────────────────────
 def assemble_prompt(core_skill: str, authz: str, target: str,
                     state: CognitiveState, skill_hint: str = "",
-                    private_ctx: str = "", evidence_dir: str = "") -> str:
+                    private_ctx: str = "", evidence_dir: str = "",
+                    candidate_block: str = "") -> str:
     cheats = "## 速查卡（再贴一遍）\n- 现象≠结果 · 无PoC≠漏洞 · 可能不报 · 替换ID测3-5个 · 20min无进展换面 · 单格闭合后继续下一未覆盖格"
     # 硬性落盘约束：钉死绝对目录，否则模型可能写到 /tmp 等处，导致采集层(harvest)看不到、
     # 合格报告被漏判为 low_roi。与具体项目无关，任何目标通用。
     drop = (f"# 落盘约束（硬性，先读）\n"
             f"本会话所有证据与报告**必须写入此绝对目录**，写到 /tmp、$TMPDIR 或别处一律不计入、视为未提交：\n"
             f"  {evidence_dir}\n"
-            f"报告用 `report_*.md`（含 severity/title/target frontmatter），原始包用 `*.http`。\n"
+            f"漏洞确立时优先写 `findings/finding_<id>/finding.json` + request/response/poc；"
+            f"旧环境才兼容 `report_*.md`（含 severity/title/target frontmatter），原始包用 `*.http`。\n"
             f"已测无利用的格用 `negative_*.md`（含 `endpoint:`/`vuln:`/`reason:`/`vectors:` 头 + 响应证据片段），让阴性也留档。"
             ) if evidence_dir else ""
     parts = [
@@ -1008,24 +1306,88 @@ def assemble_prompt(core_skill: str, authz: str, target: str,
         drop,                                          # [3] 落盘目录硬约束
         f"# 目标\n{target}\n{private_ctx}",            # [4] 目标+私有线索
         state.to_prompt_block(),                       # [5] 认知状态 + 覆盖台账（长会话才有）
+        candidate_block,                               # [5b] v6.1: 候选台账（风险维应答表/工作队列/proof保底）
         f"# 攻击面提示（按意图触发）\n{skill_hint}" if skill_hint else "",  # [6]
         cheats,                                        # [7] 尾：抗遗忘
     ]
     return "\n\n".join(p for p in parts if p.strip())
 
 
-def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=None) -> dict:
+def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=None,
+              candidate_ledger: "CandidateLedger | None" = None,
+              cards: list[dict] | None = None) -> dict:
     """Guardian 质检所有报告 → 物理证据裁定终态（证据可翻案）；可选确定性重放复验。
-    支柱 2：终态附带覆盖台账统计与负向留证数，让「测了什么/收口到哪」可见。"""
+    支柱 2：终态附带覆盖台账统计与负向留证数，让「测了什么/收口到哪」可见。
+
+    v6.1: 候选台账闭环 —— 阴性 depth floor 闭环校验（§6.2）、四类缺口渲染（§8.2）、
+    proof_ready 无 finding → 终态强制 incomplete（§D6）。
+    """
     triage_ledger = triage(evidence["reports"], evidence_dir=str(wd),
                            authorized_hosts=authorized_hosts)
-    has_valid = len(triage_ledger[ACCEPTED]) > 0              # 有 accepted 才算有效报告
+    structured_guardian_accepted = []
+    structured_guardian_rejected = []
+    normalized_by_path = {
+        str(nf.get("raw_finding_path") or nf.get("evidence_file") or ""): nf
+        for nf in evidence.get("normalized_findings", [])
+    }
+    normalized_structured = []
+    for item in evidence.get("finding_objs", []):
+        finding_path = pathlib.Path(item.get("path") or "")
+        verdict = guardian_check_finding(item.get("finding") or {}, finding_path.parent,
+                                         authorized_hosts=authorized_hosts)
+        if verdict.result == ACCEPTED:
+            structured_guardian_accepted.append({"verdict": verdict, **item})
+            rel = ""
+            try:
+                rel = finding_path.resolve().relative_to(pathlib.Path(wd).resolve()).as_posix()
+            except ValueError:
+                rel = str(finding_path)
+            if rel in normalized_by_path:
+                normalized_structured.append(normalized_by_path[rel])
+        else:
+            structured_guardian_rejected.append({
+                "id": item.get("id") or finding_path.parent.name,
+                "path": str(finding_path),
+                "reasons": [f"guardian:{verdict.result}:L{verdict.level}:{verdict.reason}"],
+            })
+    has_valid = (len(triage_ledger[ACCEPTED]) + len(structured_guardian_accepted)) > 0
     status = finalize(marker, has_valid)
-    coverage_ledger = _sync_coverage_ledger(state, wd)
+    cand_list = candidate_ledger.candidates if candidate_ledger else []
+    coverage_ledger = _sync_coverage_ledger(state, wd, candidates=cand_list)
+    # v6.1 §6.2: 阴性 depth floor 闭环校验 —— 对每个 not_vulnerable surface 复核
+    # negative_sufficient；不达 floor 的降级回 not_tested（防浅阴性伪装成 not_vulnerable）。
+    if cards is not None:
+        for surface in coverage_ledger.surfaces:
+            if (str(surface.get("status", "")) == "not_vulnerable"
+                    and not surface.get("negative_depth_checked")):
+                neg_obj = _surface_neg_obj(surface)
+                if neg_obj is not None:
+                    sufficient, _missing = negative_sufficient(surface, neg_obj, cards)
+                    if not sufficient:
+                        surface["status"] = "not_tested"
+                        surface.setdefault("next_actions", []).append(
+                            "阴性证据不达 depth floor，补向量")
+    # P1-3：discovery 饱和标志（来自 inventory.json，重算以权威；无 inventory → None）
+    saturation_reached = None
+    inv_path = pathlib.Path(wd) / "inventory.json"
+    if inv_path.exists():
+        try:
+            inv_data = json.loads(inv_path.read_text(encoding="utf-8"))
+            inv_recs = inv_data.get("endpoints") if isinstance(inv_data, dict) else inv_data
+            saturation_reached = is_saturated(inv_recs or [])
+        except Exception:
+            saturation_reached = None
+    # v6.1: finding_candidate_ids = 有 confirmed/root_cause_spread 候选（已出 finding）
+    finding_cand_ids = {str(c.get("candidate_id", ""))
+                        for c in cand_list
+                        if c.get("status") in (CONFIRMED, "root_cause_spread")}
     session_gate = evaluate_session_gate(
         coverage_ledger,
         evidence_dir=str(wd),
         ledger_path=pathlib.Path(wd) / "coverage-ledger.json",
+        inventory_path=inv_path,
+        candidates=cand_list or None,
+        finding_candidate_ids=finding_cand_ids,
     )
     open_risk_cells, needs_cells, shallow_negative_cells = [], [], []
     if state.matrix:
@@ -1064,11 +1426,67 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
             try: verified.append((v.severity, verify_fn(rep).result))
             except Exception as e: verified.append((v.severity, f"verify_error:{e}"))
     state.save(wd / "state.json")
+    # P1-2：覆盖完成度指标 —— ledger 中 next_actions 非空的 surface 数。
+    open_next_actions_count = sum(
+        1 for s in coverage_ledger.surfaces if s.get("next_actions"))
+    # P2-3：accepted 报告按根因聚合（同 endpoint+root_cause+affected_role 不重复计）。
+    findings = aggregate_findings([rep for _, rep in triage_ledger[ACCEPTED]])
+    # v6.1 §8.2: 四类缺口清单（发现但没测/测了没深入/阻塞未恢复/漏进报告）
+    demoted_count = len(triage_ledger["demoted"])
+    verify_uncertain_count = sum(1 for _sev, v in verified if v == "inconclusive") if verify_fn else 0
+    coverage_gaps = compute_coverage_gaps(
+        cand_list,
+        finding_candidate_ids=finding_cand_ids,
+        surfaces=coverage_ledger.surfaces,
+        demoted_count=demoted_count,
+        verify_uncertain_count=verify_uncertain_count,
+    )
+    # 渲染独立 coverage_gaps.md
+    render_coverage_gaps(coverage_gaps, pathlib.Path(wd) / "coverage_gaps.md")
+    # v6.1 §D6: proof_ready 无 finding → 终态强制 incomplete（治"没进报告"头号原因）
+    if coverage_gaps.get("proof_ready_without_finding"):
+        if status in ("vuln_found", "low_roi"):
+            status = "incomplete"
+    # v6.1 §8.2 铁律：四类缺口任一非空，终态不得 complete
+    if coverage_gaps_nonempty(coverage_gaps) and status == "complete":
+        status = "incomplete"
+    final_report_path = ""
+    final_report_status = "not_generated"
+    if structured_guardian_accepted:
+        final_report_status = "complete" if gate_result == "pass" else "draft_incomplete"
+        final_report_path = str(render_final_report(
+            structured_guardian_accepted,
+            pathlib.Path(wd) / "final_report.md",
+            target_name=(state.target.splitlines()[0] if getattr(state, "target", "") else "目标"),
+            status=final_report_status,
+            session_gate=session_gate,
+            open_risk_cells=open_risk_cells,
+            coverage_stats=(derive_coverage(coverage_ledger).get("stats") or {}),
+            coverage_gaps=coverage_gaps,
+        ))
     out = {
         "status": status, "marker": marker, "turn": turn,
-        "accepted": [v.severity for v, _ in triage_ledger[ACCEPTED]],
+        "accepted": (
+            [v.severity for v, _ in triage_ledger[ACCEPTED]]
+            + [item["verdict"].severity for item in structured_guardian_accepted]
+        ),
+        "findings": findings,                       # 聚合后（accepted 原样保留，不丢信息）
+        "normalized_findings": normalized_structured,
+        "structured_findings": {
+            "accepted": len(structured_guardian_accepted),
+            "rejected": len(evidence.get("finding_validation", {}).get("rejected", []))
+                        + len(structured_guardian_rejected),
+        },
+        "finding_validation": {
+            "accepted": evidence.get("finding_validation", {}).get("accepted", []),
+            "rejected": evidence.get("finding_validation", {}).get("rejected", [])
+                        + structured_guardian_rejected,
+        },
+        "final_report_path": final_report_path,
+        "final_report_status": final_report_status,
         "verified": verified,
-        "demoted": len(triage_ledger["demoted"]), "rejected": len(triage_ledger["rejected"]),
+        "demoted": len(triage_ledger["demoted"]),
+        "rejected": len(triage_ledger["rejected"]) + len(structured_guardian_rejected),
         "negatives": len(evidence.get("negatives", [])),
         "coverage": state.matrix_stats() if state.matrix else None,
         "coverage_ledger": derive_coverage(coverage_ledger),
@@ -1078,12 +1496,28 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
         "needs_cells": needs_cells,
         "blocked_cells": needs_cells,
         "shallow_negative_cells": shallow_negative_cells,
+        "open_next_actions_count": open_next_actions_count,
+        "saturation_reached": saturation_reached,
+        # v6.1: 候选台账统计 + 四类缺口清单
+        "candidate_stats": (candidate_ledger.stats() if candidate_ledger else {}),
+        "coverage_gaps": coverage_gaps,
+        "coverage_gaps_nonempty": coverage_gaps_nonempty(coverage_gaps),
+        "candidate_ledger_path": str((pathlib.Path(wd) / "candidate-ledger.json").resolve()) if candidate_ledger else "",
+        "hit_count": None,                          # 无 oracle；有 oracle 时由 run.py 算
         "state": asdict(state),
     }
     _log_event(wd, {"ev": "end", "status": status, "marker": marker, "turn": turn,
                     "accepted": out["accepted"], "demoted": out["demoted"],
                     "rejected": out["rejected"], "coverage": out["coverage"],
+                    "findings": len(findings),
+                    "structured_findings": out["structured_findings"],
+                    "final_report_path": final_report_path,
+                    "final_report_status": final_report_status,
+                    "open_next_actions_count": open_next_actions_count,
+                    "saturation_reached": saturation_reached,
                     "coverage_ledger": out["coverage_ledger"],
+                    "candidate_stats": out.get("candidate_stats", {}),
+                    "coverage_gaps_nonempty": out.get("coverage_gaps_nonempty", False),
                     "session_gate": session_gate})
     return out
 
@@ -1116,19 +1550,35 @@ class MockAdapter:
             yield "CELL: /api/orders/{id} | 越权/IDOR | PASS | 已出报告，3 ID 重放\n"
             yield "\nVULN_FOUND\n"                  # ⚙ 支柱1：有矩阵时不再立即终止
         elif self._t == 2:
-            # 第二轮：负向留证（SQLi 测了无注入），证明「负向也进台账」不蒸发
+            # 第二轮：负向留证（SQLi 测了无注入），证明「负向也进台账」不蒸发。
+            # T3 知识卡抬高了 /api/user-info×SQLi 的阴性门槛（命中 input-validation /
+            # single-param / single-payload-family / no-echo / tested-endpoint-not-param 五卡，
+            # 合计要求 ≥5 向量 + 7 类 evidence_types + ≥2 响应）。这里把脚本化证据加厚到
+            # 真正充分：5 个独立 payload 家族向量 + 多参数/多家族/二阶/逐参数证据 + 双响应，
+            # 让它闭为 negative_with_evidence（演示「合格阴性仍能闭合」），而非落 shallow_negative。
             (wd / "negative_sqli_userinfo.md").write_text(
                 "endpoint: /api/user-info\nvuln: SQLi\n"
-                "reason: 185 个探测无回显/无时间差，sort/uid 均整数白名单\n"
+                "reason: 多参数多 payload 家族二阶证据齐全，185 探测无回显/无时间差/无带外\n"
                 "vectors:\n"
                 "  - time-based\n"
+                "  - error-based\n"
+                "  - boolean-blind\n"
                 "  - sort-param\n"
-                "  - boundary\n"
+                "  - oob-dns\n"
                 "evidence_types:\n"
                 "  - baseline\n"
                 "  - boundary_result\n"
                 "  - type_result\n"
-                "curl 'https://t.example/api/user-info?uid=1 AND SLEEP(5)' → 无延迟，HTTP/1.1 200 正常\n",
+                "  - multi_param_coverage\n"
+                "  - multi_payload_family_coverage\n"
+                "  - per_param_evidence\n"
+                "  - second_order_evidence\n"
+                "identities:\n"
+                "  - owner\n"
+                "  - peer\n"
+                "curl 'https://t.example/api/user-info?uid=1 AND SLEEP(5)' → 无延迟，HTTP/1.1 200 正常\n"
+                "curl 'https://t.example/api/user-info?sort=1;--' → 无报错，HTTP/1.1 200 正常\n"
+                "带外回调通道未收到 DNS 请求（second_order_evidence 已采集，无二阶可观测信号）\n",
                 encoding="utf-8")
             yield "对 /api/user-info 做了 185 次 SQLi 探测，均无注入，已写 negative_sqli_userinfo.md。\n"
             yield "CELL: /api/user-info | SQLi | NEG | 185探测无注入，已留证\n"
@@ -1175,6 +1625,9 @@ if __name__ == "__main__":
     assert cov.get('total') == 27, f"矩阵 total 应恒为 3×9=27（不被幽灵格撑大），实得 {cov.get('total')}"
     assert cov.get('positive', 0) >= 1 and cov.get('negative_with_evidence', 0) >= 1, "应有阳性报告与充分阴性留证"
     assert cov.get('shallow_negative', 0) == 0, "A 段充分阴性样例不应落浅阴性"
+    assert res.get('findings') and len(res['findings']) >= 1, "_conclude 应输出聚合后的 findings"
+    assert res.get('open_next_actions_count') is not None, "_conclude 应输出 open_next_actions_count"
+    assert res.get('hit_count') is None, "无 oracle 时 _conclude 的 hit_count 应为 None"
     # 现实报态报告应闭到真格 /api/orders/{id}（而非误闭/补出 /api/orders/1001 幽灵格）
     mtx = res['state']['matrix']
     real_cell = mtx.get("/api/orders/{id}::越权/IDOR")
@@ -1182,6 +1635,75 @@ if __name__ == "__main__":
         "现实报态报告应闭到真格 /api/orders/{id}×越权/IDOR=positive"
     assert "/api/orders/1001::越权/IDOR" not in mtx, "不得新增 /api/orders/1001 幽灵格"
     print("✅ 持续循环 + 矩阵闭合 + 负向留档 + 现实报态闭真格(无幽灵格) 全部满足")
+
+    # —— A2) 薄阴性被 shallow 谓词拦 → _conclude 终态 incomplete（P0-2 生效）——————
+    # 同一面 /api/user-info×SQLi，仅给 3 向量 + 3 证据类型（不满足抬高的卡门槛）→
+    # 落 shallow_negative，且 _conclude 终态 incomplete、带 next_actions（缺什么补什么）。
+    print("\n=== A2) 薄阴性被 shallow 谓词拦 → _conclude 终态 incomplete（P0-2）===")
+    wd_thin = pathlib.Path(tempfile.mkdtemp()) / "runs" / "sess-thin"
+    wd_thin.mkdir(parents=True)
+    cards_a2 = load_cards()
+    st_thin = CognitiveState(sid="thin", target="https://t.example", vuln_classes=["SQLi"])
+    st_thin.seed_matrix(["/api/user-info"], enable_auth_flow_column=False)
+    thin_neg = {"endpoint": "/api/user-info", "vuln": "SQLi",
+                "reason": "薄阴性：仅 3 向量、缺二阶/多参数/多家族证据",
+                "file": "negative_thin.md",
+                "vectors": ["time-based", "sort-param", "boundary"],
+                "evidence_types": ["baseline", "boundary_result", "type_result"],
+                "response_count": 1, "identities": [], "roles": []}
+    st_thin.update("", {"files": [], "negatives": [thin_neg]}, cards=cards_a2)
+    assert st_thin.matrix["/api/user-info::SQLi"]["state"] == SHALLOW_NEGATIVE, \
+        "薄阴性（3向量/缺二阶证据）应被抬高后的卡门槛拦为 shallow_negative"
+    out_thin = _conclude("LOW_ROI", {"reports": [], "negatives": [], "files": []},
+                         wd_thin, st_thin, ["t.example"], 0)
+    assert out_thin["status"] == "incomplete", f"薄阴性终态应为 incomplete，实得 {out_thin['status']}"
+    assert out_thin["shallow_negative_cells"], "应有 shallow_negative_cells"
+    assert out_thin["open_next_actions_count"] >= 1, "薄阴性应带 next_actions（缺什么补什么）"
+    print(f"  薄阴性: cell=shallow_negative 终态={out_thin['status']} "
+          f"next_actions={out_thin['open_next_actions_count']}")
+    print("✅ 薄阴性被 shallow 谓词拦、_conclude 终态 incomplete（P0-2 生效）")
+
+    # —— H) finding 按根因聚合（P2-3：同 endpoint+root_cause+affected_role 聚合）————
+    print("\n=== H) finding 按根因聚合（P2-3：同 endpoint+root_cause+affected_role 聚合）===")
+    rep_ha = (
+        "---\nseverity: P1\ntitle: 订单越权读取（水平越权）\n"
+        "target: https://t.example/api/orders/{id}\ntype: 越权/IDOR\naffected_role: 普通用户\n---\n"
+        "换 B 账号 Cookie 越权读取了 A 用户 /api/orders/1001 订单，提取了收货地址。\n"
+        "```\ncurl 'https://t.example/api/orders/1001' -H 'Cookie: B'\nHTTP/1.1 200 返回了 A 的订单\n```\n"
+        + "证据充分。" * 30)
+    rep_hb = (
+        "---\nseverity: P2\ntitle: 订单越权删除（水平越权）\n"
+        "target: https://t.example/api/orders/{id}\ntype: 越权/IDOR\naffected_role: 普通用户\n---\n"
+        "换 B 账号 Cookie 越权删除了 A 用户 /api/orders/1001 订单。\n"
+        "```\ncurl -X DELETE 'https://t.example/api/orders/1001' -H 'Cookie: B'\nHTTP/1.1 200 已删除 A 的订单\n```\n"
+        + "证据充分。" * 30)
+    agg = aggregate_findings([rep_ha, rep_hb])
+    assert len(agg) == 1, f"同 endpoint+root_cause+role 应聚合为 1 个 finding，实得 {len(agg)}"
+    f0 = agg[0]
+    assert len(f0["facets"]) == 2, f"应有两个 facets（两份表现），实得 {f0['facets']}"
+    assert f0["severity"] == "P1", f"primary severity 应取最高(P1)，实得 {f0['severity']}"
+    assert f0["endpoint"] == "/api/orders/{id}", f"endpoint 应归一，实得 {f0['endpoint']}"
+    assert f0["root_cause"] == "越权/IDOR" and f0["affected_role"] == "普通用户"
+    assert f0["report_count"] == 2, "report_count 应为 2"
+    # 同根因两 facet 不重复计入 critical：聚合后只有 1 个 finding，critical 计数为 1 而非 2
+    crit = sum(1 for f in agg if f["severity"] == "P1")
+    assert crit == 1, f"同根因两 facet 不应重复计 critical，实得 {crit}"
+    # 不同 role 不聚合
+    rep_hc = rep_hb.replace("affected_role: 普通用户", "affected_role: 商户")
+    agg2 = aggregate_findings([rep_ha, rep_hb, rep_hc])
+    assert len(agg2) == 2, f"不同 role 应分为 2 个 finding，实得 {len(agg2)}"
+    # 价值排序：越权/IDOR(tier 3) 应排在低价值信息泄露(tier 5)之前
+    rep_leak = ("---\nseverity: P2\ntitle: 接口响应头泄露版本号\ntarget: https://t.example/api/version\n"
+                "type: 信息泄露\naffected_role: 匿名\n---\n"
+                "响应头泄露了服务器版本号。\n```\ncurl -I 'https://t.example/api/version'\nHTTP/1.1 200\n```\n"
+                + "证据。" * 40)
+    agg3 = aggregate_findings([rep_leak, rep_ha])
+    assert agg3[0]["root_cause"] == "越权/IDOR" and agg3[1]["root_cause"] == "信息泄露", \
+        "价值排序：越权(tier3) 应排在信息泄露(tier5) 之前"
+    print(f"  聚合: 2 份同根因报告 → {len(agg)} finding, facets={len(f0['facets'])}, "
+          f"severity={f0['severity']}, primary_impact={f0['primary_impact'][:24]}…")
+    print(f"  不同 role 拆分: {len(agg2)} finding ｜ 价值排序: {agg3[0]['root_cause']} → {agg3[1]['root_cause']}")
+    print("✅ finding 按根因聚合（同根因不重复计 critical、不同 role 分开、价值排序）满足")
 
     print("\n=== C) 现实报态报告 → _report_cell 映射单测（S1/S2 修复点）===")
     # 模拟真实报告：endpoint 只在正文且为具体 id 形态；frontmatter target 是站点根；CELL 行声明矩阵行端点。
@@ -1382,7 +1904,17 @@ if __name__ == "__main__":
     st_i.update("", {"files": [], "negatives": [weak_neg]}, cards=cards_i)
     assert st_i.matrix["/api/search::SQLi"]["state"] == SHALLOW_NEGATIVE, \
         "知识卡应提高输入校验阴性门槛，响应证据不足时不闭合"
-    strong_neg = dict(weak_neg, response_count=2)
+    # 加厚到满足抬高的卡门槛（5 向量 + 多参数/多家族/二阶/逐参数证据 + 双响应）才闭合
+    strong_neg = {
+        "endpoint": "/api/search", "vuln": "SQLi", "reason": "多参数多家族二阶证据齐全",
+        "file": "negative_search.md",
+        "vectors": ["time-based", "error-based", "boolean-blind", "sort-param", "oob-dns"],
+        "response_count": 2,
+        "evidence_types": ["baseline", "boundary_result", "type_result",
+                           "multi_param_coverage", "multi_payload_family_coverage",
+                           "per_param_evidence", "second_order_evidence"],
+        "identities": [], "roles": [],
+    }
     st_i.update("", {"files": [], "negatives": [strong_neg]}, cards=cards_i)
     assert st_i.matrix["/api/search::SQLi"]["state"] == NEGATIVE_WITH_EVIDENCE
     print("✅ Phase 2: 知识卡加载、提示注入、卡增强 negative_sufficiency 全部接通")

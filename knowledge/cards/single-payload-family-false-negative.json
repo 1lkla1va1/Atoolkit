@@ -1,0 +1,32 @@
+{
+  "id": "single-payload-family-false-negative",
+  "title": "单 payload 家族误判",
+  "description": "注入只试一类 payload 就判阴性；需覆盖多个独立 payload 家族。",
+  "match": {
+    "vuln_classes": ["SQLi", "XSS", "命令执行/RCE", "SSRF", "NoSQL注入", "LDAP注入"],
+    "params": ["keyword", "search", "q", "sort", "orderBy", "filter", "page", "size", "type", "url", "path", "name", "cmd", "query"],
+    "keywords": ["search", "query", "filter", "sort", "orderby", "inject", "keyword"]
+  },
+  "dimensions": [
+    "是否覆盖至少 3 个独立 payload 家族，按回显通道与探测原理划分",
+    "是否覆盖不同回显通道的 payload 家族而非只试报错型",
+    "是否只试了一类 payload 就判阴性",
+    "每个 payload 家族是否保留独立响应或二阶证据"
+  ],
+  "false_negative_rules": [
+    "只试一类 payload 不能证明注入闭合，需覆盖至少 3 个独立 payload 家族",
+    "只看无报错不能证明无注入",
+    "只覆盖一个回显通道不能覆盖注入面"
+  ],
+  "evidence_required": [
+    "multi_payload_family_coverage",
+    "baseline",
+    "boundary_result",
+    "second_order_evidence"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 5,
+    "min_response_count": 2,
+    "required_evidence_types": ["multi_payload_family_coverage"]
+  }
+}

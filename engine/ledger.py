@@ -27,6 +27,14 @@ STATUS_NOT_VULNERABLE = "not_vulnerable"
 STATUS_BLOCKED = "blocked"
 STATUS_NOT_APPLICABLE = "not_applicable"
 
+# "shallow_negative" is the matrix/legacy state for a negative that lacks
+# sufficient evidence. normalize_status collapses it onto STATUS_NOT_TESTED
+# (see LEGACY_STATUS_MAP), which would make a shallow negative indistinguishable
+# from a genuinely untested surface in the ledger. The raw token is kept as a
+# named constant so normalize_surface can tag such surfaces with a
+# `negative_depth="shallow"` marker that the session-gate reads.
+SHALLOW_NEGATIVE = "shallow_negative"
+
 VALID_STATUSES = {
     STATUS_NOT_TESTED,
     STATUS_CONFIRMED,
@@ -62,6 +70,21 @@ VULN_RISK_MAP = {
     "上传": ["file-upload"],
     "业务逻辑": ["business-logic"],
     "支付": ["payment", "accounting"],
+}
+
+# v6.1 §4.2: candidate status → depth rank for Surface.deepest_status.
+# "deepest" = most-advanced candidate status on this surface. Higher = further along.
+# duplicate does not advance (a pure re-statement). refuted sits between triaging
+# and proof_ready (tested but negated; can be re-probed per §6.3).
+CANDIDATE_STATUS_DEPTH: dict[str, int] = {
+    "proposed": 0,
+    "duplicate": 0,
+    "triaging": 1,
+    "blocked": 1,
+    "refuted": 2,
+    "proof_ready": 3,
+    "confirmed": 4,
+    "root_cause_spread": 5,
 }
 
 
@@ -151,6 +174,11 @@ class Surface:
     blocker: dict[str, Any] | None = None
     next_actions: list[str] = field(default_factory=list)
     source: str = "manual"
+    # v6.1 §4.2: candidate-aware columns (backward compatible; default 0/""/False)
+    candidate_count: int = 0           # 该格已提候选数
+    deepest_status: str = ""           # proposed/triaging/proof_ready/confirmed/refuted
+    depth_score: int = 0               # 取该格候选的 max(depth_score)
+    negative_depth_checked: bool = False  # §6.2：阴性 depth floor 是否已闭环校验
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -260,6 +288,45 @@ class CoverageLedger:
             surface["next_actions"] = list(next_actions)
         return surface
 
+    # v6.1 §4.2: candidate ↔ surface 双向耦合（治 D2：surface 知自己有几个候选）
+    def link_candidate(self, surface_id: str, *, status: str, depth_score: int,
+                       is_new: bool = True) -> dict[str, Any] | None:
+        """Link a candidate to its surface: bump candidate_count (if new), update
+        deepest_status/depth_score. Returns the surface or None if not found."""
+        surface = self.get(surface_id)
+        if not surface:
+            return None
+        if is_new:
+            surface["candidate_count"] = int(surface.get("candidate_count", 0) or 0) + 1
+        cand_rank = CANDIDATE_STATUS_DEPTH.get(str(status or "").strip(), -1)
+        cur_rank = CANDIDATE_STATUS_DEPTH.get(str(surface.get("deepest_status", "") or ""), -1)
+        if cand_rank > cur_rank:
+            surface["deepest_status"] = str(status or "").strip()
+        surface["depth_score"] = max(
+            int(surface.get("depth_score", 0) or 0), int(depth_score or 0))
+        return surface
+
+    def backfill_from_candidates(self, candidates: list[dict[str, Any]]) -> None:
+        """Recompute candidate_count/deepest_status/depth_score for all surfaces
+        from a candidate list. Each candidate should carry surface_id, status,
+        depth_score. Resets counters first, then re-derives (idempotent)."""
+        for surface in self.surfaces:
+            surface["candidate_count"] = 0
+            surface["deepest_status"] = ""
+            surface["depth_score"] = 0
+        for cand in candidates or []:
+            sid = str(cand.get("surface_id") or "")
+            if not sid:
+                continue
+            self.link_candidate(sid, status=cand.get("status", ""),
+                                depth_score=int(cand.get("depth_score", 0) or 0),
+                                is_new=False)
+            # candidate_count must reflect actual count, not just link bumps
+            surface = self.get(sid)
+            if surface is not None:
+                if str(cand.get("status", "")).strip() != "duplicate":
+                    surface["candidate_count"] = int(surface.get("candidate_count", 0) or 0) + 1
+
     def stats(self) -> dict[str, int]:
         counts = {status: 0 for status in sorted(VALID_STATUSES)}
         high_value_open = 0
@@ -277,7 +344,16 @@ class CoverageLedger:
     def next_surfaces(self, n: int = 10, *, high_value_first: bool = True) -> list[dict[str, Any]]:
         candidates = [s for s in self.surfaces if normalize_status(s.get("status")) in {STATUS_NOT_TESTED, STATUS_BLOCKED}]
         if high_value_first:
-            candidates.sort(key=lambda s: (0 if is_high_value(s) else 1, s.get("feature", ""), s.get("surface_id", "")))
+            def _prio(s: dict[str, Any]) -> tuple:
+                shallow = s.get("negative_depth") == "shallow" or str(s.get("status") or "").lower() == SHALLOW_NEGATIVE
+                return (
+                    0 if shallow else 1,
+                    0 if s.get("next_actions") else 1,
+                    0 if is_high_value(s) else 1,
+                    s.get("feature", ""),
+                    s.get("surface_id", ""),
+                )
+            candidates.sort(key=_prio)
         return candidates[:n]
 
     def save(self, path: str | pathlib.Path) -> None:
@@ -292,6 +368,8 @@ def normalize_surface(surface: dict[str, Any]) -> dict[str, Any]:
     risk_tags = _dedupe(_as_list(surface.get("risk_tags"))) or infer_risk_tags(param, endpoint, surface.get("feature", ""))
     if not risk_tags:
         risk_tags = ["general-review"]
+    raw_status = str(surface.get("status") or "").strip().lower()
+    normalized_status = normalize_status(surface.get("status", STATUS_NOT_TESTED))
     data = {
         "surface_id": surface.get("surface_id") or make_surface_id(endpoint, method, param, roles, risk_tags),
         "endpoint": endpoint,
@@ -300,15 +378,31 @@ def normalize_surface(surface: dict[str, Any]) -> dict[str, Any]:
         "roles": roles,
         "risk_tags": risk_tags,
         "feature": str(surface.get("feature") or "default"),
-        "status": normalize_status(surface.get("status", STATUS_NOT_TESTED)),
+        "status": normalized_status,
         "evidence_ref": surface.get("evidence_ref") or surface.get("evidence") or None,
         "blocker": surface.get("blocker"),
         "next_actions": _dedupe(surface.get("next_actions") or []),
         "source": str(surface.get("source") or "manual"),
+        # v6.1 §4.2: candidate-aware columns (backward compatible)
+        "candidate_count": int(surface.get("candidate_count", 0) or 0),
+        "deepest_status": str(surface.get("deepest_status", "") or ""),
+        "depth_score": int(surface.get("depth_score", 0) or 0),
+        "negative_depth_checked": bool(surface.get("negative_depth_checked", False)),
     }
     for key, value in surface.items():
         if key not in data:
             data[key] = value
+    # Preserve the shallow_negative distinction across normalization. The marker
+    # is set when the raw status literally is shallow_negative, retained while
+    # the surface is still open (STATUS_NOT_TESTED, which is what shallow_negative
+    # normalizes to), and dropped once the surface advances to a closed/blocked
+    # state so a settled cell is not re-opened by the session-gate.
+    if raw_status == SHALLOW_NEGATIVE:
+        data["negative_depth"] = "shallow"
+    elif data.get("negative_depth") == "shallow" and normalized_status == STATUS_NOT_TESTED:
+        data["negative_depth"] = "shallow"
+    else:
+        data.pop("negative_depth", None)
     return data
 
 
@@ -327,6 +421,21 @@ def merge_surface(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
     }
     if status_order.get(src.get("status"), 0) > status_order.get(dst.get("status"), 0):
         dst["status"] = src["status"]
+    # v6.1 §4.2: merge candidate-aware columns (max counts/scores, OR checked)
+    dst["candidate_count"] = max(
+        int(dst.get("candidate_count", 0) or 0), int(src.get("candidate_count", 0) or 0))
+    src_d = CANDIDATE_STATUS_DEPTH.get(str(src.get("deepest_status", "") or ""), -1)
+    dst_d = CANDIDATE_STATUS_DEPTH.get(str(dst.get("deepest_status", "") or ""), -1)
+    if src_d > dst_d:
+        dst["deepest_status"] = src.get("deepest_status", "")
+    dst["depth_score"] = max(
+        int(dst.get("depth_score", 0) or 0), int(src.get("depth_score", 0) or 0))
+    dst["negative_depth_checked"] = bool(dst.get("negative_depth_checked", False)) or bool(
+        src.get("negative_depth_checked", False))
+    # A closed surface is no longer a shallow negative: drop a stale marker so
+    # the session-gate does not re-open a settled cell after a merge.
+    if normalize_status(dst.get("status")) not in {STATUS_NOT_TESTED, STATUS_BLOCKED}:
+        dst.pop("negative_depth", None)
     return dst
 
 
@@ -337,16 +446,21 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     method = _clean_method(surface_meta.get("method") or cell.get("method"))
     feature = str(cell.get("feature") or surface_meta.get("feature") or "default")
+    cell_state = str(cell.get("state") or "").lower()
     status = normalize_status(cell.get("state") or cell.get("status"))
     source = str(surface_meta.get("source") or cell.get("source") or "legacy-matrix")
     roles = _roles_from_cell(cell)
     next_actions = _dedupe(cell.get("next_actions") or [])
-    if (cell.get("state") or "").lower() == "shallow_negative" and not next_actions:
+    if cell_state == SHALLOW_NEGATIVE and not next_actions:
         next_actions = ["add sufficient negative evidence and response proof"]
     if cell.get("needs"):
         next_actions.extend(str(x) for x in _as_list(cell.get("needs")))
     blocker = cell.get("blocker")
     evidence_ref = cell.get("evidence") or cell.get("evidence_ref") or None
+    # surfaces_from_legacy_cell pre-normalizes status (so normalize_surface can
+    # no longer see the raw shallow_negative token). Tag the surface here so the
+    # marker survives the round-trip through add_surface/normalize_surface.
+    negative_depth = "shallow" if cell_state == SHALLOW_NEGATIVE else None
 
     surfaces: list[dict[str, Any]] = []
     for param in _params_from_cell(cell):
@@ -366,6 +480,7 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
             "source": source,
             "legacy_vuln": cell.get("vuln", ""),
             "legacy_reason": cell.get("reason", ""),
+            "negative_depth": negative_depth,
         })
     return surfaces
 

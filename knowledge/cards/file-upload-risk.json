@@ -29,5 +29,10 @@
     "min_vectors": 4,
     "min_response_count": 2,
     "required_evidence_types": ["upload_response", "stored_metadata", "access_url"]
+  },
+  "positive_depth_floor": {
+    "min_depth": 2,
+    "min_vectors": 3,
+    "note": "文件上传：≥3 向量（类型/扩展名/路径/内容），达 depth_score 2 才许 proof_ready"
   }
 }

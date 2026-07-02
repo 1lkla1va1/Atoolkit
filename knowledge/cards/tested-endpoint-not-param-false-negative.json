@@ -1,0 +1,32 @@
+{
+  "id": "tested-endpoint-not-param-false-negative",
+  "title": "端点测过不等于参数测过",
+  "description": "端点测过就跳过其所有参数；每个参数需独立留证。",
+  "match": {
+    "vuln_classes": ["SQLi", "XSS", "SSRF", "输入校验", "越权/IDOR", "业务逻辑"],
+    "params": ["keyword", "search", "q", "sort", "orderBy", "filter", "page", "size", "type", "status", "url", "path", "id", "name", "amount", "quantity"],
+    "keywords": ["search", "query", "filter", "sort", "orderby", "keyword", "param", "parameter", "endpoint"]
+  },
+  "dimensions": [
+    "端点是否已对每个可控参数独立探测",
+    "是否因端点可达就跳过参数级测试",
+    "每个参数是否保留独立响应证据",
+    "新增或隐藏参数是否被纳入覆盖"
+  ],
+  "false_negative_rules": [
+    "端点测过不等于其所有参数已测过",
+    "每个参数需独立留证，不能以端点级证据代替参数级证据",
+    "跳过参数级测试会造成参数面遗漏"
+  ],
+  "evidence_required": [
+    "per_param_evidence",
+    "multi_param_coverage",
+    "baseline",
+    "boundary_result"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 4,
+    "min_response_count": 2,
+    "required_evidence_types": ["per_param_evidence"]
+  }
+}

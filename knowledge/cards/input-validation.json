@@ -28,5 +28,10 @@
     "min_vectors": 3,
     "min_response_count": 2,
     "required_evidence_types": ["baseline", "boundary_result", "type_result"]
+  },
+  "positive_depth_floor": {
+    "min_depth": 2,
+    "min_vectors": 3,
+    "note": "注入：≥3 探测向量家族（语法/布尔/时间/错误），达 depth_score 2 才许 proof_ready"
   }
 }

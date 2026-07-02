@@ -15,3 +15,8 @@ __pycache__/
 
 # 临时抽取产物
 *_extract.txt
+
+# 本地设计/迭代/测试材料（核心运行不依赖，不随运行提交上传）
+fixtures/
+project-memory/
+design/迭代方案/

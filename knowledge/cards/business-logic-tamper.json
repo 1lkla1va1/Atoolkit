@@ -28,5 +28,10 @@
     "min_vectors": 4,
     "min_response_count": 2,
     "required_evidence_types": ["baseline", "variant_result", "server_state"]
+  },
+  "positive_depth_floor": {
+    "min_depth": 2,
+    "min_vectors": 3,
+    "note": "业务逻辑篡改：≥3 金额向量（0/负/超额/精度），达 depth_score 2 才许 proof_ready"
   }
 }

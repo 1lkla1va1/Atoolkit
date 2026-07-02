@@ -14,12 +14,36 @@ from typing import Any
 
 
 DEFAULT_MIN_VECTORS = 3
+# v6.1: 候选 depth_floor 的默认下限。知识卡 positive_depth_floor.min_depth 可抬高不可降低。
+# depth_score 0=未探 1=单向量 2=多向量 3=多角色/对象 4=根因扩散（见 candidate.py）。
+DEFAULT_POSITIVE_DEPTH_FLOOR = 1
 
 NEGATIVE_WITH_EVIDENCE = "negative_with_evidence"
 SHALLOW_NEGATIVE = "shallow_negative"
 
 _DEFAULT_MISSING = "补足至少 3 个独立探测向量，并保留响应证据"
 _CARD_DIR = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "cards"
+
+# v6.1: 漏洞类 → 风险维映射（payload-free，与 ledger.VULN_RISK_MAP 同意图但自洽，
+# 避免 knowledge ↔ ledger 循环导入）。用于 risk_dimensions_for 把卡的 vuln_classes
+# 派生为风险维清单（§3.1 风险维来源之一）。
+_VULN_RISK_DIM_MAP = {
+    "idor": ["object-ownership", "idor"],
+    "越权": ["object-ownership", "idor"],
+    "未授权": ["auth-flow", "auth-flow-abuse"],
+    "认证": ["auth-flow", "auth-flow-abuse"],
+    "sqli": ["input-validation", "injection"],
+    "sql": ["input-validation", "injection"],
+    "xss": ["input-validation"],
+    "ssrf": ["ssrf"],
+    "文件": ["file-upload", "path-traversal"],
+    "上传": ["file-upload"],
+    "业务逻辑": ["business-logic", "amount-tamper"],
+    "支付": ["payment", "accounting", "amount-tamper"],
+}
+
+# v6.1: 每个 surface 必答的强插维（治 640 R6：有登录态就不再回头测认证绕过）。
+_ALWAYS_INSERT_DIMS = ["auth-flow-abuse"]
 
 # Guardrail for the input-validation card. Keep this intentionally conservative:
 # the card may name dimensions and evidence classes, but not concrete strings
@@ -270,6 +294,93 @@ def resolve_negative_state(
     return SHALLOW_NEGATIVE, missing
 
 
+# ── v6.1: 阳性 depth_floor（与 negative_sufficiency 对称）──────────────────────
+def _positive_floor_from_card(card: dict) -> int:
+    """取单张卡的 positive_depth_floor.min_depth（缺则 0=不约束）。"""
+    pdf = card.get("positive_depth_floor") or {}
+    if not isinstance(pdf, dict):
+        return 0
+    try:
+        return int(pdf.get("min_depth", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def positive_depth_floor_for(
+    cell_or_surface_or_candidate: dict,
+    cards: list[dict] | None = None,
+) -> int:
+    """候选进 proof_ready 前的最低 depth_score（§6.1）。
+
+    由匹配卡的 ``positive_depth_floor.min_depth`` 派生，可抬不可降；
+    无卡匹配时取 ``DEFAULT_POSITIVE_DEPTH_FLOOR``。depth_score 由外壳按
+    已落盘证据计分（不信任模型自报），见 ``candidate.py``。
+    """
+    floor = DEFAULT_POSITIVE_DEPTH_FLOOR
+    for card in match_cards(cell_or_surface_or_candidate, cards) if cards else []:
+        floor = max(floor, _positive_floor_from_card(card))
+    return floor
+
+
+def positive_depth_meets(
+    candidate: dict,
+    cards: list[dict] | None = None,
+) -> tuple[bool, int, list[str]]:
+    """候选的 depth_score 是否达 depth_floor（§6.1）。
+
+    返回 ``(meets, floor, missing)``。``candidate["depth_score"]`` 由外壳按磁盘证据
+    计分（≥1 向量有响应=1，≥3 向量=2，≥2 角色/对象=3，根因扩散=4）。
+    不到 floor 不许标 proof_ready（防浅阳性丢更高严重度变体）。
+    """
+    floor = positive_depth_floor_for(candidate, cards)
+    score = int(candidate.get("depth_score", 0) or 0)
+    if score >= floor:
+        return True, floor, []
+    return False, floor, [
+        f"depth_score {score} < depth_floor {floor}：补足多向量/多角色/多对象对比证据"
+    ]
+
+
+def risk_dimensions_for(
+    surface: dict,
+    cards: list[dict] | None = None,
+) -> list[str]:
+    """派生 surface 的「风险维应答清单」（§3.1，payload-free）。
+
+    v6.1 把"榨干"从模型自觉改成外壳强制的确定性骨架：外壳按 surface 的 risk_tags
+    展开成风险维清单，模型必须对每一维应答（CANDIDATE 或 NONE:<reason>）。
+
+    维来源（复用既有，不含 payload）：
+      - surface.risk_tags（planner/ledger 已从参数语义+漏洞类派生）
+      - 匹配卡的 match.vuln_classes → _VULN_RISK_DIM_MAP 派生维
+      - 强插维：每个 surface 必答 ``auth-flow-abuse``（治 R6）
+
+    返回去重保序的维清单。
+    """
+    dims: list[str] = []
+    # 1) surface 自带 risk_tags（已含参数语义 + 漏洞类派生）
+    dims.extend(str(x) for x in _as_list(surface.get("risk_tags")))
+    # 2) 匹配卡的 vuln_classes → 维派生
+    for card in match_cards(surface, cards) if cards else []:
+        match = card.get("match") or {}
+        for vc in _as_list(match.get("vuln_classes")):
+            key = _norm_text(vc)
+            for needle, mapped in _VULN_RISK_DIM_MAP.items():
+                if needle in key or key in needle:
+                    dims.extend(mapped)
+    # 3) 强插维：每个 surface 必答 auth-flow-abuse
+    dims.extend(_ALWAYS_INSERT_DIMS)
+    # 去重保序
+    seen: set[str] = set()
+    out: list[str] = []
+    for d in dims:
+        key = _norm_text(d)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+
 def render_skill_hint(cards: list[dict] | None = None) -> str:
     """Render a compact, payload-free hint block for matched cards."""
     selected = cards or []
@@ -284,17 +395,27 @@ def render_skill_hint(cards: list[dict] | None = None) -> str:
         suff = card.get("negative_sufficiency") or {}
         min_vectors = suff.get("min_vectors", DEFAULT_MIN_VECTORS)
         min_response_count = suff.get("min_response_count", 1)
-        lines.append(f"- {title}: 维度={dimensions}；证据={evidence}；阴性闭合≥{min_vectors}向量/{min_response_count}响应")
+        pdf = card.get("positive_depth_floor") or {}
+        floor = pdf.get("min_depth", DEFAULT_POSITIVE_DEPTH_FLOOR)
+        lines.append(
+            f"- {title}: 维度={dimensions}；证据={evidence}；"
+            f"阴性闭合≥{min_vectors}向量/{min_response_count}响应；"
+            f"阳性depth_floor≥{floor}"
+        )
     return "\n".join(lines)
 
 
 __all__ = [
     "DEFAULT_MIN_VECTORS",
+    "DEFAULT_POSITIVE_DEPTH_FLOOR",
     "NEGATIVE_WITH_EVIDENCE",
     "SHALLOW_NEGATIVE",
     "load_cards",
     "match_cards",
     "negative_sufficient",
     "resolve_negative_state",
+    "positive_depth_floor_for",
+    "positive_depth_meets",
+    "risk_dimensions_for",
     "render_skill_hint",
 ]

@@ -29,5 +29,12 @@
     "min_response_count": 2,
     "required_evidence_types": ["owner_identity", "peer_identity", "object_ownership", "access_result"],
     "min_identities": 2
+  },
+  "positive_depth_floor": {
+    "min_depth": 3,
+    "min_vectors": 3,
+    "min_roles": 2,
+    "min_objects": 2,
+    "note": "IDOR/越权：2 角色×2 对象对比证据 + ≥3 独立向量，达 depth_score 3 才许 proof_ready"
   }
 }

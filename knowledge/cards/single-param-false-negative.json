@@ -1,0 +1,32 @@
+{
+  "id": "single-param-false-negative",
+  "title": "单参数误判",
+  "description": "只测一个参数就判阴性；同类入口的校验差异需多参数交叉验证。",
+  "match": {
+    "vuln_classes": ["SQLi", "XSS", "SSRF", "输入校验"],
+    "params": ["keyword", "search", "q", "sort", "orderBy", "filter", "page", "size", "type", "status", "url", "path", "id", "name"],
+    "keywords": ["search", "query", "filter", "sort", "orderby", "keyword", "param", "parameter"]
+  },
+  "dimensions": [
+    "同一入口的多个可控参数是否分别独立探测",
+    "同类参数在列表、详情、导出链路中的校验是否一致",
+    "是否只覆盖了显眼参数而遗漏次级或隐藏参数",
+    "每个参数是否保留独立的响应证据"
+  ],
+  "false_negative_rules": [
+    "只测一个参数不能证明同类入口校验闭合",
+    "只覆盖主参数不能证明次级参数安全",
+    "端点可达不等于每个参数都已测过"
+  ],
+  "evidence_required": [
+    "multi_param_coverage",
+    "per_param_evidence",
+    "baseline",
+    "boundary_result"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 4,
+    "min_response_count": 2,
+    "required_evidence_types": ["multi_param_coverage"]
+  }
+}

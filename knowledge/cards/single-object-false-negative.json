@@ -1,0 +1,33 @@
+{
+  "id": "single-object-false-negative",
+  "title": "单对象误判",
+  "description": "只测一个对象 id 就判 IDOR 阴性；对象归属差异需多个对象交叉验证。",
+  "match": {
+    "vuln_classes": ["越权/IDOR", "未授权访问"],
+    "params": ["id", "uid", "user_id", "order_id", "bug_id", "project_id", "address_id", "owner_id", "account_id"],
+    "keywords": ["detail", "profile", "order", "address", "project", "bug", "object", "identity_meta"]
+  },
+  "dimensions": [
+    "是否对多个不同归属的对象 id 交叉验证",
+    "不存在对象与存在他人对象是否分别被拒绝",
+    "列表、详情、修改、导出是否分别测不同对象",
+    "对象 id 是否可枚举或可猜测"
+  ],
+  "false_negative_rules": [
+    "只测一个对象 id 不能证明对象级授权闭合，IDOR 阴性需至少 2 个不同归属的对象对照",
+    "只测不存在对象不能证明他人对象被拒绝",
+    "只测自有对象不能覆盖跨账户对象边界"
+  ],
+  "evidence_required": [
+    "multi_object_coverage",
+    "object_ownership",
+    "peer_identity",
+    "access_result"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 4,
+    "min_response_count": 2,
+    "required_evidence_types": ["multi_object_coverage", "object_ownership", "access_result"],
+    "min_identities": 2
+  }
+}

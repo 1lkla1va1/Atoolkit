@@ -1,0 +1,32 @@
+{
+  "id": "no-echo-false-negative",
+  "title": "无回显误判",
+  "description": "盲打无直接回显就判无洞；需带外或时间盲注等二阶证据才能判阴性。",
+  "match": {
+    "vuln_classes": ["SQLi", "命令执行/RCE", "SSRF", "XSS", "盲注"],
+    "params": ["keyword", "search", "q", "sort", "orderBy", "filter", "url", "path", "cmd", "name", "query"],
+    "keywords": ["search", "query", "filter", "sort", "inject", "blind", "oob", "time", "echo"]
+  },
+  "dimensions": [
+    "无直接回显时是否采集二阶可观测信号",
+    "是否用带外回调验证可执行性",
+    "是否用时间盲注验证逻辑执行",
+    "无报错是否被误读为无漏洞"
+  ],
+  "false_negative_rules": [
+    "无直接回显不能判无洞",
+    "无报错不等于无注入",
+    "需带外或时间盲注等二阶证据才能判阴性"
+  ],
+  "evidence_required": [
+    "second_order_evidence",
+    "oob_callback",
+    "time_based_marker",
+    "baseline"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 5,
+    "min_response_count": 2,
+    "required_evidence_types": ["second_order_evidence"]
+  }
+}

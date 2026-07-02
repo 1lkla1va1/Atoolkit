@@ -173,6 +173,66 @@ def triage(reports: list[str], **kw) -> dict:
     return ledger
 
 
+def _clip_text(path: pathlib.Path, limit: int = 1600) -> str:
+    text = path.read_text(encoding="utf-8", errors="ignore").strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "\n... truncated"
+
+
+def guardian_check_finding(
+    finding: dict,
+    finding_dir: str | pathlib.Path,
+    authorized_hosts: list[str] | None = None,
+) -> Verdict:
+    """Validate a structured finding, then reuse Guardian on a Markdown excerpt."""
+    fdir = pathlib.Path(finding_dir).resolve()
+    run_dir = fdir.parents[1] if fdir.parent.name == "findings" and len(fdir.parents) > 1 else fdir.parent
+    try:
+        from engine.reporting.validate import validate_finding
+        from engine.reporting.schema import resolve_finding_file
+    except ImportError:
+        from reporting.validate import validate_finding
+        from reporting.schema import resolve_finding_file
+
+    finding_path = fdir / "finding.json"
+    validation = validate_finding(finding, finding_path, run_dir, authorized_hosts=authorized_hosts)
+    sev = str(finding.get("severity") or "").upper()
+    if not validation.ok:
+        return Verdict(REJECTED, 2, "structured finding invalid: " + "; ".join(validation.reasons), sev)
+
+    risk = finding.get("risk") or {}
+    poc = finding.get("poc") or {}
+    blocks: list[str] = [
+        "---",
+        f"severity: {sev}",
+        f"title: {finding.get('title', '')}",
+        f"target: {finding.get('target', '')}",
+        f"type: {finding.get('vuln_type', '')}",
+        "---",
+        "## 漏洞描述",
+        str(risk.get("summary", "")),
+        "## 影响范围",
+        "已证明影响：" + str(risk.get("proven_impact", "")),
+        "该 finding 已通过结构化证据校验，包含请求包、响应包、手工 Burp 复测步骤和可执行 PoC。",
+    ]
+    if poc.get("file"):
+        poc_path = resolve_finding_file(fdir, poc.get("file"), run_dir)
+        blocks.extend(["## PoC", "```", _clip_text(poc_path), "```"])
+    for packet in finding.get("proof_packets") or []:
+        if not isinstance(packet, dict):
+            continue
+        blocks.append("## 响应证据")
+        blocks.append(str(packet.get("evidence_summary") or ""))
+        for key in ("request_file", "response_file"):
+            if packet.get(key):
+                path = resolve_finding_file(fdir, packet.get(key), run_dir)
+                blocks.extend(["```", _clip_text(path), "```"])
+    blocks.append("## 复测步骤")
+    for step in finding.get("manual_burp_replay") or []:
+        blocks.append(f"- {step}")
+    excerpt = "\n".join(blocks)
+    return guardian_check(excerpt, evidence_dir=str(fdir), authorized_hosts=authorized_hosts)
+
+
 # ── §5 危险动作分级闸（治本：判「执行的命令」，不判模型叙述/抓回的数据）──────
 # 判别轴 = 动作(读/建/改删) × 归属(自有/他人) × 可逆性，而非 SQL 关键词本身。
 # 三档：allow 自动放行 / confirm 暂停人工确认 / block 灾难必杀（借鉴 bug bounty

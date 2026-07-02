@@ -29,5 +29,11 @@
     "min_response_count": 2,
     "required_evidence_types": ["anonymous_baseline", "authenticated_baseline"],
     "min_identities": 2
+  },
+  "positive_depth_floor": {
+    "min_depth": 2,
+    "min_vectors": 3,
+    "min_roles": 2,
+    "note": "认证流程滥用：≥2 角色对比 + ≥3 独立向量，达 depth_score 2 才许 proof_ready"
   }
 }

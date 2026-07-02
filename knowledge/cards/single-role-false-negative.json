@@ -1,0 +1,33 @@
+{
+  "id": "single-role-false-negative",
+  "title": "单角色误判",
+  "description": "只用一个身份就判越权阴性；跨角色授权边界需至少两个已授权身份对照。",
+  "match": {
+    "vuln_classes": ["越权/IDOR", "未授权访问", "认证绕过/枚举"],
+    "params": ["id", "uid", "user_id", "order_id", "project_id", "role", "owner_id", "account_id"],
+    "keywords": ["detail", "profile", "order", "address", "project", "role", "identity_meta", "permission"]
+  },
+  "dimensions": [
+    "对象读取与修改是否跨角色对照验证",
+    "不同角色对同一对象的授权边界是否一致",
+    "角色切换、令牌复用后的权限是否对照",
+    "是否只用自有身份自测而缺少对照身份"
+  ],
+  "false_negative_rules": [
+    "单身份自测不能证明对象级授权闭合",
+    "只比较页面文案不能证明后端权限一致",
+    "只用一个角色不能覆盖跨角色越权路径，越权或 IDOR 阴性需至少 2 个已授权角色对照"
+  ],
+  "evidence_required": [
+    "owner_identity",
+    "peer_identity",
+    "role_comparison",
+    "access_result"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 4,
+    "min_response_count": 2,
+    "required_evidence_types": ["owner_identity", "peer_identity", "role_comparison"],
+    "min_identities": 2
+  }
+}
