@@ -9,7 +9,7 @@ engine/orchestrator.py —— 模型无关编排外壳的心脏。
   - 状态在系统，不在模型记忆：CognitiveState 每轮落盘 + 每轮全量重注入。
   - 换模型只换 adapter，本文件零改动。
 
-广度支柱 1+2（见 design/广度提升设计.md §2）：
+广度支柱 1+2：
   - 支柱 1 · 不首洞即停：收到 VULN_FOUND 不再立即 return；会话终止改为三选一——
     ① 覆盖矩阵全格闭合 ② 预算耗尽(max_turns / 无进展超时) ③ 危险闸 block/needs_confirm。
   - 支柱 2 · 覆盖台账：CognitiveState 持有「攻击面 × 漏洞类」矩阵，每格四态

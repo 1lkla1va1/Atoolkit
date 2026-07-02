@@ -16,14 +16,12 @@ Use this skill to operate this repository as a ZCode skill package for **authori
 
 ## What to read, based on the task
 
-- For a quick orientation: read `README.md`.
+- For a quick orientation: read `run.py`.
 - For the core behavior rules injected into agents: read `skill/核心技能文件.v2.md`.
-- For Codex manual setup and `/src` usage: read `codex/USAGE.md` and `codex/prompts/src.md`.
+- For Codex `/src` usage: read `codex/prompts/src.md`.
 - For one-command orchestration: read `run.py`, then relevant files in `engine/`.
 - For report quality gates / Guardian behavior: read `engine/enforce.py`.
 - For deterministic replay verification: read `engine/verify.py`.
-- For design rationale: read `design/AI_SRC挖掘设计思路.md` and `design/AI_SRC落地实施方案.md`.
-- For recent behavior changes: read `CHANGELOG.md`.
 
 Paths in this skill are relative to the skill package root.
 
@@ -31,15 +29,11 @@ Paths in this skill are relative to the skill package root.
 
 ### 1. Install for Codex mode A
 
-Follow `codex/USAGE.md`:
-
 ```bash
 cp codex/AGENTS.md ~/.codex/AGENTS.md
 mkdir -p ~/.codex/prompts
 cp codex/prompts/src.md ~/.codex/prompts/src.md
 ```
-
-Then merge the needed keys from `codex/config.toml.example` into `~/.codex/config.toml`.
 
 ### 2. Run mode B dry-run
 
@@ -77,4 +71,3 @@ When reviewing or writing findings, enforce the core rules from `skill/核心技
 
 - Edit only `skill/核心技能文件.v2.md` for core rule changes.
 - Regenerate `codex/AGENTS.md` with `bash codex/regen_agents.sh` after core rule changes.
-- Record meaningful changes in `CHANGELOG.md`.

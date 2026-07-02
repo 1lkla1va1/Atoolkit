@@ -16,7 +16,20 @@ __pycache__/
 # 临时抽取产物
 *_extract.txt
 
-# 本地设计/迭代/测试材料（核心运行不依赖，不随运行提交上传）
+# 本地设计/说明/测试材料（核心运行不依赖，不随运行提交上传）
+README.md
+CHANGELOG.md
+design/
 fixtures/
+knowledge-base/
+opencode/
 project-memory/
-design/迭代方案/
+raw-materials/
+
+# 本地安装说明 / 草稿 / 对照材料
+codex/USAGE.md
+codex/config.toml.example
+skill/核心技能文件.md
+skill/核心技能文件.v1-v2.diff
+skill/核心技能文件.v1-v2.sidebyside.txt
+skill/核心技能文件.审核对照.md

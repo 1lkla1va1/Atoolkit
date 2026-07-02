@@ -278,10 +278,10 @@ def _merge_inventory_records(records: list[dict]) -> list[dict]:
 
 
 def _run_self_check() -> int:
-    """--self-check 自检门：在固定 fixture 上跑断言，不接真实模型/网络。
+    """--self-check 自检门：临时生成 fixture 跑断言，不接真实模型/网络。
 
     三条断言（全过 exit 0，任一失败 exit 1 并打印哪条失败）：
-      1. surface.bootstrap(fixtures/recon_sample) 覆盖 oracle_sample 全部端点。
+      1. surface.bootstrap(recon_sample) 覆盖 oracle_sample 全部端点。
       2. 浅阴性 ledger（非高价值、无 next_actions 的 shallow_negative 格）→
          session_gate.evaluate_session_gate 返回 incomplete（演示 P0-2）。
       3. 合格报告（target/curl/响应证据）→ enforce.guardian_check accepted。
@@ -294,9 +294,124 @@ def _run_self_check() -> int:
     from engine.enforce import guardian_check, ACCEPTED
     import tempfile, shutil
 
-    recon_dir = ROOT / "fixtures" / "recon_sample"
-    oracle_path = ROOT / "fixtures" / "oracle_sample.json"
-    print("▶ self-check（固定 fixture，不接模型/网络）")
+    def _write_text(path: pathlib.Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def _make_self_check_fixtures(base: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+        """生成自检所需的最小样例，避免把 fixtures/ 测试数据放进仓库。"""
+        recon = base / "recon_sample"
+        reporting = base / "reporting" / "basic_idor"
+        _write_text(recon / "app.js", (
+            "fetch('/api/order/detail?order_no=1');\n"
+            "axios.post('/api/user/login', { password: 'redacted' });\n"
+        ))
+        _write_text(recon / "page.html", """<!doctype html>
+<html lang="zh">
+<body>
+  <form action="/api/user/login" method="POST">
+    <input name="password" type="password">
+  </form>
+  <a href="/api/order/list">order list</a>
+</body>
+</html>
+""")
+        _write_text(recon / "traffic.har", json.dumps({
+            "log": {
+                "version": "1.2",
+                "creator": {"name": "atoolkit-self-check", "version": "1.0"},
+                "entries": [{
+                    "request": {
+                        "method": "GET",
+                        "url": "https://t.example/api/user/info",
+                        "headers": [],
+                    },
+                    "response": {"status": 200, "statusText": "OK"},
+                }],
+            }
+        }, ensure_ascii=False, indent=2))
+        oracle = base / "oracle_sample.json"
+        _write_text(oracle, json.dumps([
+            {"id": "case-001", "endpoint": "/api/order/detail", "method": "GET",
+             "params": ["order_no"], "class": "越权/IDOR", "score": 3.0, "roles": []},
+            {"id": "case-002", "endpoint": "/api/user/login", "method": "POST",
+             "params": ["password"], "class": "认证", "score": 2.0, "roles": []},
+            {"id": "case-003", "endpoint": "/api/order/list", "method": "GET",
+             "params": [], "class": "越权/IDOR", "score": 2.0, "roles": []},
+            {"id": "case-004", "endpoint": "/api/user/info", "method": "GET",
+             "params": [], "class": "信息泄露", "score": 2.0, "roles": []},
+            {"id": "case-005", "endpoint": "/api/orders/{id}", "method": "GET",
+             "params": [], "class": "越权/IDOR", "score": 3.0, "roles": [],
+             "discovered_during_testing": True},
+        ], ensure_ascii=False, indent=2))
+        _write_text(reporting / "finding.json", json.dumps({
+            "schema_version": 1,
+            "id": "finding_001",
+            "title": "订单详情接口存在水平越权漏洞",
+            "severity": "P1",
+            "vuln_type": "越权/IDOR",
+            "target": "https://t.example",
+            "risk": {
+                "summary": "攻击者可读取其他用户订单详情。",
+                "proven_impact": "实测 B 账号读取到 A 账号订单收货地址与金额。",
+            },
+            "recommendation": {
+                "summary": "服务端按当前登录身份校验订单归属。",
+                "details": ["查询订单详情时绑定 current_user_id 与 order_id。"],
+            },
+            "feature_point": {
+                "module": "订单模块",
+                "function": "订单详情查询",
+                "trigger": "进入订单详情页时触发",
+                "trigger_api": "GET /api/order/detail",
+                "vulnerable_param": "order_id",
+                "statement": "订单模块 -> 订单详情查询，触发 GET /api/order/detail 接口，order_id 参数存在水平越权漏洞。",
+            },
+            "apis": [{
+                "method": "GET",
+                "path": "/api/order/detail",
+                "purpose": "根据订单 ID 查询订单详情",
+                "risk_params": ["order_id"],
+                "params": [{"name": "order_id", "location": "query", "risk": "服务端未校验订单归属"}],
+            }],
+            "proof_packets": [{
+                "name": "attacker_read_victim_order",
+                "request_file": "request_1.http",
+                "response_file": "response_1.http",
+                "evidence_summary": "响应中返回受害者订单地址与金额。",
+            }],
+            "manual_burp_replay": [
+                "登录攻击者账号并进入订单详情页面。",
+                "使用 Burp Suite 捕获 GET /api/order/detail 请求。",
+                "将 order_id 修改为受害者订单 ID。",
+                "重放请求后响应中返回受害者订单详情。",
+            ],
+            "poc": {
+                "type": "curl",
+                "file": "poc.sh",
+                "description": "替换 Cookie 与 order_id 后可复现越权读取。",
+            },
+            "source_proof": None,
+            "crypto_chain": None,
+        }, ensure_ascii=False, indent=2))
+        _write_text(reporting / "poc.sh", (
+            "curl 'https://t.example/api/order/detail?order_id=1001' \\\n"
+            "  -H 'Cookie: session=attacker_b' \\\n"
+            "  -H 'Accept: application/json'\n"
+        ))
+        _write_text(reporting / "request_1.http", (
+            "GET /api/order/detail?order_id=1001 HTTP/1.1\n"
+            "Host: t.example\nCookie: session=attacker_b\nAccept: application/json\n\n"
+        ))
+        _write_text(reporting / "response_1.http", (
+            "HTTP/1.1 200 OK\nContent-Type: application/json\n\n"
+            "{\"order_id\":\"1001\",\"owner\":\"victim_a\",\"address\":\"北京市海淀区示例路 1 号\",\"amount\":\"1299.00\"}\n"
+        ))
+        return recon, oracle, reporting
+
+    fixture_root = pathlib.Path(tempfile.mkdtemp(prefix="atoolkit-selfcheck-"))
+    recon_dir, oracle_path, reporting_fixture = _make_self_check_fixtures(fixture_root)
+    print("▶ self-check（临时 fixture，不接模型/网络）")
 
     failures: list[str] = []
 
@@ -408,7 +523,7 @@ def _run_self_check() -> int:
     def _assert7():
         from engine.reporting.schema import load_finding
         from engine.reporting.validate import validate_finding
-        fixture = ROOT / "fixtures" / "reporting" / "basic_idor"
+        fixture = reporting_fixture
         finding = load_finding(fixture / "finding.json")
         ok = validate_finding(finding, fixture / "finding.json", fixture,
                               authorized_hosts=["t.example"])
@@ -438,7 +553,7 @@ def _run_self_check() -> int:
     def _assert8():
         from engine.reporting.collect import collect_structured_findings
         from engine.reporting.render_md import render_final_report
-        fixture = ROOT / "fixtures" / "reporting" / "basic_idor"
+        fixture = reporting_fixture
         tmp = pathlib.Path(tempfile.mkdtemp())
         dst = tmp / "findings" / "finding_001"
         shutil.copytree(fixture, dst)
@@ -459,7 +574,7 @@ def _run_self_check() -> int:
     # 断言9：_conclude 等价闭环写 final_report_path，gate 未过时 draft_incomplete。
     def _assert9():
         from engine.orchestrator import CognitiveState, harvest_evidence, _conclude
-        fixture = ROOT / "fixtures" / "reporting" / "basic_idor"
+        fixture = reporting_fixture
         tmp = pathlib.Path(tempfile.mkdtemp())
         dst = tmp / "findings" / "finding_001"
         shutil.copytree(fixture, dst)
@@ -644,8 +759,10 @@ def _run_self_check() -> int:
         print(f"\n✗ self-check 失败（{len(failures)} 条）:", file=sys.stderr)
         for fail in failures:
             print(f"  - {fail}", file=sys.stderr)
+        shutil.rmtree(fixture_root, ignore_errors=True)
         return 1
     print("✅ self-check 全部通过")
+    shutil.rmtree(fixture_root, ignore_errors=True)
     return 0
 
 
@@ -684,7 +801,7 @@ def main():
                     help="断点续测：复用 --sid 的 runs/<sid>/state.json 承接覆盖进度（无则照常新开）")
     ap.add_argument("--dry-run", action="store_true", help="用 MockAdapter，不接模型/网络")
     ap.add_argument("--self-check", action="store_true",
-                    help="自检门：在固定 fixture 上跑断言（不接模型/网络），全过 exit 0、失败 exit 1；"
+                    help="自检门：临时生成 fixture 跑断言（不接模型/网络），全过 exit 0、失败 exit 1；"
                          "独立于 --target/--authz，可不带这两参数")
     # v6.1 §10.3 flags
     ap.add_argument("--loop-mode", default="recall-first",
@@ -705,7 +822,7 @@ def main():
                          "算 hit/total（oracle 命中 confirmed surface 数）并打印")
     args = ap.parse_args()
 
-    # --self-check：在固定 fixture 上跑断言，不接模型/网络，独立于 --target/--authz。
+    # --self-check：临时生成 fixture 跑断言，不接模型/网络，独立于 --target/--authz。
     if args.self_check:
         return _run_self_check()
     # 非 self-check：--target/--authz 仍为必填（argparse 层已放宽为非 required 以放行 --self-check）。
