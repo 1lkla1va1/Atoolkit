@@ -41,6 +41,12 @@ SRC_MANUAL = "manual"
 _API_NEEDLE = "/api/"                                   # 通用 API 路径前缀，非业务名
 _PHP_PATH = re.compile(r"^[A-Za-z0-9_][\w./-]*\.php(?:\?[\w=&%.-]*)?$")
 _BAD_PATH_CHARS = frozenset(" \t\r\n\"'<>|\\^`")        # 路径里不应出现的字符
+_STATIC_EXTS = {
+    ".css", ".js", ".mjs", ".cjs", ".map",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".mp4", ".webm", ".mp3", ".wav",
+}
 
 
 def _dedupe(values: Iterable[Any]) -> list[str]:
@@ -88,6 +94,12 @@ def _is_endpoint_path(path: str) -> bool:
     if path.startswith("/"):
         return any(seg for seg in path.split("/"))                 # 至少一个非空段
     return bool(_PHP_PATH.match(path))                             # 无前导 / 只认 .php 相对路径
+
+
+def _is_static_asset_path(path: str) -> bool:
+    """静态资源不是业务测试 surface；JS 文件会作为 recon 输入单独解析。"""
+    clean = path.split("?", 1)[0].split("#", 1)[0].lower()
+    return any(clean.endswith(ext) for ext in _STATIC_EXTS)
 
 
 # 自由文本里的 URL/路径候选 token（P1-3：深测新发现 endpoint hook 用）。
@@ -282,11 +294,11 @@ def _extract_html(text: str) -> list[tuple[str, str, list[str], int, str]]:
             if not url:
                 continue
             path, params = _split_url(url)
-            if _is_endpoint_path(path):
+            if _is_endpoint_path(path) and not _is_static_asset_path(path):
                 out.append((path, "GET", params, _line_no(text, tm.start()), attr_name))
     for m in _DATA_SRC_RE.finditer(text):
         path, params = _split_url(m.group(1))
-        if _is_endpoint_path(path):
+        if _is_endpoint_path(path) and not _is_static_asset_path(path):
             out.append((path, "GET", params, _line_no(text, m.start()), "data-src"))
     return out
 

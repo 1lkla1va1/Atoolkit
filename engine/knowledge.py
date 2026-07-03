@@ -88,6 +88,21 @@ def _unique_norm(values: list) -> set[str]:
     return {_norm_text(v) for v in values if _norm_text(v)}
 
 
+def _expand_evidence_types(values: list) -> set[str]:
+    out = _unique_norm(values)
+    aliases = {
+        "baseline_valid_login": {"baseline", "authenticated_baseline"},
+        "baseline_invalid_login": {"baseline", "anonymous_baseline"},
+        "per_param_evidence": {"multi_param_coverage"},
+        "multi_payload_family_coverage": {"boundary_result"},
+        "alternate_content_type": {"type_result"},
+        "timing_result": {"second_order_evidence", "time_based_marker"},
+    }
+    for value in list(out):
+        out.update(aliases.get(value, set()))
+    return out
+
+
 def _string_values(obj: Any) -> list[str]:
     if isinstance(obj, dict):
         out: list[str] = []
@@ -228,7 +243,16 @@ def _requirements(cell: dict, cards: list[dict] | None) -> tuple[int, int, set[s
     required_roles: set[str] = set()
     labels: list[str] = []
 
+    ctx = _match_context(cell)
+    vuln = str(ctx.get("vuln") or "")
     for card in match_cards(cell, cards) if cards else []:
+        match = card.get("match") or {}
+        card_vulns = _as_list(match.get("vuln_classes"))
+        if vuln and card_vulns and not any(
+            _norm_text(x) and (_norm_text(x) == vuln or _norm_text(x) in vuln)
+            for x in card_vulns
+        ):
+            continue
         labels.append(str(card.get("title") or card.get("id")))
         suff = card.get("negative_sufficiency") or {}
         min_vectors = max(min_vectors, int(suff.get("min_vectors", 0) or 0))
@@ -254,7 +278,7 @@ def negative_sufficient(
     """
     vectors = _unique_norm(_as_list(negative_obj.get("vectors")))
     response_count = int(negative_obj.get("response_count", 0) or 0)
-    evidence_types = _unique_norm(_as_list(negative_obj.get("evidence_types")))
+    evidence_types = _expand_evidence_types(_as_list(negative_obj.get("evidence_types")))
     identities = _unique_norm(_as_list(negative_obj.get("identities")))
     roles = _unique_norm(_as_list(negative_obj.get("roles")))
 

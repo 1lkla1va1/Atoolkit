@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 import argparse, inspect, sys, time, re, pathlib, json
+from fnmatch import fnmatch
 
 ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -79,6 +80,111 @@ def _oracle_hit_str(oracle_path: str, res: dict) -> str:
         return f"{len(ev['hits'])}/{len(oracle)}"
     except Exception as e:                       # oracle 缺失/格式错 → 不阻断收尾打印
         return f"err:{type(e).__name__}"
+
+
+def _render_scorecard_md(result: dict, *, sid: str, oracle_path: pathlib.Path,
+                         summary_path: pathlib.Path, coverage_path: pathlib.Path) -> str:
+    meta = result.get("meta") or {}
+    hits = result.get("hits") or []
+    misses = result.get("misses") or []
+    lines = [
+        f"# Atoolkit Scorecard: {sid}",
+        "",
+        f"- oracle_used_post_run_only: `{meta.get('oracle_used_post_run_only', True)}`",
+        f"- oracle: `{oracle_path}`",
+        f"- summary: `{summary_path}`",
+        f"- coverage: `{coverage_path}`",
+        f"- hits: `{len(hits)}/{meta.get('oracle_cases', len(hits) + len(misses))}`",
+        f"- score: `{result.get('total_score', 0)}/{result.get('max_score', 0)}`",
+        f"- score_rate: `{result.get('score_rate', 0)}`",
+        "",
+        "## Hits",
+    ]
+    if hits:
+        for item in hits[:50]:
+            oc = item.get("oracle") or {}
+            finding = item.get("finding") or {}
+            lines.append(
+                f"- `{oc.get('id','')}` {oc.get('endpoint','')} "
+                f"{oc.get('params', [])} -> `{finding.get('id','')}`")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Misses"])
+    if misses:
+        for item in misses[:100]:
+            oc = item.get("oracle") or {}
+            attr = item.get("attribution") or {}
+            lines.append(
+                f"- `{oc.get('id','')}` {oc.get('endpoint','')} "
+                f"{oc.get('params', [])} class={oc.get('class','')} "
+                f"coverage={attr.get('status','unknown')}")
+    else:
+        lines.append("- none")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _score_run(argv: list[str]) -> int:
+    """Offline post-run score command.
+
+    This deliberately reads only run artifacts plus the oracle. It never feeds
+    oracle contents into the attack prompt or live session state.
+    """
+    ap = argparse.ArgumentParser(description="赛后离线评分，只读 summary/coverage/findings，不进入攻击 prompt")
+    ap.add_argument("--sid", default="", help="runs/<sid> 会话 ID")
+    ap.add_argument("--run-dir", default="", help="显式 run 目录；优先于 --sid")
+    ap.add_argument("--oracle", required=True, type=pathlib.Path, help="Oracle file: JSON/YAML/CSV/PHP array")
+    ap.add_argument("--summary", default=None, type=pathlib.Path, help="默认 <run-dir>/summary.json")
+    ap.add_argument("--coverage", default=None, type=pathlib.Path, help="默认 <run-dir>/coverage-ledger.json")
+    ap.add_argument("--compact", action="store_true", help="stdout 输出 compact JSON")
+    args = ap.parse_args(argv)
+
+    if args.run_dir:
+        run_dir = pathlib.Path(args.run_dir)
+        sid = run_dir.name
+    elif args.sid:
+        sid = args.sid
+        run_dir = ROOT / "runs" / sid
+    else:
+        ap.error("--sid 或 --run-dir 必填")
+    summary_path = args.summary or (run_dir / "summary.json")
+    coverage_path = args.coverage or (run_dir / "coverage-ledger.json")
+    if not summary_path.exists():
+        ap.error(f"summary 不存在: {summary_path}")
+    if not coverage_path.exists():
+        ap.error(f"coverage-ledger 不存在: {coverage_path}")
+    if not args.oracle.exists():
+        ap.error(f"oracle 不存在: {args.oracle}")
+
+    from engine import benchmark_eval as be
+    oracle = be.load_oracle(args.oracle)
+    findings = be.load_findings(summary_path)
+    coverage = be.load_coverage(coverage_path)
+    result = be.evaluate(oracle, findings, coverage)
+    result["meta"] = {
+        "oracle_cases": len(oracle),
+        "findings": len(findings),
+        "coverage_surfaces": len(coverage),
+        "sid": sid,
+        "run_dir": str(run_dir.resolve()),
+        "summary": str(summary_path.resolve()),
+        "coverage": str(coverage_path.resolve()),
+        "oracle": str(args.oracle.resolve()),
+        "oracle_used_post_run_only": True,
+    }
+    run_dir.mkdir(parents=True, exist_ok=True)
+    scorecard_json = run_dir / "scorecard.json"
+    scorecard_md = run_dir / "scorecard.md"
+    scorecard_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    scorecard_md.write_text(
+        _render_scorecard_md(result, sid=sid, oracle_path=args.oracle,
+                             summary_path=summary_path, coverage_path=coverage_path),
+        encoding="utf-8")
+    json.dump(result, sys.stdout, ensure_ascii=False, indent=None if args.compact else 2)
+    sys.stdout.write("\n")
+    print(f"scorecard_json={scorecard_json}")
+    print(f"scorecard_md={scorecard_md}")
+    return 0
 
 
 def _print_open_high_value(res: dict):
@@ -212,11 +318,47 @@ def _summary_status(res: dict) -> str:
     return status
 
 
-def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list[str], list[dict]]:
+def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list, list[dict]]:
     p = pathlib.Path(arg)
-    endpoints: list[str] = []
+    endpoints: list = []
     records: list[dict] = []
     if p.exists():
+        if p.suffix.lower() == ".json":
+            data = json.loads(p.read_text(encoding="utf-8"))
+            raw_items = data.get("endpoints") if isinstance(data, dict) else data
+            for index, item in enumerate(raw_items or [], start=1):
+                if isinstance(item, dict):
+                    endpoint = str(item.get("endpoint") or item.get("path") or item.get("url") or "").strip()
+                    if not endpoint:
+                        continue
+                    rec = {
+                        "endpoint": endpoint,
+                        "method": str(item.get("method") or "GET").upper(),
+                        "params": item.get("params") or item.get("parameters") or [],
+                        "source": item.get("source") or "endpoints",
+                        "source_file": str(p.resolve()),
+                        "source_line": item.get("source_line") or index,
+                        "source_kind": item.get("source_kind") or "endpoints_json",
+                        "last_seen": item.get("last_seen") or "",
+                        "discovered_during_testing": bool(item.get("discovered_during_testing", False)),
+                    }
+                    endpoints.append(rec)
+                    records.append(rec)
+                    continue
+                endpoint = str(item or "").strip()
+                if endpoint:
+                    endpoints.append(endpoint)
+                    records.append({
+                        "endpoint": endpoint,
+                        "method": "GET",
+                        "source": "endpoints",
+                        "source_file": str(p.resolve()),
+                        "source_line": index,
+                        "source_kind": "endpoints_json",
+                        "last_seen": "",
+                        "discovered_during_testing": False,
+                    })
+            return endpoints, records
         raw_lines = p.read_text(encoding="utf-8").splitlines()
         for line_no, line in enumerate(raw_lines, start=1):
             endpoint = line.strip()
@@ -275,6 +417,42 @@ def _merge_inventory_records(records: list[dict]) -> list[dict]:
             if not cur.get(field) and rec.get(field):
                 cur[field] = rec[field]
     return list(merged.values())
+
+
+def _endpoint_excluded(endpoint: str, patterns: list[str]) -> bool:
+    """Return True when an endpoint matches a user-supplied exclude pattern.
+
+    Patterns are intentionally simple: shell-style globs, with a substring
+    fallback for common path snippets such as ``vuln.php``.
+    """
+    ep = str(endpoint or "").strip()
+    low = ep.lower()
+    for raw in patterns or []:
+        pat = str(raw or "").strip()
+        if not pat:
+            continue
+        p_low = pat.lower()
+        if fnmatch(low, p_low) or p_low in low:
+            return True
+    return False
+
+
+def _filter_endpoint_records(records: list[dict], patterns: list[str]) -> list[dict]:
+    if not patterns:
+        return records
+    return [r for r in records
+            if not _endpoint_excluded(str(r.get("endpoint") or ""), patterns)]
+
+
+def _filter_inventory(items: list, patterns: list[str]) -> list:
+    if not patterns:
+        return items
+    out = []
+    for item in items:
+        endpoint = item.get("endpoint") if isinstance(item, dict) else item
+        if not _endpoint_excluded(str(endpoint or ""), patterns):
+            out.append(item)
+    return out
 
 
 def _run_self_check() -> int:
@@ -741,11 +919,93 @@ def _run_self_check() -> int:
         assert out.get("coverage_gaps_nonempty"), "coverage_gaps_nonempty should be True"
         print(f"  断言15 ✅ proof_ready无finding → incomplete + gaps④={len(gaps.get('proof_ready_without_finding',[]))}条")
 
+    def _assert16():
+        """v6.2 loop phase 注入与 events.jsonl 记录生效。"""
+        import tempfile
+        from engine.orchestrator import run_session
+
+        class PhaseAdapter:
+            name = "phase"
+            def run(self, prompt, *, session_id):
+                assert "## Loop 编排器" in prompt, "正式覆盖跑 prompt 应注入 Loop 编排器"
+                assert "phase: recall" in prompt, "无候选首轮应进入 recall phase"
+                yield "DIM: input-validation | NONE: 本轮无候选\nLOW_ROI\n"
+
+        tmp = pathlib.Path(tempfile.mkdtemp()) / "runs" / "sess-phase"
+        tmp.mkdir(parents=True)
+        out = run_session(
+            PhaseAdapter(),
+            target="https://t.example",
+            authz="仅限 https://t.example，已授权。",
+            core_skill="self-check",
+            workdir=str(tmp),
+            authorized_hosts=["t.example"],
+            max_turns=1,
+            endpoints=[{"endpoint": "/api/search", "params": ["keyword"]}],
+            vuln_classes=["SQLi"],
+            verbose=False,
+        )
+        events = [json.loads(line) for line in (tmp / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+        start = next(e for e in events if e.get("ev") == "start")
+        turn = next(e for e in events if e.get("ev") == "turn")
+        assert start.get("loop", {}).get("mode") == "recall-first", start
+        assert turn.get("loop_phase") == "recall", turn
+        assert out.get("coverage_ledger_path") and pathlib.Path(out["coverage_ledger_path"]).exists(), out
+        print("  断言16 ✅ v6.2 loop phase: prompt 注入 + events.jsonl loop_phase=recall")
+
+    def _assert17():
+        """run.py score 只读赛后产物并写 scorecard.json/md。"""
+        import tempfile
+        tmp = pathlib.Path(tempfile.mkdtemp()) / "runs" / "sess-score"
+        tmp.mkdir(parents=True)
+        oracle = tmp / "oracle.json"
+        oracle.write_text(json.dumps([{
+            "id": "case-001", "endpoint": "/api/order/detail", "method": "GET",
+            "params": ["order_no"], "class": "越权/IDOR", "score": 160, "roles": [],
+        }], ensure_ascii=False), encoding="utf-8")
+        (tmp / "evidence.json").write_text(json.dumps({
+            "request": {
+                "method": "GET",
+                "url": "https://t.example/api/order/detail?order_no=1001",
+            }
+        }, ensure_ascii=False), encoding="utf-8")
+        (tmp / "summary.json").write_text(json.dumps({
+            "findings": [{
+                "id": "finding_001",
+                "endpoint": "/api/order/detail",
+                "class": "越权/IDOR",
+                "evidence_file": "evidence.json",
+            }]
+        }, ensure_ascii=False), encoding="utf-8")
+        (tmp / "coverage-ledger.json").write_text(json.dumps({
+            "schema_version": 1,
+            "surfaces": [{
+                "surface_id": "GET /api/order/detail order_no [user] {object-ownership,idor}",
+                "endpoint": "/api/order/detail",
+                "method": "GET",
+                "param": "order_no",
+                "roles": ["user"],
+                "risk_tags": ["object-ownership", "idor"],
+                "status": "confirmed",
+            }]
+        }, ensure_ascii=False), encoding="utf-8")
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = _score_run(["--run-dir", str(tmp), "--oracle", str(oracle), "--compact"])
+        assert rc == 0
+        scorecard = json.loads((tmp / "scorecard.json").read_text(encoding="utf-8"))
+        assert scorecard["meta"]["oracle_used_post_run_only"] is True
+        assert len(scorecard["hits"]) == 1 and scorecard["total_score"] == 160
+        assert (tmp / "scorecard.md").exists()
+        print("  断言17 ✅ score: 离线评分写 scorecard.json/md 且 oracle_used_post_run_only=true")
+
     for name, fn in (("断言1", _assert1), ("断言2", _assert2), ("断言3", _assert3),
                      ("断言4", _assert4), ("断言5", _assert5), ("断言6", _assert6),
                      ("断言7", _assert7), ("断言8", _assert8), ("断言9", _assert9),
                      ("断言10", _assert10), ("断言11", _assert11), ("断言12", _assert12),
-                     ("断言13", _assert13), ("断言14", _assert14), ("断言15", _assert15)):
+                     ("断言13", _assert13), ("断言14", _assert14), ("断言15", _assert15),
+                     ("断言16", _assert16), ("断言17", _assert17)):
         try:
             fn()
         except AssertionError as exc:
@@ -767,6 +1027,8 @@ def _run_self_check() -> int:
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "score":
+        return _score_run(sys.argv[2:])
     ap = argparse.ArgumentParser(description="起一次授权 SRC 会话（engine 三件套接线）")
     ap.add_argument("--target", default="", help="授权目标 URL")
     ap.add_argument("--authz", default="", help="授权说明文本，或授权文件路径")
@@ -774,7 +1036,7 @@ def main():
     ap.add_argument("--bearer", default="", help="人已拿到的新鲜 Bearer JWT（与 --cookie 二选一）")
     ap.add_argument("--auth-scheme", choices=["cookie", "bearer"], default="cookie",
                     help="--identity 凭据的注入方式：cookie→Cookie 头；bearer→Authorization: Bearer")
-    ap.add_argument("--model", default="gpt-5.5-codex", help="模型名（换模型只改这里）")
+    ap.add_argument("--model", default="gpt-5.5", help="模型名（换模型只改这里）")
     ap.add_argument("--allow", action="append", default=[], help="额外授权 host（可多次）")
     ap.add_argument("--identity", action="append", default=[],
                     help="复验身份 label:cred（cookie 模式如 owner:session=A；bearer 模式如 owner:eyJ...；可多次）")
@@ -789,6 +1051,8 @@ def main():
     ap.add_argument("--recon-dir", default="",
                     help="recon 产物目录(JS/HTML/JSON/HAR)；由 engine.surface.bootstrap 解析为攻击面，"
                          "喂 planner.plan_surfaces 展开后与 --endpoints 合并")
+    ap.add_argument("--exclude-endpoint", action="append", default=[],
+                    help="从 inventory/coverage 输入排除 endpoint（glob 或路径片段，可多次；例如 vuln.php）")
     ap.add_argument("--ad-hoc", action="store_true",
                     help="显式声明退化单点验证(无 --endpoints/--recon-dir 时放行空启动，退化为首洞即结)")
     ap.add_argument("--vuln-class", action="append", default=[],
@@ -854,6 +1118,8 @@ def main():
     endpoint_inv_records: list[dict] = []
     if args.endpoints:
         endpoints, endpoint_inv_records = _inventory_records_from_endpoint_arg(args.endpoints)
+        endpoints = _filter_inventory(endpoints, args.exclude_endpoint)
+        endpoint_inv_records = _filter_endpoint_records(endpoint_inv_records, args.exclude_endpoint)
     inventory: list = list(endpoints)  # str（--endpoints）+ dict（recon bootstrap 展开）
     inventory_records: list[dict] = list(endpoint_inv_records)
     from engine.surface import is_saturated
@@ -861,6 +1127,7 @@ def main():
     if args.recon_dir:
         from engine.surface import bootstrap
         recon_surfaces = bootstrap(pathlib.Path(args.recon_dir))
+        recon_surfaces = _filter_endpoint_records(recon_surfaces, args.exclude_endpoint)
         if not recon_surfaces:
             print(f"  ⚠ --recon-dir {args.recon_dir} 未解析出任何攻击面", file=sys.stderr)
         # P1-3：落 endpoint 台账 inventory.json（与 coverage-ledger.json 同目录）。
@@ -889,7 +1156,7 @@ def main():
             for s in recon_surfaces
         ] + existing_discovered
         inventory_records.extend(inv_records)
-        inventory.extend(plan_surfaces(recon_surfaces))
+        inventory.extend(_filter_inventory(plan_surfaces(recon_surfaces), args.exclude_endpoint))
 
     # 正式覆盖跑统一落 endpoint 台账：--endpoints-only 也必须有 inventory.json，
     # 这样 session_gate 能解释 endpoint 来源，报告引用未登记面也能被拦住。
@@ -904,7 +1171,8 @@ def main():
                                        if isinstance(r, dict) and r.get("discovered_during_testing")]
             except Exception:
                 existing_discovered = []
-        inv_records = _merge_inventory_records(inventory_records + existing_discovered)
+        inv_records = _merge_inventory_records(
+            _filter_endpoint_records(inventory_records + existing_discovered, args.exclude_endpoint))
         inv_path.write_text(
             json.dumps({"endpoints": inv_records,
                         "saturation_reached": is_saturated(inv_records)},
@@ -979,6 +1247,8 @@ def main():
     run_kwargs["no_flow_surfaces"] = args.no_flow_surfaces
     if args.lens:
         run_kwargs["lens"] = [x.strip() for x in args.lens.split(",") if x.strip()]
+    if "exclude_endpoints" in inspect.signature(run_session).parameters:
+        run_kwargs["exclude_endpoints"] = args.exclude_endpoint
     res = run_session(adapter, **run_kwargs)
     # 硬门：正式覆盖跑必须同时有 inventory 与 ledger；否则终态强制 incomplete。
     led_stats = (res.get("coverage_ledger") or {}).get("stats") or {}

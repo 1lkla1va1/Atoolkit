@@ -6,7 +6,7 @@ Codex 适配器 —— 把 `codex exec` 包成 orchestrator.py 需要的 ModelAd
 
 用法：
     from codex_adapter import CodexAdapter
-    adapter = CodexAdapter(model="gpt-5.5-codex", workdir="runs/sess-xxx")
+    adapter = CodexAdapter(model="gpt-5.5", workdir="runs/sess-xxx")
     for chunk in adapter.run(prompt, session_id="sess-xxx"):
         ...   # 交给 orchestrator 的强制层/解析层
 
@@ -14,14 +14,27 @@ Codex 适配器 —— 把 `codex exec` 包成 orchestrator.py 需要的 ModelAd
 注意：实际 flag 名以 `codex exec --help` 为准，不同版本可能不同；下方按通用语义给出。
 """
 import os
+import pathlib
 import subprocess
 from typing import Iterator
+
+
+class CodexExecError(RuntimeError):
+    """Raised when codex exec exits unsuccessfully after streaming output."""
+
+
+class CodexUsageLimitError(CodexExecError):
+    """Raised when the Codex account has exhausted its current usage window."""
+
+
+class CodexModelUnsupportedError(CodexExecError):
+    """Raised when the configured model is not available to this account."""
 
 
 class CodexAdapter:
     name = "codex"
 
-    def __init__(self, model: str = "gpt-5.5-codex", workdir: str = ".",
+    def __init__(self, model: str = "gpt-5.5", workdir: str = ".",
                  allow_hosts: list[str] | None = None):
         self.model = model
         self.workdir = workdir
@@ -54,9 +67,29 @@ class CodexAdapter:
         assert proc.stdin and proc.stdout
         proc.stdin.write(prompt)
         proc.stdin.close()
+        chunks: list[str] = []
         for line in proc.stdout:          # 流式回吐，orchestrator 实时做危险命令拦截
+            chunks.append(line)
             yield line
-        proc.wait()
+        rc = proc.wait()
+        try:
+            pathlib.Path(self.workdir, "last_response.md").write_text(
+                "".join(chunks), encoding="utf-8")
+        except OSError:
+            pass
+        if rc != 0:
+            full = "".join(chunks)
+            tail = full[-1000:]
+            lowered = full.lower()
+            if "you've hit your usage limit" in lowered or "usage limit" in lowered:
+                raise CodexUsageLimitError(
+                    f"codex exec usage limit reached for model {self.model}; "
+                    "see last_response.md for reset time/details")
+            if "model is not supported" in lowered:
+                raise CodexModelUnsupportedError(
+                    f"codex exec model unsupported: {self.model}; "
+                    "see last_response.md for details")
+            raise CodexExecError(f"codex exec failed with exit code {rc}: {tail}")
 
 
 # ── 与 orchestrator 的对接（伪代码，仅示意） ──────────────────────
@@ -66,7 +99,7 @@ if __name__ == "__main__":
     wd = pathlib.Path("runs") / sid
     wd.mkdir(parents=True, exist_ok=True)
     (wd / "authz.md").write_text("# 授权范围\n- 仅限：https://target.example\n", encoding="utf-8")
-    adapter = CodexAdapter(model="gpt-5.5-codex", workdir=str(wd),
+    adapter = CodexAdapter(model="gpt-5.5", workdir=str(wd),
                            allow_hosts=["target.example"])
     # 真实使用时由 orchestrator.assemble_prompt() 拼装；这里直接喂一段
     prompt = sys.stdin.read() if not sys.stdin.isatty() else "对 https://target.example 做授权 SRC 测试，先告诉我首个攻击面。"
