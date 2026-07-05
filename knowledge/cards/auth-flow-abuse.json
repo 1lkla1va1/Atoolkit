@@ -3,9 +3,50 @@
   "title": "认证流程滥用",
   "description": "覆盖注册、登录、重置、验证码、会话、令牌、管理入口等认证流程风险。v7.2 新增密码重置 4 模式检测和验证码攻击模式。",
   "match": {
-    "vuln_classes": ["认证绕过/枚举", "未授权访问"],
-    "endpoints": ["register", "login", "reset-password", "password", "captcha", "sms", "verify-code", "change-audit", "admin", "token", "session", "sub-login", "role", "forgot", "recover", "send-code", "send-sms"],
-    "keywords": ["register", "login", "password", "captcha", "sms", "token", "session", "admin", "forgot", "recover", "reset"]
+    "vuln_classes": [
+      "认证绕过/枚举",
+      "未授权访问"
+    ],
+    "endpoints": [
+      "register",
+      "login",
+      "reset-password",
+      "password",
+      "captcha",
+      "sms",
+      "verify-code",
+      "change-audit",
+      "admin",
+      "token",
+      "session",
+      "sub-login",
+      "role",
+      "forgot",
+      "recover",
+      "send-code",
+      "send-sms"
+    ],
+    "keywords": [
+      "register",
+      "login",
+      "password",
+      "captcha",
+      "sms",
+      "token",
+      "session",
+      "admin",
+      "forgot",
+      "recover",
+      "reset"
+    ],
+    "secondary_params": [
+      "authenticity_token",
+      "auth_type",
+      "client_id",
+      "redirect_uri",
+      "_method",
+      "auth_code"
+    ]
   },
   "dimensions": [
     "不同认证状态下的可达性差异",
@@ -35,7 +76,11 @@
   "negative_sufficiency": {
     "min_vectors": 5,
     "min_response_count": 2,
-    "required_evidence_types": ["anonymous_baseline", "authenticated_baseline", "captcha_leak_check"],
+    "required_evidence_types": [
+      "anonymous_baseline",
+      "authenticated_baseline",
+      "captcha_leak_check"
+    ],
     "min_identities": 2
   },
   "positive_depth_floor": {

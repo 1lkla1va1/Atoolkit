@@ -3,9 +3,58 @@
   "title": "输入校验",
   "description": "覆盖搜索、排序、过滤、分页、类型转换、边界值和服务端错误处理。",
   "match": {
-    "vuln_classes": ["SQLi", "XSS", "SSRF"],
-    "params": ["keyword", "search", "q", "sort", "orderBy", "filter", "page", "size", "type", "status", "url", "path"],
-    "keywords": ["search", "query", "filter", "sort", "orderby", "keyword"]
+    "vuln_classes": [
+      "SQLi",
+      "XSS",
+      "SSRF"
+    ],
+    "params": [
+      "keyword",
+      "search",
+      "q",
+      "sort",
+      "orderBy",
+      "filter",
+      "page",
+      "size",
+      "type",
+      "status",
+      "url",
+      "path"
+    ],
+    "keywords": [
+      "search",
+      "query",
+      "filter",
+      "sort",
+      "orderby",
+      "keyword"
+    ],
+    "secondary_params": [
+      "hash",
+      "acctid",
+      "regid",
+      "organization_id",
+      "post_type",
+      "import_url",
+      "callback_url",
+      "svg",
+      "protocol",
+      "filepath",
+      "file_path",
+      "filepathdownload",
+      "redirect_uri",
+      "redir",
+      "return_url",
+      "next",
+      "return_to",
+      "redirect_to",
+      "goto",
+      "target",
+      "response_type",
+      "scope",
+      "state"
+    ]
   },
   "dimensions": [
     "输入类型、长度、字符类别和枚举范围是否由服务端校验",
@@ -30,7 +79,11 @@
   "negative_sufficiency": {
     "min_vectors": 3,
     "min_response_count": 2,
-    "required_evidence_types": ["baseline", "boundary_result", "type_result"]
+    "required_evidence_types": [
+      "baseline",
+      "boundary_result",
+      "type_result"
+    ]
   },
   "positive_depth_floor": {
     "min_depth": 2,

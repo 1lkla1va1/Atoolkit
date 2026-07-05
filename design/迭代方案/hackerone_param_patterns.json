@@ -1,0 +1,7563 @@
+{
+  "metadata": {
+    "source": "Hacker0x01/hackerone_disclosed_reports",
+    "filter": "resolved + has_bounty + full_visibility + 200chars_min",
+    "total_reports_processed": 3319,
+    "vuln_type_distribution": {
+      "Other": 1182,
+      "XSS": 598,
+      "InfoDisclosure": 308,
+      "AuthBypass": 204,
+      "AccessControl": 185,
+      "RCE": 157,
+      "PrivEsc": 138,
+      "CSRF": 118,
+      "BusinessLogic": 96,
+      "OpenRedirect": 88,
+      "IDOR": 62,
+      "SSRF": 55,
+      "SQLi": 44,
+      "PathTraversal": 41,
+      "Clickjacking": 15,
+      "RaceCondition": 12,
+      "SessionFixation": 5,
+      "XXE": 4,
+      "RFI": 3,
+      "Crypto": 2,
+      "LFI": 1,
+      "FileUpload": 1
+    }
+  },
+  "parameter_patterns": {
+    "AccessControl": {
+      "report_count": 185,
+      "unique_params": 563,
+      "top_params": [
+        {
+          "name": "variables",
+          "count": 32,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "type",
+          "count": 32,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "state",
+          "count": 27,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "scope",
+          "count": 26,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "search",
+          "count": 22,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "operationname",
+          "count": 19,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "group_id",
+          "count": 17,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "description",
+          "count": 16,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "age",
+          "count": 16,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "repository_ref",
+          "count": 14,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "severity",
+          "count": 13,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "client_id",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "snippets",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "namespace",
+          "count": 11,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "access_token",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "featurename",
+          "count": 9,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "featureversion",
+          "count": 9,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "vulnerability",
+          "count": 9,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "link",
+          "count": 9,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "fixedby",
+          "count": 9,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "redirect_uri",
+          "count": 9,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "mode",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "file",
+          "count": 8,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "format",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "page",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "report_id",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "utf8",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "locale",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "response_type",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "test",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "operation",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "title",
+          "count": 6,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "sort_type",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "sentry_key",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "first_0",
+          "count": 6,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "host",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "__typename",
+          "count": 6,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "role",
+          "count": 6,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "ghj6l8hv",
+          "count": 6,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "location",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "timestamp",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "edges",
+          "count": 5,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "pagesize",
+          "count": 5,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "innertext",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "owner",
+          "count": 5,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "visibility",
+          "count": 5,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "_ab",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "sha",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "project_id",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "flow_name",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        }
+      ]
+    },
+    "AuthBypass": {
+      "report_count": 204,
+      "unique_params": 628,
+      "top_params": [
+        {
+          "name": "entities",
+          "count": 240,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "type",
+          "count": 68,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "authenticity_token",
+          "count": 34,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "age",
+          "count": 33,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "client_id",
+          "count": 32,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "subtask_id",
+          "count": 28,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "host",
+          "count": 25,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "utf8",
+          "count": 23,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "link_type",
+          "count": 22,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "link_id",
+          "count": 22,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "consumer_key",
+          "count": 20,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "referrer",
+          "count": 18,
+          "sources": [
+            "form_data",
+            "html_form",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "label",
+          "count": 17,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "redirect_uri",
+          "count": 16,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "expires",
+          "count": 15,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "auth_type",
+          "count": 15,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "__utma",
+          "count": 14,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "__utmc",
+          "count": 14,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "__utmz",
+          "count": 14,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "_ga",
+          "count": 14,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "_shopify_y",
+          "count": 14,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "__utmb",
+          "count": 13,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "_method",
+          "count": 13,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "utmcsr",
+          "count": 12,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "utmccn",
+          "count": 12,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "utmcmd",
+          "count": 12,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "_shopify_s",
+          "count": 12,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "auth_code",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "filename",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "phone",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "_secure_admin_session_id",
+          "count": 10,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "response_type",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "state",
+          "count": 9,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "user_id",
+          "count": 9,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "primary_text",
+          "count": 9,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "client_secret",
+          "count": 9,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "_gat",
+          "count": 8,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "oauth_token",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "account_id",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "mode",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "commit",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "ticket",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "comment_id",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "ajs_anonymous_id",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "utmcct",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "request_method",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "boundary",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "shop",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "xsi",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "signed_url",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        }
+      ]
+    },
+    "BusinessLogic": {
+      "report_count": 96,
+      "unique_params": 248,
+      "top_params": [
+        {
+          "name": "type",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "str",
+          "count": 10,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "lang",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "amount",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "client_id",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "discussionid",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "all_results",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "callback",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "session_id",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "skipprimeonboarding",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "user_id",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "authenticity_token",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "csrfmiddlewaretoken",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "app_version",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "push_permission",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "app_run_id",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "presentlon",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "uuid",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "city_id",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "plan_id",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "_ga",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "age",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "objectid",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "hpt",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "commentid",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "draftid",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "format",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "_wysihtml5_mode",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "deliverytype",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "deliverymethod",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "lastcommentid",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "do_not_track",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "expand_media",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "safe_mode",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "suppress_response_codes",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "theme",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "timeline_type",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "team_id",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "description",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "payment",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "amount_in",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "amount_rounding",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "device_id",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "unique_token",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "amount_tip",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "card_source",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "auto_finalize",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "amount_out",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "location_id",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "charge",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        }
+      ]
+    },
+    "CSRF": {
+      "report_count": 118,
+      "unique_params": 302,
+      "top_params": [
+        {
+          "name": "type",
+          "count": 211,
+          "sources": [
+            "form_data",
+            "html_form",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "age",
+          "count": 15,
+          "sources": [
+            "form_data",
+            "html_form"
+          ]
+        },
+        {
+          "name": "nonce",
+          "count": 14,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "authenticity_token",
+          "count": 13,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "redirect_uri",
+          "count": 13,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "state",
+          "count": 13,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "domain",
+          "count": 12,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "target",
+          "count": 11,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "client_id",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "return_to",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "host",
+          "count": 8,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "pathprefix",
+          "count": 8,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "scheme",
+          "count": 8,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "scope",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "productintentid",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "deliverytype",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "deliverymethod",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "location",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "utf8",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "commit",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "transfer_code",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "mode",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "enctype",
+          "count": 6,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "userid",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "displayname",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "page",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "filename",
+          "count": 6,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "ports",
+          "count": 6,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "session_id",
+          "count": 5,
+          "sources": [
+            "html_form",
+            "json_key"
+          ]
+        },
+        {
+          "name": "user_id",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "expires",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "onload",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "response_type",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "unifises",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "title",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "html_form",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "pagename",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "cookiename",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "cookievalue",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "backurl",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "maxlength",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "placeholder",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "ywsid",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "device_type",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "app_version",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "lang",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "efs",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "signature",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "last_name",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "html_form",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "act",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "gid",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        }
+      ]
+    },
+    "Clickjacking": {
+      "report_count": 15,
+      "unique_params": 23,
+      "top_params": [
+        {
+          "name": "type",
+          "count": 15,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "placeholder",
+          "count": 6,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "required",
+          "count": 6,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "previous_url",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "userid",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "checked",
+          "count": 3,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "login",
+          "count": 3,
+          "sources": [
+            "html_form"
+          ]
+        },
+        {
+          "name": "remember",
+          "count": 3,
+          "sources": [
+            "html_form"
+          ]
+        },
+        {
+          "name": "rel",
+          "count": 3,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "frameborder",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "equiv",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "lang",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "tweet_id",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "screen_name",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "flag_id",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "flag_type",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "dst_user_id",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "user_id",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "cols",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "target",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "onerror",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "button",
+          "count": 1,
+          "sources": [
+            "html_form"
+          ]
+        },
+        {
+          "name": "onbeforeunload",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        }
+      ]
+    },
+    "Crypto": {
+      "report_count": 2,
+      "unique_params": 1,
+      "top_params": [
+        {
+          "name": "chars",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        }
+      ]
+    },
+    "FileUpload": {
+      "report_count": 1,
+      "unique_params": 1,
+      "top_params": [
+        {
+          "name": "type",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        }
+      ]
+    },
+    "IDOR": {
+      "report_count": 62,
+      "unique_params": 235,
+      "top_params": [
+        {
+          "name": "type",
+          "count": 16,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "user_id",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "accounts",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "time_range",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "variables",
+          "count": 8,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "delivery_subzone",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "target_id",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "target_type",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "title",
+          "count": 7,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "age",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "sha",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "external_status_check_id",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "sessionid",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "note",
+          "count": 6,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "weight",
+          "count": 5,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "selectedaddressid",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "case",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "updated_at",
+          "count": 4,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "created_at",
+          "count": 4,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "access_level",
+          "count": 4,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "access_level_description",
+          "count": 4,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "group_id",
+          "count": 4,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "operation",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "operationname",
+          "count": 4,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "csrftoken",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "trk",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "popup",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "subsection",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "error_alert",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "money",
+          "count": 3,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "was_successful",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "lastmodified",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "deletedat",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "weightunit",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "confirmation",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "board",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "labels",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "milestone_id",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "assignee",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "label_ids",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "subscription_id",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "_ga",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "_gid",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "session_id",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "issue_ids",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "steamid",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "medium",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "subredditname",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "document_type",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "description",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        }
+      ]
+    },
+    "InfoDisclosure": {
+      "report_count": 308,
+      "unique_params": 1060,
+      "top_params": [
+        {
+          "name": "age",
+          "count": 172,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "domain",
+          "count": 155,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "expires",
+          "count": 155,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "type",
+          "count": 41,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "__typename",
+          "count": 29,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "page",
+          "count": 24,
+          "sources": [
+            "form_data",
+            "json_key",
+            "php_var",
+            "url_query"
+          ]
+        },
+        {
+          "name": "node",
+          "count": 23,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "variables",
+          "count": 21,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "description",
+          "count": 19,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "title",
+          "count": 18,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "iresult",
+          "count": 17,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "permissions",
+          "count": 16,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "originalsrc",
+          "count": 14,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "alttext",
+          "count": 14,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "team",
+          "count": 13,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "cursor",
+          "count": 13,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "client_id",
+          "count": 13,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "eret",
+          "count": 13,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "operationname",
+          "count": 12,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "file",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "html_form",
+            "json_key"
+          ]
+        },
+        {
+          "name": "mode",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "line",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "total_count",
+          "count": 10,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "_id",
+          "count": 10,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "state",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "user_id",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "sort",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "shop",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "mret",
+          "count": 10,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "payload",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "created_at",
+          "count": 9,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "phone",
+          "count": 9,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "edges",
+          "count": 9,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "handle",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "meta",
+          "count": 8,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "redirect_uri",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "template",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "text_query",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "message_type",
+          "count": 8,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "pagename",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "len",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "filename",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "locale",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "extensions",
+          "count": 7,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "link",
+          "count": 7,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "new_env",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "tnew_env",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "rest_route",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "lang",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "uri",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        }
+      ]
+    },
+    "LFI": {
+      "report_count": 1,
+      "unique_params": 2,
+      "top_params": [
+        {
+          "name": "ifn",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "ifl",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        }
+      ]
+    },
+    "OpenRedirect": {
+      "report_count": 88,
+      "unique_params": 125,
+      "top_params": [
+        {
+          "name": "redirect_uri",
+          "count": 26,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "type",
+          "count": 24,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "client_id",
+          "count": 20,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "response_type",
+          "count": 20,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "redir",
+          "count": 14,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "return_url",
+          "count": 14,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "next",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "scope",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "subject",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "redirect",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "state",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "page",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "return_to",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "utm_medium",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "utm_campaign",
+          "count": 10,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "callback_url",
+          "count": 9,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "target",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "category",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "host",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "failed",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "age",
+          "count": 6,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "prejoin_data",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "goto",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "consumer_key",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "redirect_to",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "contrast",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "success",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "participants",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "description",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "organization",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "timeframe",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "timezone",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "agreement",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "link",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "ticket_form_id",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "email_confirm",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "domain_name",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "logout",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "expires",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "shop",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "noredirect",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "pub_secret",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "weg_digest",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "screen_name",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "checkout_url",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "popup",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "usp",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "locale_id",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "unsafe_link",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "file",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        }
+      ]
+    },
+    "PathTraversal": {
+      "report_count": 41,
+      "unique_params": 104,
+      "top_params": [
+        {
+          "name": "type",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "textdomain",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "lang",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "filepathdownload",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "check",
+          "count": 6,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "filepath",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "php_var"
+          ]
+        },
+        {
+          "name": "shop",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "filename",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "dir",
+          "count": 3,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "format",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "download_object",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "file_path",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "target_parent",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "dir_perms",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "age",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "patterntype",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "case",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "target",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "linkpath",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "php_var"
+          ]
+        },
+        {
+          "name": "file",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "read",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "csv",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "digests",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "range",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "fontpath",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "addondirname",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "uid",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "gid",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "groups",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "resolve",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "uri",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "extension",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "downloads",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "errors",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "siteurl",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "upload_path",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "stat",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "folder_parts",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "log_tag",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "private_uri",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "commit",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "repository",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "abbrev",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "files",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "resp",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "dst",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "sport",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "dport",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "ancount",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "rrname",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        }
+      ]
+    },
+    "PrivEsc": {
+      "report_count": 138,
+      "unique_params": 451,
+      "top_params": [
+        {
+          "name": "type",
+          "count": 37,
+          "sources": [
+            "form_data",
+            "html_form",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "authenticity_token",
+          "count": 21,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "_method",
+          "count": 14,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "issuekey",
+          "count": 13,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "r10",
+          "count": 12,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "utf8",
+          "count": 10,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "r1_w",
+          "count": 10,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "r0_w",
+          "count": 9,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "mode",
+          "count": 8,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "r2_w",
+          "count": 8,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "commit",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "properties",
+          "count": 8,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "null_value",
+          "count": 8,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "_ga",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "uid",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "gid",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "groups",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "timeout",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "hosting",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "tab",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "cmd",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "set_active",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "_attempts",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "user_id",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "is_internal",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "umax_value",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "var_off",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "badge_channel",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "description",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "__utma",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "__utmz",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "utmcsr",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "utmccn",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "utmcmd",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "created_at",
+          "count": 4,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "app_id",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "clip_id",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "track_id",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "job_data",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "updated_at",
+          "count": 4,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "umin_value",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "u32_max_value",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "appname",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "directory",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "bucket",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "widget",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "preview",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "badge_stream",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "badge_album",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "badge_layout",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        }
+      ]
+    },
+    "RCE": {
+      "report_count": 157,
+      "unique_params": 730,
+      "top_params": [
+        {
+          "name": "entry",
+          "count": 24,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "icllayout",
+          "count": 21,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "type",
+          "count": 14,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "user_id",
+          "count": 13,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "filename",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "command",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "ref",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "object_class",
+          "count": 9,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "expectsigned",
+          "count": 9,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "lang",
+          "count": 9,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "int_soft_id",
+          "count": 8,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "point_code",
+          "count": 8,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "scope",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "search",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "flags",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "thestr",
+          "count": 6,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "dag_id",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "uid",
+          "count": 6,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "_ga",
+          "count": 6,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "to_s",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "file",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "html_form"
+          ]
+        },
+        {
+          "name": "address",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "cmd",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "gid",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "groups",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "headers",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "zval_ptr",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "net_sessionid",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "actiontype",
+          "count": 5,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "call",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "title",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "city",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "secret",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "target",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "mimetype",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "params",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "fid",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "argc",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "argv",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "rdexportfilename",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "rdnoshowwait",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "rdagcurrentopentablepanel",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "getsc",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "aspsessionidsssbqtqr",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "aspsessionidsqrdsrrr",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "len",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "fullname",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "sitelinks_xml",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "site_url",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "sitemap_url_errors",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        }
+      ]
+    },
+    "RFI": {
+      "report_count": 3,
+      "unique_params": 3,
+      "top_params": [
+        {
+          "name": "docs_path",
+          "count": 3,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "page",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "docs",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        }
+      ]
+    },
+    "RaceCondition": {
+      "report_count": 12,
+      "unique_params": 37,
+      "top_params": [
+        {
+          "name": "raw_json",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "invite",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "clientmutationid",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "claimcredential",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "team",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "claimed_credential",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "credentials",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "private_id",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "account_details",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "was_successful",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "_errors4fkckf",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "edges",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "pageinfo",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "hasnextpage",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "haspreviouspage",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "feature",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "sr_detail",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "expand_srs",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "from_detail",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "api_type",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "always_show_media",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "request_timestamp",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "package_name",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "product_id",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "correlation_id",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "bonus_id",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "variables",
+          "count": 1,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "input_0",
+          "count": 1,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "team_id",
+          "count": 1,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "types_1",
+          "count": 1,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "first_2",
+          "count": 1,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "__cfduid",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "_cfuid",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "_ga",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "_mkto_trk",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "transaction_id",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "csrf",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        }
+      ]
+    },
+    "SQLi": {
+      "report_count": 44,
+      "unique_params": 289,
+      "top_params": [
+        {
+          "name": "hash",
+          "count": 16,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "submit",
+          "count": 15,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "type",
+          "count": 15,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "scn",
+          "count": 14,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "cookie",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "acctid",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "check20",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "page",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "regid",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "sort",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "subject",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "studentname",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "phoneormail",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "locationid",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "blobcol",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "blobkey",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "blobtable",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "blobwhere",
+          "count": 8,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "_ga",
+          "count": 7,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "payload",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "search",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "post_type",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "useraction",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "transition",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "city_id",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "age",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "organization_id",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "check25",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "check26",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "check27",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "check29",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "check24",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "comments",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "after_html",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "act",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "division",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "tournament",
+          "count": 6,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "ctx",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "uuid",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "preview_data",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "parentid",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "php_var"
+          ]
+        },
+        {
+          "name": "phpsessid",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "parapa_uid",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "courseid",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "target",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "lang",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "validateemail",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "opt",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "locid",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "city",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        }
+      ]
+    },
+    "SSRF": {
+      "report_count": 55,
+      "unique_params": 207,
+      "top_params": [
+        {
+          "name": "timestamp",
+          "count": 58,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "category",
+          "count": 54,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "type",
+          "count": 17,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "account",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "status_code",
+          "count": 7,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "protocol",
+          "count": 7,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "fetching",
+          "count": 6,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "standalone",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "svg",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "xmlns",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "xlink",
+          "count": 5,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "_ga",
+          "count": 5,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "import_url",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "extraheader",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "sentry_version",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "sentry_client",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "sentry_key",
+          "count": 4,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "onerror",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "proxy",
+          "count": 3,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "filename",
+          "count": 3,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "referer",
+          "count": 3,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "fetched",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "successpayload",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "errorpayload",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "stack",
+          "count": 3,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "age",
+          "count": 3,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "file",
+          "count": 3,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "javascript",
+          "count": 3,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "host",
+          "count": 3,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "port",
+          "count": 3,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "mirror",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "followredirects",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "errors",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "mode",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "format",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "widgettype",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "configid",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "headers",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "transaction",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "state",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "location",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "environment",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "__cfduid",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "access_token",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "lastupdated",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "accesskeyid",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "secretaccesskey",
+          "count": 2,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "authenticity_token",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "trigger",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "test",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        }
+      ]
+    },
+    "SessionFixation": {
+      "report_count": 5,
+      "unique_params": 4,
+      "top_params": [
+        {
+          "name": "shop",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "cookie",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "_flow_session",
+          "count": 2,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "domain",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        }
+      ]
+    },
+    "XSS": {
+      "report_count": 598,
+      "unique_params": 1165,
+      "top_params": [
+        {
+          "name": "type",
+          "count": 199,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "onerror",
+          "count": 183,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "description",
+          "count": 103,
+          "sources": [
+            "form_data",
+            "html_form",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "onload",
+          "count": 76,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "lang",
+          "count": 45,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "tags",
+          "count": 29,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "title",
+          "count": 29,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "ctx",
+          "count": 28,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "required",
+          "count": 27,
+          "sources": [
+            "form_data",
+            "json_key"
+          ]
+        },
+        {
+          "name": "location",
+          "count": 25,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "summary",
+          "count": 23,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "callback",
+          "count": 22,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "20src",
+          "count": 21,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "format",
+          "count": 21,
+          "sources": [
+            "form_data",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "onmouseover",
+          "count": 20,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "operationid",
+          "count": 20,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "produces",
+          "count": 20,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "parameters",
+          "count": 20,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "responses",
+          "count": 20,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "countryredirect",
+          "count": 19,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "innerhtml",
+          "count": 18,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "utm_source",
+          "count": 18,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "20onerror",
+          "count": 18,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "rel",
+          "count": 18,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "staticdomainname",
+          "count": 18,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "shop",
+          "count": 17,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "p_datasource_data",
+          "count": 16,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "ajax_call",
+          "count": 16,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "spamballonexp",
+          "count": 16,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "settingson",
+          "count": 16,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "post_type",
+          "count": 16,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "schema",
+          "count": 16,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "page",
+          "count": 15,
+          "sources": [
+            "form_data",
+            "html_form",
+            "json_key",
+            "url_query"
+          ]
+        },
+        {
+          "name": "redirect",
+          "count": 15,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "dhl",
+          "count": 14,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "age",
+          "count": 13,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "target",
+          "count": 13,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "srcdoc",
+          "count": 13,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "isvalid",
+          "count": 13,
+          "sources": [
+            "json_key"
+          ]
+        },
+        {
+          "name": "signature",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "redirect_uri",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "locale",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "othersdriving",
+          "count": 12,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "owndriving",
+          "count": 12,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "tab",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "search",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "canary",
+          "count": 12,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "prefill",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "html_form",
+            "url_query"
+          ]
+        },
+        {
+          "name": "domain",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "state",
+          "count": 11,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        }
+      ]
+    },
+    "XXE": {
+      "report_count": 4,
+      "unique_params": 12,
+      "top_params": [
+        {
+          "name": "type",
+          "count": 4,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "xmlns",
+          "count": 3,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "xsi",
+          "count": 3,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "schemalocation",
+          "count": 3,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "_hxpage",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "max_file_size_kb",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "allow_file_type_list",
+          "count": 2,
+          "sources": [
+            "form_data",
+            "url_query"
+          ]
+        },
+        {
+          "name": "hx_page_name",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "referenceid",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "abc",
+          "count": 1,
+          "sources": [
+            "html_form"
+          ]
+        },
+        {
+          "name": "loader",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        },
+        {
+          "name": "xmlobject",
+          "count": 1,
+          "sources": [
+            "form_data"
+          ]
+        }
+      ]
+    }
+  },
+  "endpoint_patterns": {
+    "AccessControl": {
+      "unique_endpoints": 163,
+      "top_endpoints": [
+        {
+          "pattern": "/graphql/core",
+          "count": 15
+        },
+        {
+          "pattern": "/search",
+          "count": 8
+        },
+        {
+          "pattern": "/graphql",
+          "count": 8
+        },
+        {
+          "pattern": "/login",
+          "count": 7
+        },
+        {
+          "pattern": "/graphql/flow",
+          "count": 4
+        },
+        {
+          "pattern": "/index.php",
+          "count": 4
+        },
+        {
+          "pattern": "/users/api",
+          "count": 4
+        },
+        {
+          "pattern": "/auth/init",
+          "count": 4
+        },
+        {
+          "pattern": "/store/purchase.php",
+          "count": 3
+        },
+        {
+          "pattern": "/apps/development",
+          "count": 3
+        },
+        {
+          "pattern": "/30/csp-report",
+          "count": 3
+        },
+        {
+          "pattern": "/api/setTenderStatus",
+          "count": 3
+        },
+        {
+          "pattern": "/nextcloud/index.php",
+          "count": 3
+        },
+        {
+          "pattern": "/users",
+          "count": 3
+        },
+        {
+          "pattern": "/credentials/`",
+          "count": 3
+        },
+        {
+          "pattern": "/user/lookup.json",
+          "count": 3
+        },
+        {
+          "pattern": "/publish/connect-domain-hostinger",
+          "count": 3
+        },
+        {
+          "pattern": "/v1/<API_KEY_ID>`",
+          "count": 3
+        },
+        {
+          "pattern": "/upload",
+          "count": 2
+        },
+        {
+          "pattern": "/authorize",
+          "count": 2
+        },
+        {
+          "pattern": "/auth-sandbox.elastic.co",
+          "count": 2
+        },
+        {
+          "pattern": "/onboarding/task.json",
+          "count": 2
+        },
+        {
+          "pattern": "/unversioned/graphql",
+          "count": 2
+        },
+        {
+          "pattern": "/remote.php",
+          "count": 2
+        },
+        {
+          "pattern": "/2021-07/graphql",
+          "count": 2
+        },
+        {
+          "pattern": "/Users/Shared`",
+          "count": 2
+        },
+        {
+          "pattern": "/v5/bind.html",
+          "count": 2
+        },
+        {
+          "pattern": "/api/driverrequest",
+          "count": 2
+        },
+        {
+          "pattern": "/userstorages/<storage_id>",
+          "count": 2
+        },
+        {
+          "pattern": "/lVf2NuhLoYVrpN4nO7uw0Q/Likes",
+          "count": 2
+        }
+      ]
+    },
+    "AuthBypass": {
+      "unique_endpoints": 186,
+      "top_endpoints": [
+        {
+          "pattern": "/login",
+          "count": 15
+        },
+        {
+          "pattern": "/admin.php",
+          "count": 12
+        },
+        {
+          "pattern": "/settings/general",
+          "count": 7
+        },
+        {
+          "pattern": "/file/somthine.svg",
+          "count": 7
+        },
+        {
+          "pattern": "/admin/users.json",
+          "count": 5
+        },
+        {
+          "pattern": "/admin/mobile_devices.json`",
+          "count": 5
+        },
+        {
+          "pattern": "/reset/<the",
+          "count": 5
+        },
+        {
+          "pattern": "/admin/account",
+          "count": 5
+        },
+        {
+          "pattern": "/login/phone",
+          "count": 5
+        },
+        {
+          "pattern": "/admin",
+          "count": 5
+        },
+        {
+          "pattern": "/accounts/sso",
+          "count": 5
+        },
+        {
+          "pattern": "/2fa/send_sms",
+          "count": 4
+        },
+        {
+          "pattern": "/phone/SOMETOKEN",
+          "count": 4
+        },
+        {
+          "pattern": "/handle_failed/220152",
+          "count": 4
+        },
+        {
+          "pattern": "/authorize",
+          "count": 4
+        },
+        {
+          "pattern": "/v1/resend-verify",
+          "count": 4
+        },
+        {
+          "pattern": "/api.e2e-kops-aws-canary.test-cncf-aws.canary.k8s.io",
+          "count": 4
+        },
+        {
+          "pattern": "/direct_messages/show.json",
+          "count": 3
+        },
+        {
+          "pattern": "/auth/shopify",
+          "count": 3
+        },
+        {
+          "pattern": "/authenticate",
+          "count": 3
+        },
+        {
+          "pattern": "/prepareuberattack.php",
+          "count": 3
+        },
+        {
+          "pattern": "/users/passwordless-signup",
+          "count": 3
+        },
+        {
+          "pattern": "/dashboard/activity_feed",
+          "count": 3
+        },
+        {
+          "pattern": "/mopub/activate",
+          "count": 2
+        },
+        {
+          "pattern": "/login`",
+          "count": 2
+        },
+        {
+          "pattern": "/2fa/confirm",
+          "count": 2
+        },
+        {
+          "pattern": "/account/61715715",
+          "count": 2
+        },
+        {
+          "pattern": "/user/login",
+          "count": 2
+        },
+        {
+          "pattern": "/oauth/authenticate",
+          "count": 2
+        },
+        {
+          "pattern": "/profiles/edit",
+          "count": 2
+        }
+      ]
+    },
+    "BusinessLogic": {
+      "unique_endpoints": 45,
+      "top_endpoints": [
+        {
+          "pattern": "/5788adb325c4824f193d08daf474f21a/payments.json",
+          "count": 4
+        },
+        {
+          "pattern": "/publishing/contentSeries",
+          "count": 4
+        },
+        {
+          "pattern": "/surveys/personal_info",
+          "count": 3
+        },
+        {
+          "pattern": "/order-received/21237",
+          "count": 3
+        },
+        {
+          "pattern": "/data_credits/transfer_dc",
+          "count": 3
+        },
+        {
+          "pattern": "/profile",
+          "count": 2
+        },
+        {
+          "pattern": "/users/new_invite",
+          "count": 2
+        },
+        {
+          "pattern": "/activation/support",
+          "count": 2
+        },
+        {
+          "pattern": "/purchases/bulk",
+          "count": 2
+        },
+        {
+          "pattern": "/ignored_user_list/`",
+          "count": 2
+        },
+        {
+          "pattern": "/ads/██████████",
+          "count": 2
+        },
+        {
+          "pattern": "/paym_test_xxxx/status",
+          "count": 2
+        },
+        {
+          "pattern": "/paypal/create_coin_purchase_order",
+          "count": 2
+        },
+        {
+          "pattern": "/publishing/normFirstPartyArticle```",
+          "count": 2
+        },
+        {
+          "pattern": "/upload_app",
+          "count": 2
+        },
+        {
+          "pattern": "/wqfqmw9n/share",
+          "count": 2
+        },
+        {
+          "pattern": "/ad-units/email-instructions",
+          "count": 2
+        },
+        {
+          "pattern": "/e329e463-7f5d-4358-9109-4f97c9f86abd/merchants",
+          "count": 2
+        },
+        {
+          "pattern": "/admin/login",
+          "count": 2
+        },
+        {
+          "pattern": "/admin/auth",
+          "count": 2
+        },
+        {
+          "pattern": "/post/comment",
+          "count": 2
+        },
+        {
+          "pattern": "/timelines/preview",
+          "count": 2
+        },
+        {
+          "pattern": "/prime/subscription",
+          "count": 1
+        },
+        {
+          "pattern": "/graphql",
+          "count": 1
+        },
+        {
+          "pattern": "/account/transfer.action",
+          "count": 1
+        },
+        {
+          "pattern": "/lite/flag-content",
+          "count": 1
+        },
+        {
+          "pattern": "/search",
+          "count": 1
+        },
+        {
+          "pattern": "/products/1557454323768",
+          "count": 1
+        },
+        {
+          "pattern": "/users/invite",
+          "count": 1
+        },
+        {
+          "pattern": "/business-requests/signup",
+          "count": 1
+        }
+      ]
+    },
+    "CSRF": {
+      "unique_endpoints": 148,
+      "top_endpoints": [
+        {
+          "pattern": "/login",
+          "count": 10
+        },
+        {
+          "pattern": "/oauth/authorize",
+          "count": 7
+        },
+        {
+          "pattern": "/authorize",
+          "count": 5
+        },
+        {
+          "pattern": "/cmd/sitemgr",
+          "count": 5
+        },
+        {
+          "pattern": "/verify.html",
+          "count": 5
+        },
+        {
+          "pattern": "/settings/2fa_sms",
+          "count": 5
+        },
+        {
+          "pattern": "/account/create_secure",
+          "count": 4
+        },
+        {
+          "pattern": "/cloud/users`",
+          "count": 4
+        },
+        {
+          "pattern": "/apiv1/inviteemail",
+          "count": 3
+        },
+        {
+          "pattern": "/twitter/disconnect",
+          "count": 3
+        },
+        {
+          "pattern": "/account",
+          "count": 3
+        },
+        {
+          "pattern": "/authorization.json",
+          "count": 3
+        },
+        {
+          "pattern": "/auth",
+          "count": 3
+        },
+        {
+          "pattern": "/apiv1",
+          "count": 3
+        },
+        {
+          "pattern": "/util/PhabricatorHash.php",
+          "count": 3
+        },
+        {
+          "pattern": "/storage/PhabricatorUser.php",
+          "count": 3
+        },
+        {
+          "pattern": "/method/ConduitConnectConduitAPIMethod.php",
+          "count": 3
+        },
+        {
+          "pattern": "/controller/PhabricatorMetaMTAMailgunReceiveController.php",
+          "count": 3
+        },
+        {
+          "pattern": "/auth/cb",
+          "count": 3
+        },
+        {
+          "pattern": "/authorize/crossdomain.xml",
+          "count": 2
+        },
+        {
+          "pattern": "/oauth/authorize.",
+          "count": 2
+        },
+        {
+          "pattern": "/user/<any",
+          "count": 2
+        },
+        {
+          "pattern": "/domains/initiate_inter_shop_domain_transfer",
+          "count": 2
+        },
+        {
+          "pattern": "/profile",
+          "count": 2
+        },
+        {
+          "pattern": "/broadcast/publish)",
+          "count": 2
+        },
+        {
+          "pattern": "/auth/slack",
+          "count": 2
+        },
+        {
+          "pattern": "/authorization/token",
+          "count": 2
+        },
+        {
+          "pattern": "/users/sign_out",
+          "count": 2
+        },
+        {
+          "pattern": "/complete_paypal_incontext_oauth/41",
+          "count": 2
+        },
+        {
+          "pattern": "/yahoo/callback",
+          "count": 2
+        }
+      ]
+    },
+    "Clickjacking": {
+      "unique_endpoints": 10,
+      "top_endpoints": [
+        {
+          "pattern": "/login.php",
+          "count": 6
+        },
+        {
+          "pattern": "/console/*",
+          "count": 2
+        },
+        {
+          "pattern": "/user_details",
+          "count": 2
+        },
+        {
+          "pattern": "/(follow/unfollow)",
+          "count": 1
+        },
+        {
+          "pattern": "/user/unfollow",
+          "count": 1
+        },
+        {
+          "pattern": "/user/follow",
+          "count": 1
+        },
+        {
+          "pattern": "/user/info",
+          "count": 1
+        },
+        {
+          "pattern": "/users/signin'",
+          "count": 1
+        },
+        {
+          "pattern": "/users/signin",
+          "count": 1
+        },
+        {
+          "pattern": "/index.php",
+          "count": 1
+        }
+      ]
+    },
+    "Crypto": {
+      "unique_endpoints": 3,
+      "top_endpoints": [
+        {
+          "pattern": "/lib/Generator.php",
+          "count": 1
+        },
+        {
+          "pattern": "/user/login,and",
+          "count": 1
+        },
+        {
+          "pattern": "/admin",
+          "count": 1
+        }
+      ]
+    },
+    "IDOR": {
+      "unique_endpoints": 92,
+      "top_endpoints": [
+        {
+          "pattern": "/index.php",
+          "count": 6
+        },
+        {
+          "pattern": "/order-food-online",
+          "count": 4
+        },
+        {
+          "pattern": "/v2/messages",
+          "count": 4
+        },
+        {
+          "pattern": "/invitations/0ff7e9f9-877a-40cc-b99f-f6b3b1bea3f8",
+          "count": 4
+        },
+        {
+          "pattern": "/1/status_check_responses",
+          "count": 3
+        },
+        {
+          "pattern": "/register/forOrder",
+          "count": 3
+        },
+        {
+          "pattern": "/stats/query",
+          "count": 3
+        },
+        {
+          "pattern": "/stats/equity",
+          "count": 3
+        },
+        {
+          "pattern": "/notes/8",
+          "count": 3
+        },
+        {
+          "pattern": "/afk-requests/12346",
+          "count": 2
+        },
+        {
+          "pattern": "/api/v1)",
+          "count": 2
+        },
+        {
+          "pattern": "/shopify/███",
+          "count": 2
+        },
+        {
+          "pattern": "/shopify/██████",
+          "count": 2
+        },
+        {
+          "pattern": "/admin.shopify.com",
+          "count": 2
+        },
+        {
+          "pattern": "/messages/4423007",
+          "count": 2
+        },
+        {
+          "pattern": "/account",
+          "count": 2
+        },
+        {
+          "pattern": "/accountCredits",
+          "count": 2
+        },
+        {
+          "pattern": "/v1/arro_token",
+          "count": 2
+        },
+        {
+          "pattern": "/api/xauth",
+          "count": 2
+        },
+        {
+          "pattern": "/0wXMTrPu/hgjbk",
+          "count": 2
+        },
+        {
+          "pattern": "/orders",
+          "count": 2
+        },
+        {
+          "pattern": "/php/filter_user_tab_content.php",
+          "count": 2
+        },
+        {
+          "pattern": "/ed5ab56bc85699117ba230eb799fd3bf/indi.jpg`",
+          "count": 2
+        },
+        {
+          "pattern": "/ed5ab56bc85699117ba230eb799fd3bf/indi.jpg",
+          "count": 2
+        },
+        {
+          "pattern": "/invitations/a996881d-7177-43fb-be7c-da3a6b005f40",
+          "count": 2
+        },
+        {
+          "pattern": "/users/invite-user.php",
+          "count": 2
+        },
+        {
+          "pattern": "/v1/orders",
+          "count": 2
+        },
+        {
+          "pattern": "/order\\\\\\/error\\\\\\",
+          "count": 2
+        },
+        {
+          "pattern": "/boards/[board_id].json",
+          "count": 1
+        },
+        {
+          "pattern": "/boards/848604.json",
+          "count": 1
+        }
+      ]
+    },
+    "InfoDisclosure": {
+      "unique_endpoints": 258,
+      "top_endpoints": [
+        {
+          "pattern": "/login",
+          "count": 11
+        },
+        {
+          "pattern": "/home.php",
+          "count": 10
+        },
+        {
+          "pattern": "/graphql",
+          "count": 9
+        },
+        {
+          "pattern": "/api/user",
+          "count": 9
+        },
+        {
+          "pattern": "/dp.php",
+          "count": 7
+        },
+        {
+          "pattern": "/v2/users",
+          "count": 5
+        },
+        {
+          "pattern": "/search",
+          "count": 5
+        },
+        {
+          "pattern": "/wikis/attachments",
+          "count": 5
+        },
+        {
+          "pattern": "/v2/pages",
+          "count": 4
+        },
+        {
+          "pattern": "/users/passwordless-signup",
+          "count": 4
+        },
+        {
+          "pattern": "/accounts.shopify.com/account`",
+          "count": 4
+        },
+        {
+          "pattern": "/bmaapi.phtml",
+          "count": 4
+        },
+        {
+          "pattern": "/api/graphql",
+          "count": 4
+        },
+        {
+          "pattern": "/profile_metrics.json",
+          "count": 3
+        },
+        {
+          "pattern": "/index.php",
+          "count": 3
+        },
+        {
+          "pattern": "/dialog/oauth",
+          "count": 3
+        },
+        {
+          "pattern": "/Logger/OLogger.php",
+          "count": 3
+        },
+        {
+          "pattern": "/v2/zones",
+          "count": 3
+        },
+        {
+          "pattern": "/all/orders",
+          "count": 3
+        },
+        {
+          "pattern": "/api/getTenderStatus",
+          "count": 3
+        },
+        {
+          "pattern": "/user/me",
+          "count": 2
+        },
+        {
+          "pattern": "/wp-login.php",
+          "count": 2
+        },
+        {
+          "pattern": "/20/store██████",
+          "count": 2
+        },
+        {
+          "pattern": "/public/workspace",
+          "count": 2
+        },
+        {
+          "pattern": "/forgot",
+          "count": 2
+        },
+        {
+          "pattern": "/login/create",
+          "count": 2
+        },
+        {
+          "pattern": "/admin/mobile_devices.json.",
+          "count": 2
+        },
+        {
+          "pattern": "/pictures/120041856",
+          "count": 2
+        },
+        {
+          "pattern": "/videos/3102890",
+          "count": 2
+        },
+        {
+          "pattern": "/posts/7673012",
+          "count": 2
+        }
+      ]
+    },
+    "LFI": {
+      "unique_endpoints": 1,
+      "top_endpoints": [
+        {
+          "pattern": "/profile",
+          "count": 1
+        }
+      ]
+    },
+    "OpenRedirect": {
+      "unique_endpoints": 41,
+      "top_endpoints": [
+        {
+          "pattern": "/index.php",
+          "count": 12
+        },
+        {
+          "pattern": "/login",
+          "count": 8
+        },
+        {
+          "pattern": "/account/logout",
+          "count": 7
+        },
+        {
+          "pattern": "/admin",
+          "count": 4
+        },
+        {
+          "pattern": "/account/login",
+          "count": 4
+        },
+        {
+          "pattern": "/auth",
+          "count": 3
+        },
+        {
+          "pattern": "/auth/login",
+          "count": 2
+        },
+        {
+          "pattern": "/hackerone/landpage.php",
+          "count": 2
+        },
+        {
+          "pattern": "/auth/authorize",
+          "count": 2
+        },
+        {
+          "pattern": "/auth/shopify",
+          "count": 2
+        },
+        {
+          "pattern": "/accounts",
+          "count": 2
+        },
+        {
+          "pattern": "/search",
+          "count": 2
+        },
+        {
+          "pattern": "/oauth/authorize",
+          "count": 2
+        },
+        {
+          "pattern": "/authorize",
+          "count": 2
+        },
+        {
+          "pattern": "/js/main.044af6485f6b0cd90809.js",
+          "count": 1
+        },
+        {
+          "pattern": "/v1/shortLinks",
+          "count": 1
+        },
+        {
+          "pattern": "/hackerone/scampage.php",
+          "count": 1
+        },
+        {
+          "pattern": "/example.com",
+          "count": 1
+        },
+        {
+          "pattern": "/users.php",
+          "count": 1
+        },
+        {
+          "pattern": "/users.php?page=bp-profile-edit&wp_http_referer=https:/google.com",
+          "count": 1
+        },
+        {
+          "pattern": "/@google.com",
+          "count": 1
+        },
+        {
+          "pattern": "/LIVE_PUBLIC/DEHOXIMUQAEbRFW",
+          "count": 1
+        },
+        {
+          "pattern": "/google.com/%2f..`",
+          "count": 1
+        },
+        {
+          "pattern": "/fb-connect/logoutRedir.php",
+          "count": 1
+        },
+        {
+          "pattern": "/logoutRedir.php?goto=`,",
+          "count": 1
+        },
+        {
+          "pattern": "/logoutRedir.php?goto=\\http:/\\",
+          "count": 1
+        },
+        {
+          "pattern": "/logoutRedir.php?goto=https:/www.google.fr`",
+          "count": 1
+        },
+        {
+          "pattern": "/s/doi",
+          "count": 1
+        },
+        {
+          "pattern": "/login/)",
+          "count": 1
+        },
+        {
+          "pattern": "/account/logout`",
+          "count": 1
+        }
+      ]
+    },
+    "PathTraversal": {
+      "unique_endpoints": 44,
+      "top_endpoints": [
+        {
+          "pattern": "/nextcloud/remote.php",
+          "count": 4
+        },
+        {
+          "pattern": "/etc/passwd",
+          "count": 2
+        },
+        {
+          "pattern": "/verify/..%252fconf%252f",
+          "count": 2
+        },
+        {
+          "pattern": "/nuget/`",
+          "count": 2
+        },
+        {
+          "pattern": "/internal/personal_access_token',",
+          "count": 2
+        },
+        {
+          "pattern": "/rubygems/package.rb#L415)",
+          "count": 1
+        },
+        {
+          "pattern": "/uploads'",
+          "count": 1
+        },
+        {
+          "pattern": "/uploads';",
+          "count": 1
+        },
+        {
+          "pattern": "/options.php",
+          "count": 1
+        },
+        {
+          "pattern": "/../..",
+          "count": 1
+        },
+        {
+          "pattern": "/ss/b.php",
+          "count": 1
+        },
+        {
+          "pattern": "/+CSCOE+/session_password.html",
+          "count": 1
+        },
+        {
+          "pattern": "/user/0",
+          "count": 1
+        },
+        {
+          "pattern": "/0/com.nextcloud.client",
+          "count": 1
+        },
+        {
+          "pattern": "/shared_prefs/com.nextcloud.client_preferences.xml",
+          "count": 1
+        },
+        {
+          "pattern": "/api/diffusion.internal.gitrawdiffquery",
+          "count": 1
+        },
+        {
+          "pattern": "/search",
+          "count": 1
+        },
+        {
+          "pattern": "/conduit/DiffusionInternalGitRawDiffQueryConduitAPIMethod.php",
+          "count": 1
+        },
+        {
+          "pattern": "/admin123",
+          "count": 1
+        },
+        {
+          "pattern": "/bin/sh",
+          "count": 1
+        },
+        {
+          "pattern": "/download.php?filePathDownload=data_products",
+          "count": 1
+        },
+        {
+          "pattern": "/../download.php",
+          "count": 1
+        },
+        {
+          "pattern": "/admin",
+          "count": 1
+        },
+        {
+          "pattern": "/d:href><d:propstat><d:prop><d:resourcetype/><d:getlastmodified>Tue,",
+          "count": 1
+        },
+        {
+          "pattern": "/../.bash_profile.",
+          "count": 1
+        },
+        {
+          "pattern": "/../.bash_profile",
+          "count": 1
+        },
+        {
+          "pattern": "/uploads`",
+          "count": 1
+        },
+        {
+          "pattern": "/uploads/secret_data.txt`",
+          "count": 1
+        },
+        {
+          "pattern": "/bugs.php",
+          "count": 1
+        },
+        {
+          "pattern": "/bug.php?id=78939",
+          "count": 1
+        }
+      ]
+    },
+    "PrivEsc": {
+      "unique_endpoints": 131,
+      "top_endpoints": [
+        {
+          "pattern": "/Library/Group",
+          "count": 6
+        },
+        {
+          "pattern": "/users/sign_up_by_channel",
+          "count": 4
+        },
+        {
+          "pattern": "/api/team.prefs.set",
+          "count": 4
+        },
+        {
+          "pattern": "/api",
+          "count": 4
+        },
+        {
+          "pattern": "/functions/ajax.php",
+          "count": 4
+        },
+        {
+          "pattern": "/v1",
+          "count": 3
+        },
+        {
+          "pattern": "/stores/api",
+          "count": 3
+        },
+        {
+          "pattern": "/Keybase/keybased.sock)",
+          "count": 3
+        },
+        {
+          "pattern": "/Keybase/keybased.sock:",
+          "count": 3
+        },
+        {
+          "pattern": "/users/create_admin",
+          "count": 3
+        },
+        {
+          "pattern": "/118026546",
+          "count": 2
+        },
+        {
+          "pattern": "/[App_ID]HTTP/1.1",
+          "count": 2
+        },
+        {
+          "pattern": "/memberships/id`",
+          "count": 2
+        },
+        {
+          "pattern": "/settings/packing_slip_template`.",
+          "count": 2
+        },
+        {
+          "pattern": "/accounts/54aa37d8f61d7749430127ee",
+          "count": 2
+        },
+        {
+          "pattern": "/accounts/54aa4c616bb166b8f300134a",
+          "count": 2
+        },
+        {
+          "pattern": "/shares/[share-id]",
+          "count": 2
+        },
+        {
+          "pattern": "/enhancer",
+          "count": 2
+        },
+        {
+          "pattern": "/[Transfer_comment_ID]HTTP/1.1",
+          "count": 2
+        },
+        {
+          "pattern": "/transfers/774529",
+          "count": 2
+        },
+        {
+          "pattern": "/default/token",
+          "count": 2
+        },
+        {
+          "pattern": "/admin/settings",
+          "count": 2
+        },
+        {
+          "pattern": "/php/restaurant_menus_handler.php",
+          "count": 2
+        },
+        {
+          "pattern": "/users/api",
+          "count": 2
+        },
+        {
+          "pattern": "/[appid]/team_members",
+          "count": 2
+        },
+        {
+          "pattern": "/accounts/54aa4ab19ea6961359001260",
+          "count": 2
+        },
+        {
+          "pattern": "/login",
+          "count": 2
+        },
+        {
+          "pattern": "/unversioned/graphql",
+          "count": 2
+        },
+        {
+          "pattern": "/api/xauth",
+          "count": 2
+        },
+        {
+          "pattern": "/261932226/order_change_logs",
+          "count": 2
+        }
+      ]
+    },
+    "RCE": {
+      "unique_endpoints": 139,
+      "top_endpoints": [
+        {
+          "pattern": "/bugs.php",
+          "count": 10
+        },
+        {
+          "pattern": "/blog/info.php",
+          "count": 8
+        },
+        {
+          "pattern": "/authorized_keys",
+          "count": 5
+        },
+        {
+          "pattern": "/import/github",
+          "count": 5
+        },
+        {
+          "pattern": "/search",
+          "count": 5
+        },
+        {
+          "pattern": "/v1/1yv4QQmkj4h4OdmmyT11tkiGf5M.php",
+          "count": 4
+        },
+        {
+          "pattern": "/authorized_keys`",
+          "count": 4
+        },
+        {
+          "pattern": "/index.php",
+          "count": 4
+        },
+        {
+          "pattern": "/process",
+          "count": 4
+        },
+        {
+          "pattern": "/login.cgi",
+          "count": 3
+        },
+        {
+          "pattern": "/v1",
+          "count": 3
+        },
+        {
+          "pattern": "/attacker/phish.php",
+          "count": 3
+        },
+        {
+          "pattern": "/account/photo",
+          "count": 3
+        },
+        {
+          "pattern": "/www.php",
+          "count": 2
+        },
+        {
+          "pattern": "/api/files.info`",
+          "count": 2
+        },
+        {
+          "pattern": "/tmp/test.php",
+          "count": 2
+        },
+        {
+          "pattern": "/v1/backend1",
+          "count": 2
+        },
+        {
+          "pattern": "/gadgets/makeRequest",
+          "count": 2
+        },
+        {
+          "pattern": "/client/index.php",
+          "count": 2
+        },
+        {
+          "pattern": "/suanve",
+          "count": 2
+        },
+        {
+          "pattern": "/attachment/2",
+          "count": 2
+        },
+        {
+          "pattern": "/4/search",
+          "count": 2
+        },
+        {
+          "pattern": "/domain/metadata",
+          "count": 2
+        },
+        {
+          "pattern": "/user/verify'",
+          "count": 2
+        },
+        {
+          "pattern": "/import/gitlab_project",
+          "count": 2
+        },
+        {
+          "pattern": "/upload",
+          "count": 2
+        },
+        {
+          "pattern": "/login.cgi$",
+          "count": 1
+        },
+        {
+          "pattern": "/analyse.php",
+          "count": 1
+        },
+        {
+          "pattern": "/saleslead/6b6a8a5a-4a74-46db-b2fe-32a46f927ecc",
+          "count": 1
+        },
+        {
+          "pattern": "/register",
+          "count": 1
+        }
+      ]
+    },
+    "RaceCondition": {
+      "unique_endpoints": 6,
+      "top_endpoints": [
+        {
+          "pattern": "/android/verify_purchase",
+          "count": 3
+        },
+        {
+          "pattern": "/graphql",
+          "count": 1
+        },
+        {
+          "pattern": "/android/verify_purchase,",
+          "count": 1
+        },
+        {
+          "pattern": "/group/post_join",
+          "count": 1
+        },
+        {
+          "pattern": "/proxy/`.",
+          "count": 1
+        },
+        {
+          "pattern": "/ajax/choose_prize",
+          "count": 1
+        }
+      ]
+    },
+    "SQLi": {
+      "unique_endpoints": 58,
+      "top_endpoints": [
+        {
+          "pattern": "/api/user",
+          "count": 6
+        },
+        {
+          "pattern": "/api",
+          "count": 5
+        },
+        {
+          "pattern": "/admin-ajax.php'",
+          "count": 5
+        },
+        {
+          "pattern": "/user",
+          "count": 4
+        },
+        {
+          "pattern": "/api/tweets",
+          "count": 3
+        },
+        {
+          "pattern": "/leasib.php",
+          "count": 3
+        },
+        {
+          "pattern": "/datagov/csv_to_json",
+          "count": 3
+        },
+        {
+          "pattern": "/changeReplaceOpt.php",
+          "count": 3
+        },
+        {
+          "pattern": "/webapi/searchapi.php",
+          "count": 3
+        },
+        {
+          "pattern": "/index.php",
+          "count": 3
+        },
+        {
+          "pattern": "/edit.php?post_type=qa_faqs&page=faqpageorder",
+          "count": 3
+        },
+        {
+          "pattern": "/api/test",
+          "count": 2
+        },
+        {
+          "pattern": "/js/importStatus.php?acctid=1",
+          "count": 2
+        },
+        {
+          "pattern": "/registration.php",
+          "count": 2
+        },
+        {
+          "pattern": "/reader_api/stories.php?limit=10&offset=20&organization_id=88822&search=0&sort=",
+          "count": 2
+        },
+        {
+          "pattern": "/searchapi.php",
+          "count": 2
+        },
+        {
+          "pattern": "/profile/deleteInvitation",
+          "count": 2
+        },
+        {
+          "pattern": "/inc/reorder.php",
+          "count": 2
+        },
+        {
+          "pattern": "/organizations/0010jdlwix09k'or(extractvalue(rand(),concat(0x3a,(select+user()))))=1--%20aa",
+          "count": 2
+        },
+        {
+          "pattern": "/organizations/'or(extractvalue(1,concat(1,(select(table_name)from%20information_schema.tables%20limit%2054,1))))='",
+          "count": 2
+        },
+        {
+          "pattern": "/account",
+          "count": 2
+        },
+        {
+          "pattern": "/webApp/lapsuudenturva",
+          "count": 2
+        },
+        {
+          "pattern": "/userInfo><timezone",
+          "count": 2
+        },
+        {
+          "pattern": "/login.php",
+          "count": 2
+        },
+        {
+          "pattern": "/account/userbar",
+          "count": 2
+        },
+        {
+          "pattern": "/webApp/oma_conf",
+          "count": 1
+        },
+        {
+          "pattern": "/filter/ajax_get_new_contents",
+          "count": 1
+        },
+        {
+          "pattern": "/forums",
+          "count": 1
+        },
+        {
+          "pattern": "/forums/showthread.php?t=106825&page=74&p=3522012",
+          "count": 1
+        },
+        {
+          "pattern": "/library/index.php?obj=cat&id=212&searchST='+and+0+union+select+1,2,concat_ws(0x3a,user(),version()),4,5,6,7--",
+          "count": 1
+        }
+      ]
+    },
+    "SSRF": {
+      "unique_endpoints": 67,
+      "top_endpoints": [
+        {
+          "pattern": "/api/file-storage",
+          "count": 5
+        },
+        {
+          "pattern": "/v1",
+          "count": 4
+        },
+        {
+          "pattern": "/v1/download-url",
+          "count": 4
+        },
+        {
+          "pattern": "/api/graphql",
+          "count": 4
+        },
+        {
+          "pattern": "/4/store",
+          "count": 3
+        },
+        {
+          "pattern": "/v1.json`",
+          "count": 3
+        },
+        {
+          "pattern": "/example/index.php",
+          "count": 3
+        },
+        {
+          "pattern": "/v1/config",
+          "count": 2
+        },
+        {
+          "pattern": "/9577763394/images.json",
+          "count": 2
+        },
+        {
+          "pattern": "/order",
+          "count": 2
+        },
+        {
+          "pattern": "/nr/video",
+          "count": 2
+        },
+        {
+          "pattern": "/php/PEAR.php",
+          "count": 2
+        },
+        {
+          "pattern": "/redirect.php",
+          "count": 2
+        },
+        {
+          "pattern": "/latest/meta-data",
+          "count": 2
+        },
+        {
+          "pattern": "/index.php",
+          "count": 2
+        },
+        {
+          "pattern": "/v0.0.0",
+          "count": 2
+        },
+        {
+          "pattern": "/api/accounts",
+          "count": 2
+        },
+        {
+          "pattern": "/v1/proxy",
+          "count": 2
+        },
+        {
+          "pattern": "/statuses/5509244fe4919b85f5c1e0e1a2340805055c32d9",
+          "count": 2
+        },
+        {
+          "pattern": "/css_optimiser.php",
+          "count": 2
+        },
+        {
+          "pattern": "/.proxy=http:/proxy.aw.rs:8500`",
+          "count": 1
+        },
+        {
+          "pattern": "/v4/projects",
+          "count": 1
+        },
+        {
+          "pattern": "/.proxy=http:/proxy.aw.rs:8500&name=proxy4'`.",
+          "count": 1
+        },
+        {
+          "pattern": "/projects/204",
+          "count": 1
+        },
+        {
+          "pattern": "/projects/204'",
+          "count": 1
+        },
+        {
+          "pattern": "/image.jpeg",
+          "count": 1
+        },
+        {
+          "pattern": "/api.stripe.com",
+          "count": 1
+        },
+        {
+          "pattern": "/users/plans",
+          "count": 1
+        },
+        {
+          "pattern": "/payments/providers",
+          "count": 1
+        },
+        {
+          "pattern": "/v1/faqs",
+          "count": 1
+        }
+      ]
+    },
+    "SessionFixation": {
+      "unique_endpoints": 4,
+      "top_endpoints": [
+        {
+          "pattern": "/login",
+          "count": 2
+        },
+        {
+          "pattern": "/apps/flow",
+          "count": 2
+        },
+        {
+          "pattern": "/account",
+          "count": 1
+        },
+        {
+          "pattern": "/auth/callback),",
+          "count": 1
+        }
+      ]
+    },
+    "XSS": {
+      "unique_endpoints": 344,
+      "top_endpoints": [
+        {
+          "pattern": "/index.php",
+          "count": 17
+        },
+        {
+          "pattern": "/admin",
+          "count": 15
+        },
+        {
+          "pattern": "/search",
+          "count": 15
+        },
+        {
+          "pattern": "/login",
+          "count": 8
+        },
+        {
+          "pattern": "/account/signin",
+          "count": 7
+        },
+        {
+          "pattern": "/{service:[A-Za-z0-9]+}/complete",
+          "count": 6
+        },
+        {
+          "pattern": "/authorize",
+          "count": 5
+        },
+        {
+          "pattern": "/oauth/authorize",
+          "count": 5
+        },
+        {
+          "pattern": "/User",
+          "count": 5
+        },
+        {
+          "pattern": "/userInfo><timezone",
+          "count": 4
+        },
+        {
+          "pattern": "/accounts/login",
+          "count": 4
+        },
+        {
+          "pattern": "/users",
+          "count": 4
+        },
+        {
+          "pattern": "/upload.php",
+          "count": 4
+        },
+        {
+          "pattern": "/admin`",
+          "count": 4
+        },
+        {
+          "pattern": "/link/continue",
+          "count": 4
+        },
+        {
+          "pattern": "/user/hermawanferdi",
+          "count": 4
+        },
+        {
+          "pattern": "/spreadsheet/promocodes",
+          "count": 4
+        },
+        {
+          "pattern": "/admin/themes',",
+          "count": 3
+        },
+        {
+          "pattern": "/reviews/product",
+          "count": 3
+        },
+        {
+          "pattern": "/settings/password",
+          "count": 3
+        },
+        {
+          "pattern": "/admin/collections",
+          "count": 3
+        },
+        {
+          "pattern": "/account",
+          "count": 3
+        },
+        {
+          "pattern": "/import/github",
+          "count": 3
+        },
+        {
+          "pattern": "/settings/general",
+          "count": 3
+        },
+        {
+          "pattern": "/user/user36690798).",
+          "count": 3
+        },
+        {
+          "pattern": "/orders",
+          "count": 3
+        },
+        {
+          "pattern": "/profile/subscription",
+          "count": 3
+        },
+        {
+          "pattern": "/Order",
+          "count": 3
+        },
+        {
+          "pattern": "/authentication/fb_callback",
+          "count": 3
+        },
+        {
+          "pattern": "/users/5212593",
+          "count": 3
+        }
+      ]
+    },
+    "XXE": {
+      "unique_endpoints": 7,
+      "top_endpoints": [
+        {
+          "pattern": "/sxmp/1.0",
+          "count": 2
+        },
+        {
+          "pattern": "/hxpublic_v6/hxdynamicpage6.aspx",
+          "count": 1
+        },
+        {
+          "pattern": "/hxpublic_v6/hxxmlservice6.aspx",
+          "count": 1
+        },
+        {
+          "pattern": "/index.php",
+          "count": 1
+        },
+        {
+          "pattern": "/text.txt",
+          "count": 1
+        },
+        {
+          "pattern": "/resp/███████",
+          "count": 1
+        },
+        {
+          "pattern": "/resp/██████",
+          "count": 1
+        }
+      ]
+    }
+  }
+}

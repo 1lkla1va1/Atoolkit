@@ -3,9 +3,49 @@
   "title": "业务逻辑篡改",
   "description": "覆盖金额、库存、优惠、积分、抽奖、退款、回调等跨步骤业务一致性风险。",
   "match": {
-    "vuln_classes": ["业务逻辑"],
-    "params": ["amount", "price", "refund_amount", "use_points", "use_point", "points", "integral", "score", "discount", "discount_amount", "discount_rate", "coupon", "coupon_id", "coupon_code", "discount_code", "voucher", "pay_amount", "final_amount", "total_amount", "quantity", "balance", "stock", "order_time", "callback", "recharge", "lottery", "probability"],
-    "keywords": ["refund", "payment", "points", "coupon", "recharge", "lottery"]
+    "vuln_classes": [
+      "业务逻辑"
+    ],
+    "params": [
+      "amount",
+      "price",
+      "refund_amount",
+      "use_points",
+      "use_point",
+      "points",
+      "integral",
+      "score",
+      "discount",
+      "discount_amount",
+      "discount_rate",
+      "coupon",
+      "coupon_id",
+      "coupon_code",
+      "discount_code",
+      "voucher",
+      "pay_amount",
+      "final_amount",
+      "total_amount",
+      "quantity",
+      "balance",
+      "stock",
+      "order_time",
+      "callback",
+      "recharge",
+      "lottery",
+      "probability"
+    ],
+    "keywords": [
+      "refund",
+      "payment",
+      "points",
+      "coupon",
+      "recharge",
+      "lottery"
+    ],
+    "secondary_params": [
+      "uuid"
+    ]
   },
   "dimensions": [
     "客户端可控字段与服务端计算结果是否一致",
@@ -29,7 +69,11 @@
   "negative_sufficiency": {
     "min_vectors": 4,
     "min_response_count": 2,
-    "required_evidence_types": ["baseline", "variant_result", "server_state"]
+    "required_evidence_types": [
+      "baseline",
+      "variant_result",
+      "server_state"
+    ]
   },
   "positive_depth_floor": {
     "min_depth": 2,

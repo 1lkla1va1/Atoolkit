@@ -3,9 +3,38 @@
   "title": "多身份 IDOR",
   "description": "覆盖对象级授权、跨账户读取、跨账户修改、角色边界和对象归属校验。",
   "match": {
-    "vuln_classes": ["越权/IDOR", "未授权访问"],
-    "params": ["id", "uid", "user_id", "order_id", "bug_id", "project_id", "address_id", "owner_id", "account_id"],
-    "keywords": ["detail", "profile", "order", "address", "project", "bug", "identity_meta"]
+    "vuln_classes": [
+      "越权/IDOR",
+      "未授权访问"
+    ],
+    "params": [
+      "id",
+      "uid",
+      "user_id",
+      "order_id",
+      "bug_id",
+      "project_id",
+      "address_id",
+      "owner_id",
+      "account_id"
+    ],
+    "keywords": [
+      "detail",
+      "profile",
+      "order",
+      "address",
+      "project",
+      "bug",
+      "identity_meta"
+    ],
+    "secondary_params": [
+      "target_id",
+      "target_type",
+      "accounts",
+      "group_id",
+      "selectedaddressid",
+      "time_range"
+    ]
   },
   "dimensions": [
     "对象读取是否绑定当前授权身份",
@@ -27,7 +56,12 @@
   "negative_sufficiency": {
     "min_vectors": 3,
     "min_response_count": 2,
-    "required_evidence_types": ["owner_identity", "peer_identity", "object_ownership", "access_result"],
+    "required_evidence_types": [
+      "owner_identity",
+      "peer_identity",
+      "object_ownership",
+      "access_result"
+    ],
     "min_identities": 2
   },
   "positive_depth_floor": {
