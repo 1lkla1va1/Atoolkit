@@ -5,7 +5,7 @@
   "match": {
     "vuln_classes": ["文件读取/穿越", "XSS", "命令执行/RCE"],
     "endpoints": ["upload", "file", "avatar", "image", "media", "attachment"],
-    "params": ["filename", "file", "category", "path", "content_type", "extension", "url"],
+    "params": ["filename", "file", "category", "dir", "folder", "module", "type", "path", "content_type", "extension", "url", "name", "newname", "save_name", "max_size", "size_limit", "width", "height", "callback", "return_url", "redirect", "title", "description", "alt", "tag"],
     "keywords": ["upload", "download", "preview", "image", "avatar", "attachment"]
   },
   "dimensions": [

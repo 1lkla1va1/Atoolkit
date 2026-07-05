@@ -1,0 +1,38 @@
+{
+  "id": "waf-bypass",
+  "title": "WAF 绕过",
+  "description": "当注入 payload 被 WAF/关键字过滤拦截时，按 6 个绕过家族逐一尝试，不得因单次拦截即判阴性。",
+  "match": {
+    "vuln_classes": ["SQLi", "XSS", "命令执行/RCE", "SSRF", "文件读取/穿越"],
+    "keywords": ["waf", "firewall", "filter", "blocked", "illegal", "forbidden", "拦截", "非法", "关键字"]
+  },
+  "dimensions": [
+    "拦截是否为关键字匹配（大小写变体是否通过）",
+    "拦截是否为空格匹配（空白字符替换是否通过）",
+    "拦截是否为函数名黑名单（等价函数是否通过）",
+    "拦截是否为请求方式限制（POST/HPP/分块是否通过）",
+    "拦截后是否有错误信息泄露可利用"
+  ],
+  "false_negative_rules": [
+    "WAF 拦截不等于漏洞不存在——被拦截只说明 payload 被检测，不说明漏洞不存在",
+    "至少尝试 3 个不同绕过家族后才能判阴性",
+    "同一 payload 被拦截后必须换编码方式重试，不得直接放弃",
+    "关键字过滤通常有长度限制——超长 payload 可能绕过"
+  ],
+  "evidence_required": [
+    "blocked_response",
+    "bypass_attempt_1",
+    "bypass_attempt_2",
+    "bypass_attempt_3"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 6,
+    "min_response_count": 3,
+    "required_evidence_types": ["blocked_response", "bypass_attempt_1", "bypass_attempt_2", "bypass_attempt_3"]
+  },
+  "positive_depth_floor": {
+    "min_depth": 2,
+    "min_vectors": 2,
+    "note": "WAF 绕过：≥1 个绕过家族成功 + payload 生效，达 depth_score 2 才许 proof_ready"
+  }
+}

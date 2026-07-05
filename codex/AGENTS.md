@@ -34,49 +34,25 @@
 在开始测试之前，必须完成 Phase 0 侦察，建立完整的攻击面清单：
 
 1. **页面与 JS 分析**：获取关键页面 HTML，提取所有 JS 文件，grep API 路径 → `endpoint_inventory.md`
-2. **API 端点枚举**：逐一 curl 检查可达性，分类（公开/需认证/不存在） → 更新 `endpoint_inventory.md`
-3. **业务流建模**：走一遍用户/商户/管理核心流程，记录端点和参数 → `business_flow.md`
-4. **攻击面清单生成**：合并以上产出，每个 surface = endpoint/method/param/role/risk_tags/status → `attack_surface_list.md`
-5. **完整性检查**：对照决策树分支确认无空白方向，缺失方向继续侦察或标 NEED_INPUT
-
-**Phase 0 结束后必检完整性门**：认证面（注册/登录/找回/验证码/SMS）、交易面（支付/退款/订单/积分）、IDOR 面、输入验证面、管理面、商户面——每个方向至少 1 个 surface。
+2. **非 API 页面与表单扫描**：提取 HTML 表单 action 和高价值非 API 页面 → `[HTML]` 前缀记录
+3. **API 端点枚举**：逐一 curl 检查可达性，分类（公开/需认证/不存在） → 更新 `endpoint_inventory.md`
+4. **业务流建模**：走一遍用户/商户/管理核心流程，记录端点和参数 → `business_flow.md`
+5. **攻击面清单生成**：合并以上产出，每个 surface = endpoint/method/param/role/risk_tags/status → `attack_surface_list.md`
+6. **完整性检查**：对照决策树分支确认无空白方向，缺失方向继续侦察或标 NEED_INPUT
 
 ---
 
 ## 1. 垃圾洞清单（置顶 · 第一眼就要看到）
 
-下列发现**绝对不报**。唯一例外：你能给出"被利用后造成实际后果"的完整窃取/利用 PoC。
-（例外只有这一句。逐条**不再**写"除非……"，不要把它当成需要辩证的判断题——命中即丢。）⚙ 标题命中即被拦截器拒绝
+下列发现**默认不报**，除非你能给出"被利用后造成实际后果"的完整利用 PoC。遇到这些模式时先记录到观察清单，在后续测试中关注是否可与其他漏洞链式利用。⚙ 标题命中即被拦截器拒绝
 
-- CORS 跨域配置 —— 跨域本身不是漏洞
-- Sourcemap / .map 泄露 —— 配置问题，不可利用
-- HTTP 安全头缺失（X-Frame-Options / CSP / HSTS）—— 理论风险
-- 版本号 / 中间件指纹 / 框架特征 —— 信息收集副产品
-- Self-XSS —— 只能攻击自己，无危害
-- SSL/TLS 配置警告 —— 配置项，不是结果
-- 单独的开放重定向 —— 单独存在无害（可链式利用属于"结果"，见下方判定规则）
-- Rate limiting / 限频缺失 —— 功能建议，不是漏洞
-- 目录列举 / 默认页 / 报错堆栈 —— 现象，不是结果
-- **任何没有可重现 PoC 的发现** —— 不能重现的就不存在
+- CORS 跨域配置 · Sourcemap / .map 泄露 · HTTP 安全头缺失
+- 版本号 / 中间件指纹 · Self-XSS · SSL/TLS 配置警告
+- 单独的开放重定向（链式利用判定详见 skillmode-reference.md）
+- Rate limiting / 限频缺失 · 目录列举 / 报错堆栈
+- **任何没有可重现 PoC 的发现**
 
 > 出现新的噪音模式 → 立即追加到本清单。
-
-### 开放重定向的"结果"判定（v7 补充）
-
-**单独存在 = 现象（不报）：**
-- redirect 参数指向外部 URL，但无其他漏洞可链
-
-**构成结果（报）的条件——满足任一即可：**
-1. 重定向目标页能窃取 token/session（如：redirect 到钓鱼页 + 页面包含登录表单）
-2. 重定向可与 OAuth/SSO 回调链式利用，劫持授权码
-3. 重定向可绕过 referer 检查（如：支付回调的 redirect 被服务端 302 到外站，泄露了 sign/token）
-4. 重定向可与 SSRF 链式利用（如：redirect URL 被服务端 fetch 而非浏览器跳转）
-
-**测试 checklist（每个 redirect 参数）：**
-- 替换为外部 URL → 是否 302/303 跳转？
-- 替换为含 token 的 URL → 跳转后 URL 是否泄露敏感参数？
-- 与 OAuth/支付回调组合 → 能否劫持回调？
-- 服务端是否 fetch 了 redirect URL → SSRF 链？
 
 ---
 
@@ -105,27 +81,18 @@
 - 「可能」不报，只报「已证明」
 - 报告必须带 curl / 原始 HTTP 包；P3 以下不写报告
 - 物理证据 > 自我声明（说做了 ≠ 真做了，落盘才算数）
-- ⚙ 20 分钟无进展 → 换攻击面，别死磕（外部计时器会注入切换指令）
+- 20 分钟无进展信号 → 考虑换攻击面，但有微弱信号就继续追（模型直觉比计时器可靠）
 - 长链路用 PLAN（前置规划），短链路用 TODO（边走边测）
 - 业务逻辑漏洞几乎都是长链路 → 先建模、再拆 TODO、按清单执行
 - 越界即停：超出授权范围（含跨子系统）立即停手并标记 NEED_INPUT
-- **替换 ID 至少测 3–5 个**，别只换一个就下结论
-- **A 接口的响应字段 → 试着喂给 B 接口**（越权/IDOR 的高产路径）
-- **排序/筛选参数（sort / orderBy / filter）是被低估的注入点**
-- 高价值覆盖格不得停在 `not_tested`；未闭合时只能标 `incomplete` 或 `NEED_INPUT`
-- 认证、参数、角色/对象对都是一等攻击面，不因已有登录态而跳过
+- **认证、参数、角色/对象对都是一等攻击面**，不因已有登录态而跳过
+- **响应异常嗅探**：对每个 API 响应，检查是否有意外字段（callback_sign、内部路径、调试信息、其他用户敏感数据），即使主流程正常——意外字段本身可能是独立的攻击面入口
 
-### 假阴性陷阱（v7 补充 · 从知识卡提取）
+### 假阴性陷阱
 
-以下模式是"以为安全但其实没测够"的典型陷阱：
-
-- 替换 ID 只换一个就下结论 → 不够，至少 3-5 个（同根因去重）
-- A 接口响应字段 → 试着喂给 B 接口（越权高产路径）
-- sort/orderBy/filter → 被低估的注入点
+- 替换 ID 至少 3-5 个（同根因去重）
 - 已测端点无参数 → 不代表安全，检查路径本身（信息泄露/未授权访问）
-- 单对象单角色测通 → 不代表安全，换角色换对象再测
 - 金额字段只测了正值 → 负数/零/精度/单位换算
-- 时间字段只看了返回 → 试着传 order_time/create_time/timestamp
 - 认证通过后就不再回头测认证面 → 错，注册/找回/重置/captcha 都是独立面
 
 ---
@@ -142,15 +109,29 @@
 
 ---
 
-## 5. 七问验证门（报告前逐条自答，全过才写）
+## 5. 验证门（两层 · 不同阶段用不同标准）
+
+### 第一层：测试信号门（发现异常时 · 决定是否继续深挖）
+
+遇到异常响应或可疑信号时，用以下 3 问快速判断是否值得投入更多测试时间：
+
+| # | 问题 | 信号判断 |
+|---|---|---|
+| 1 | 在授权范围内吗？ | 不在 → 停止，不碰 |
+| 2 | 响应有可观察的异常吗？ | 有异常（状态码变化/内容差异/长度变化/错误信息/时间延迟）→ 值得深挖。无异常但参数可控 → 换 payload 类型再试 |
+| 3 | 这个异常能链接到具体危害吗？ | 能描述出"如果成功会怎样" → 继续。**不要求此时已证明**，只要求危害路径合理且可验证 |
+
+**关键**：测试阶段不要因为"还没有 PoC"或"影响还没证明"就放弃。信号门只过滤"确实没信号"的情况，有信号就追到底。
+
+### 第二层：报告验证门（写报告前 · 逐条自答，全过才写）
 
 | # | 问题 | 不通过则 |
 |---|---|---|
 | 1 | 在授权范围内吗？ | 停止，不报 |
-| 2 | 有完整可重现的 PoC（curl / HTTP 包）吗？ | 补 PoC，没有就不报 |
-| 3 | 解释危害需要假设或推测吗？ | 需要假设 → 危害不够直接，不报 |
-| 4 | 影响是已证明的还是「可能」的？ | 「可能」不报 |
-| 5 | 这是现象还是结果？ | 现象不报 |
+| 2 | 有完整可重现的 PoC（curl / HTTP 包）吗？ | **回去补**，补不到就不报 |
+| 3 | 危害是可直接演示的，还是需要假设前提条件？ | 需要假设攻击者拥有不可获取的前提（如内网访问/物理接触）→ 不报。前提条件在攻击链中可达成（如 SQLi 拿到密码 → 登录后台）→ 可以报，写清楚链路 |
+| 4 | 影响已经在 PoC 中复现了吗？ | PoC 中已复现（响应/数据/行为证明）→ 报。只有理论推导、PoC 中无法体现 → 不报 |
+| 5 | 这是「可控参数 + 异常响应」还是「可证明的安全结果」？ | 前者是现象（不报），后者是结果（报）。区分方法：你的 PoC 是否展示了安全边界被突破的具体后果（数据泄露/越权操作/资金变化/代码执行），而非仅仅"参数被接受" |
 | 6 | 不懂安全的开发者能看懂危害吗？ | 写更清楚，或危害不明显 → 不报 |
 | 7 | 发到漏洞平台会被接受还是关闭？ | 会被关闭 → 不报 |
 
@@ -163,26 +144,9 @@
 
 ## 6. 覆盖完整性（硬纪律）
 
-先覆盖，再收口。每个发现的攻击面都必须拆成 `endpoint / method / param / role / risk_tag`，并维护覆盖格状态：`not_tested`、`confirmed`、`not_vulnerable`、`shallow_negative`、`blocked`、`not_applicable`。
+先覆盖，再收口。每个发现的攻击面都必须拆成 `endpoint / method / param / role / risk_tag`，并维护覆盖格状态：`not_tested`、`confirmed`、`not_vulnerable`、`shallow_negative`、`blocked`、`not_applicable`、`exploring`。
 
-### 覆盖台账（两种模式并存）
-
-- **Engine Mode**（不变）：默认用 `python3 run.py` 起会话，让外壳维护权威台账 `coverage-ledger.json` 和 session gate。
-- **Skill Mode**（v7 新增）：使用轻量 markdown 覆盖表，在 Phase 0 生成后边走边更新状态列：
-
-```markdown
-| # | surface | status | evidence | depth | note |
-|---|---|---|---|---|---|
-| S01 | POST /register captcha | not_vulnerable | NF-001 | ✓ 5 vectors | captcha 服务端校验有效 |
-| S03 | POST /refund amount | confirmed | finding_001 | ✓ 4 vectors | 退款金额无上限校验 |
-| S05 | GET /balance-records | shallow_negative | NF-005 | ✗ 数据为空 | 需创建余额记录后重测 |
-```
-
-`status` 列只允许：`not_tested / confirmed / not_vulnerable / shallow_negative / blocked`。
-`depth` 列只允许：`✓`（达到 depth floor）或 `✗ <原因>`。
-终态时 `not_tested` 的高价值 surface → 终态标 `incomplete`。
-
-**并行模式**：每个 agent 各写一份带前缀的覆盖表（`coverage_auth.md`、`coverage_txn.md` 等），聚合阶段合并去重。
+**Skill Mode 覆盖台账**：用 markdown 表格维护覆盖状态（格式见 skillmode-reference.md §覆盖台账）。`status` 列只允许上述七种值，`depth` 列只允许 `✓`（达到 depth floor）或 `✗ <原因>`。终态时 `not_tested` 的高价值 surface → 标 `incomplete`。`exploring` 表示正在对该 surface 做非结构化深度测试，不受 checklist 约束，有明确结论后转为 `confirmed` / `not_vulnerable` / `shallow_negative`。
 
 ### 高价值格不得空白
 
@@ -190,9 +154,9 @@
 
 ### `LOW_ROI` 条件
 
-只能用于覆盖充分、可恢复阻塞已处理、关键负向证据已落盘后仍无发现；有待测高价值格、未转任务的 `next_actions`、证据不一致时不得使用。
+只能用于覆盖充分、可恢复阻塞已处理、关键负向证据已落盘、**§8.5 直觉探索阶段已完成**后仍无发现；有待测高价值格、未转任务的 `next_actions`、证据不一致、直觉探索未执行时不得使用。**配置内有超过 5 个 not_tested 高价值 surface 时，不得输出 LOW_ROI。**
 
-### 弹性 depth floor（v7 升级 · 两级确认）
+### 弹性 depth floor（两级确认）
 
 确认漏洞前，候选必须达到 depth_floor——即用多向量/多角色/多对象的对比证据证明这**真是漏洞且严重度没被低估**。
 
@@ -201,80 +165,51 @@
 | **快速确认** | 首个 payload 即成功 + 影响明确 | 1 个成功 + 2 个失败对照 |
 | **完整确认** | 需要排除误报或评估严重度 | 达到完整 depth floor 阈值 |
 
-**快速确认条件（满足全部即可跳过完整确认）：**
-1. 首个测试 payload 即产生明确的、可区分于正常响应的结果
-2. 影响可以直接证明（如：返回了其他用户数据、执行了注入、修改了他人订单）
-3. 不是"可能"或"疑似"，而是确定性的结果
+快速确认条件：首个 payload 产生明确可区分结果 + 影响可直接证明 + 确定性结果（非"可能"）。最小证据：1 成功请求+响应、1 对照请求+响应（证明差异是 payload 导致）；涉及越权时加 1 owner + 1 attacker 请求+响应差异。
 
-**快速确认仍需的最小证据：**
-- 1 个成功请求 + 响应
-- 1 个对照请求（正常输入）+ 响应（证明差异是 payload 导致的）
-- 如果涉及越权：1 个 owner 请求 + 1 个 attacker 请求 + 响应差异
+**这是取证完整性，不是"进一步利用"**——前者必做，后者红线禁止。depth_score < depth_floor 时候选不得标 proof_ready。
 
-**何时升级到完整确认：**
-- 首个 payload 结果模糊（状态码 200 但内容不确定）
-- 需要评估严重度（能提多少数据？能越多少角色？）
-- 需要排除 WAF/过滤的误判
-- 准备写 P1/P2 报告前
+### 阴性 depth floor（弹性判断）
 
-**这是取证完整性，不是"进一步利用"**——前者必做（§4 铁律"够证明即止"不豁免 depth floor），后者红线禁止。depth_score < depth_floor 时候选不得标 proof_ready。
+阴性结论需要足够的测试深度支撑。深度由你根据端点复杂度、参数语义、响应特征和技术栈自行判断，不设硬性数值阈值。
 
-### 阴性 depth floor 硬阈值（从知识卡提取，可抬不可降）
+判断原则：
+- 参数语义越复杂（多义/多类型/多上下文），需要的测试向量越多样
+- 响应差异越微妙（行数变化 vs 状态码变化 vs 内容变化），需要的对照实验越充分
+- 涉及越权/多角色的漏洞，必须有跨角色对比证据
+- 仅凭单一 payload 类型不足以排除注入类漏洞
 
-| 漏洞类 | 最低向量数 | 最低身份数 | 最低对象数 | 来源卡 |
-|---|---|---|---|---|
-| SQLi/命令注入 | ≥3 payload 家族（classic/UNION/blind/error） | ≥1 | ≥3 参数 | input-validation |
-| SSRF | ≥5 向量（127.0.0.1/0.0.0.0/DNS-rebinding/@-prefix/file://） | ≥1 | ≥3 协议 | 待验证 |
-| IDOR/越权 | ≥1 payload | ≥2 角色 | ≥2 对象 + 响应差异 | idor-multi-identity |
-| 业务逻辑篡改 | ≥3 金额向量（负/零/超大/精度/参数名变体） | ≥1 | ≥1 订单 | business-logic-tamper |
-| 认证流绕过 | ≥3 绕过向量（空值/缺失/复用/替换/类型篡改） | ≥2 角色 | ≥1 | auth-flow-abuse |
-| 文件上传 | ≥3 绕过技术（双扩展/替代扩展/null byte/content-type） | ≥1 | ≥3 扩展 | file-upload-risk |
+未充分测试的阴性一律标 `shallow_negative`，不得标 `not_vulnerable`。
 
-未达阈值的阴性一律标 `shallow_negative`，不得标 `not_vulnerable`。
-
-### 阴性落盘格式（两种模式并存）
-
-- **Engine Mode**（不变）：每条阴性 = 独立 `negative_<surface_id>.md`，frontmatter 必含 `endpoint / method / param / vuln / roles / identities / vectors / evidence_types / next_actions`，正文附关键请求/响应片段。⚙ 逐格 ingest 只认 frontmatter，合并散文会被吃下却贡献为空。
-- **Skill Mode**（v7 新增）：使用合并文件 `negative_findings.md`，每条阴性为结构化段落：
-
-```markdown
-## NF-001: search.php SQLi
-- **endpoint:** GET /api/user/search.php
-- **param:** keyword
-- **vuln:** sql-injection
-- **roles:** anonymous, user
-- **vectors tested:** classic (3), UNION (2), blind-time (2), blind-bool (2), error (1) = 10 vectors
-- **result:** all returned normal results or error pages, no data extraction
-- **evidence:** response contained 0 products for injection payloads vs 1 for normal
-- **depth_floor_met:** yes (≥3 families, ≥10 vectors)
-- **status:** not_vulnerable
-- **next_actions:** none
-```
-
-**Skill Mode 阴性关键约束：**
-- 每条阴性必须有 `vectors tested` 数量明细（满足 depth floor 可审计性）
-- 每条阴性必须有 `depth_floor_met: yes/no`（显式声明是否达到阈值）
-- 未达阈值的必须标 `status: shallow_negative` + `next_actions`
+**阴性落盘格式**：Skill Mode 使用合并文件 `negative_findings.md`（完整格式见 skillmode-reference.md §阴性落盘）。每条阴性须含已测试向量描述 + depth_floor_met + status。
 
 ### 阻塞要分类
 
-`blocked` 必须写明可恢复或不可恢复。`quota_exhausted`、`object_absent`、可注册/可申请的 `missing_role` 属于可恢复阻塞，必须转成 `next_actions`（重置数据、换账号、创建对象、请求角色账号）；`captcha_required`、短信/二次核身、人审边界输出 `NEED_INPUT`；`out_of_scope` 立即停止，不绕过。
+`blocked` 必须写明可恢复或不可恢复。`quota_exhausted`、`object_absent`、可申请 `missing_role`、`captcha_bypass_exhausted`（二次验证绕过协议全部失败后）属可恢复阻塞 → 转 `next_actions`；`out_of_scope` 立即停止。**captcha/SMS/2FA 不是阻塞条件**——先执行二次验证绕过优先协议（§7 认证面分支），全部失败后才能标 NEED_INPUT。
+
+### 数据预备步骤
+
+测试某些端点前须先创建测试数据（余额/积分记录、订单、购物车、图片/文件等），确保端点有内容可测。**端点返回空数据不得直接标 not_vulnerable**，必须先执行数据预备后重测。
+
+### 存储型漏洞闭环验证
+
+存储型漏洞 POST 后必须执行 GET 闭环验证（POST→GET 渲染验证→跨用户验证），详见 skillmode-reference.md §存储型闭环。POST 返回空/200 不等于安全。
 
 ### 同根因去重
 
-同一端点、同一根因、同一受影响角色只算一个发现，聚合为 `finding_key = endpoint + root_cause + affected_role`；不同表现写入 `facets`，例如 `unpaid_recharge`、`race_replay`，不要拆成多个独立高危计数。并行模式下的前缀约定（§8 的 `finding_auth_001` 等）在聚合阶段合并为统一编号。
+同一端点、同一根因、同一受影响角色只算一个发现，聚合为 `finding_key = endpoint + root_cause + affected_role`。**聚合缝隙检查**：聚合阶段须列出所有端点参数按类型检查是否都有测试记录，未覆盖的标 `seam_gap` 补测。
 
 ### 认证面一等覆盖
 
-注册、登录、找回/重置、captcha/sms/verify-code、审核状态、锁定/解锁、用户枚举、token/session/role switch 都是独立认证面。即使已有登录态，命中这些 endpoint/参数时也要生成 `auth-flow` 或 `auth-flow-abuse` 风险格。
+注册、登录、找回/重置、captcha/sms/verify-code、审核状态、锁定/解锁、用户枚举、token/session/role switch 都是独立认证面。即使已有登录态，命中这些 endpoint/参数时也要生成认证风险格。
 
-### 风险维逐维应答（v6.1 硬纪律）
+### 风险维逐维应答
 
-每个攻击面按其 risk_tags 展开成风险维清单后，必须对**每一维**应答——有假设就写候选（CANDIDATE），没有就写 NONE:<reason>，**不许跳过任何一维**。这是"榨干"的确定性骨架：不是靠你自觉发散，而是逐维强制应答。换皮重述同一候选（同 endpoint+漏洞类+参数+角色+对象+根因）不算新增，会被 diversity_key 拦。
+每个攻击面按 risk_tags 展开后，必须对**每一维**应答——有假设写 `CANDIDATE`，没有写 `NONE:<reason>`，不许跳过任何一维。
 
 ### 价值排序只影响测试顺序
 
-优先级为认证/验证绕过 → 支付/余额/退款/积分 → 对象级授权 → 输入验证/文件/跳转 → 低价值信息暴露；排序不改变漏洞是否成立，报告仍以已证明结果为准。
+优先级为认证/验证绕过 → 支付/余额/退款/积分 → 对象级授权 → 输入验证/文件/跳转 → 低价值信息暴露；排序不改变漏洞是否成立。
 
 ---
 
@@ -282,88 +217,92 @@
 
 先收集流量、理解业务，再按目标特征选下一步；不穷举，给的是"怎么选"的框架。
 
-- **按认证面分支（一等分支，不挂在无登录态下面）**
-  - 命中 register / login / password / reset / captcha / sms / verify-code / admin / token / session / role-switch → 生成 `auth-flow` 风险格，测试注册、登录、找回、验证码、审核、锁定/解锁、用户枚举、token/session/role 切换
-  - 有登录态 → 仍要测认证状态变化、角色切换、会话绑定、对象归属；外壳按 endpoint / method / param / role / risk_tag 匹配认证和授权知识卡
-  - 无登录态 → 优先声明未授权访问 / 认证绕过 / 输入验证方向；遇验证码、短信、人审、二次核身即标 `NEED_INPUT`
+- **按认证面分支（一等分支）**
+  - 命中 register / login / password / reset / captcha / sms / verify-code / admin / token / session / role-switch → 生成 `auth-flow` 风险格
+  - **认证端到端验证**：组件级弱点必须验证能否链式利用到完整流程（captcha 可复用→完整注册/找回、SMS 无限频→暴力破解、token 可预测→重置密码）。组件弱点标 CANDIDATE，链式成功后标 confirmed
+  - **密码重置/找回流程测试**：密码重置是高价值认证面。分析其完整请求参数和业务流程，自行设计攻击策略。参考方向包括但不限于：验证码泄露检查（响应 body/headers/cookie 中是否包含验证码值）、验证码绑定检查（跨用户重用）、流程步骤跳过（直接请求后续步骤）、目标用户参数篡改（修改 username/phone/user_id）、token 可预测性/可重用性。详细的认证攻击模式参考见 skillmode-reference.md §密码重置
+  - **用户枚举三通道**：消息差异 + 时间差异（≥100ms，3 次取中位数）+ 行为差异（锁定/限频）。三通道全部测完才能下阴性
+  - 有登录态 → 仍测认证状态变化、角色切换、会话绑定、对象归属
+  - 无登录态 → 声明未授权访问 / 认证绕过 / 输入验证方向
+  - **二次验证绕过优先协议**：遇到 captcha / SMS / 2FA / 核身时，**绕过测试本身是一个独立的攻击面**，不是阻塞条件。在标 NEED_INPUT 之前，必须尝试以下方向（不限于此列表）：空值/null/空字符串提交、通用码（0000/1234/1111/admin/test）、验证码重用（同一验证码多次使用/跨会话重用）、字段省略（不发送 captcha 字段）、逻辑跳步（直接请求验证后的接口）、响应篡改（修改前端响应中的验证状态字段）、验证码回显检查（响应 body/headers/cookie/Set-Cookie 中是否包含验证码值）、验证码绑用户检查（A 的验证码能否用于 B 的流程）、类型/通道混淆。全部失败（至少 5 种不同方向）→ 才能标 NEED_INPUT。任一成功 → 绕过本身就是一个 finding。
 - **按参数语义分支**
-  - amount / refund_amount / use_points / price / fee / balance / stock → `amount-tamper`、`accounting`
+  - amount / refund_amount / use_points / price / fee / balance / stock → `amount-tamper`
   - order_time / timestamp / create_time → `time-tamper`
-  - order_no / product_no / user_id / user_hash / id → `object-ownership`、`idor`
-  - redirect / return_url / callback_url → `redirect-chain`、`callback`
+  - order_no / product_no / user_id / user_hash / id → `idor`
+  - redirect / return_url / callback_url → `redirect-chain`
   - image_url / url / fetch → `ssrf`
-  - filename / category / file / upload → `file-upload`、`path-traversal`
-  - keyword / search / sort / orderBy / filter → `input-validation`、`injection`
-  - status / discount / role / state → `enum-tamper`、`privilege`
+  - filename / category / file / upload → `file-upload`
+  - keyword / search / sort / orderBy / filter → `input-validation`
+  - status / discount / role / state → `privilege`
+  - **SQLi 注入测试**：对每个可能存在注入的参数，根据参数语义和响应特征自适应选择注入策略。需要覆盖的 SQL 上下文包括但不限于：等值查询、LIKE 模糊查询、ORDER BY 排序、INSERT/UPDATE 写入、数字型（无引号）和字符型（需闭合引号）。对每种上下文，根据你的判断选择合适的 payload 和闭合方式。观察响应的多维度差异：返回行数、内容变化、状态码、响应长度、响应时间、错误信息。不同 DBMS（MySQL / PostgreSQL / SQLite / MSSQL / Oracle）有不同的语法方言和特征函数，根据技术栈线索选择对应的 payload 变体。
 - **按 role/object-pair 分支**
-  - 对 `id`、`uid`、`user_id`、`order_id`、`product_id`、`merchant_id`、`address_id`、`hash`、`*_no` 这类对象参数，至少规划 owner 创建/枚举对象 → attacker 读取/修改/删除/操作 → owner/victim 回查业务影响
-  - 普通用户对象面至少覆盖 `owner:user -> attacker:user`；商户商品/订单覆盖 `merchant_a -> merchant_b`；高权限管理面覆盖 anonymous / user / merchant / admin 的角色差异格
+  - 对象参数（id / uid / user_id / order_id / product_id / merchant_id / hash / *_no）：owner 创建 → attacker 读取/修改/删除 → owner 回查影响
+  - 普通用户覆盖 owner→attacker；商户覆盖 merchant_a→merchant_b；高权限面覆盖 anon/user/merchant/admin 角色差异格
 - **按技术栈分支**
-  - Java 中间件 → 声明对象处理 / 表达式解析 / 中间件暴露面方向；外壳按技术栈与入口面匹配知识卡注入提示
-  - PHP → 声明文件访问 / 类型边界 / 输入验证方向；外壳按路径、参数、文件类 surface 匹配知识卡注入提示
-  - Node/前端重 → 声明对象合并 / 前端渲染 / 客户端路由方向；外壳按 JS 暴露接口、参数名、数据流匹配知识卡注入提示
-- **按功能分支（业务逻辑优先，单系统具体分析）**
-  - 支付 / 充值 / 套餐 → 金额篡改 / 精度 / 负数 / 0 元购 / 回调伪造 / 越权 capture
+  - Java → 对象处理 / 表达式解析 / 中间件暴露面
+  - PHP → 文件访问 / 类型边界 / 输入验证
+  - Node/前端重 → 对象合并 / 前端渲染 / 客户端路由
+- **按功能分支（业务逻辑优先）**
+  - 支付 / 充值 / 套餐 → 金额篡改 / 精度 / 负数 / 0 元购 / 回调伪造
   - 优惠券 / 积分 / 邀请 → 叠券 / 无限链 / 关单后仍可用
-  - 下单 / 库存 / 秒杀 → 声明并发一致性 / 重复提交 / 库存边界方向；外壳按交易链路 surface 匹配知识卡注入提示
-  - 第三方 / 社交登录 → 声明回调绑定 / 状态校验 / 账号关联方向；外壳按认证回调 surface 匹配知识卡注入提示
-  - 上传 / 导出 / 下载 → 声明文件访问 / 文件落地 / 导出授权方向；外壳按文件类 endpoint / surface 匹配知识卡注入提示
-- **按 ROI 分支**：认证 / 支付 / 数据导出 等高价值功能优先
+  - 下单 / 库存 / 秒杀 → 并发一致性 / 重复提交 / 库存边界
+  - **业务逻辑攻击模式库**：6 种高频模式（竞态条件 / 支付回调伪造 / 价格篡改 / 密码重置 / 积分滥用 / 响应篡改），详见 skillmode-reference.md §攻击模式库
+  - 第三方 / 社交登录 → 回调绑定 / 状态校验 / 账号关联
+  - 上传 / 导出 / 下载 → 文件访问 / 文件落地 / 导出授权。上传接口须测试 ≥3 个非文件参数（category/dir/filename/callback/metadata），详见 skillmode-reference.md §上传全参数
+  - **交易端点参数穷举**：对每个交易端点逐一测试金额（负/零/超大/精度）、积分优惠券（≥2 参数名变体 × 3 测试值）、数量、时间、状态参数，至少 4 个维度
+- **按 ROI 分支**：认证 / 支付 / 数据导出等高价值功能优先
+- **WAF 对抗协议**：payload 被拦截时（响应含"非法关键字"/"请求被拦截"/403/payload 被去除），分析拦截机制并创造性地尝试绕过。不限制绕过技术的选择范围。参考方向（启发性提示，非穷举清单）：编码变体、混淆、注释穿插、空白字符替换、函数等价替换、分块传输、参数污染、Content-Type 切换、大小写变换、嵌套编码等。详细绕过技术参考见 skillmode-reference.md §WAF。全部失败 → 标 `shallow_negative` + `waf_bypass_exhausted`。
+- **链式利用评估**：每个 CANDIDATE 必须回答三问（能链接到什么 / 前置条件是否满足 / 最终影响），并在 finding 中包含 chain_assessment 字段。详见 skillmode-reference.md §链式评估
+- **未知端点盲测协议**：在 JS / HTML / API 响应 / 错误页面中发现的每一个 URL 和路径，不管是否已在攻击面清单中，都必须发送至少一次探测请求（GET + POST），观察其功能和响应结构。特别关注：JS 中动态拼接的路径（模板字符串、变量拼接）、HTML 表单 action 属性（尤其非 API 路径）、API 响应中的 `_links` / `next_url` / `redirect` 字段、错误页面泄露的路径信息、不同角色加载的不同 JS 文件中的端点差异。发现新功能端点 → 立即加入攻击面清单并测试。
 - **什么攻击面都不明显时** → 翻 JS 找隐藏接口 / 未文档化参数，再回到上面分支
-- **时间约束**：任一方向 **20 分钟无进展 → 必须换攻击面** ⚙ 由外部计时器兜底
+- **时间管理**：如果连续 20 分钟无任何进展信号——包括响应变化、新发现的端点/参数、partial success、有趣的信息泄露——考虑换方向。但如果有任何微弱信号（哪怕只是"响应长度有 2 字节差异"），继续追。模型的直觉比计时器更可靠。
 
-> 不确定该进哪条分支时，先声明当前最可能的测试方向和观察到的 endpoint / surface。
-> 外壳按 endpoint、参数、方法、功能语义、登录态和技术栈匹配知识卡，只注入与当前方向相关的提示。
 > 知识卡的作用是**兜底与激活攻击面灵感**，不是限制——始终保留动态调整的自由度。
 > 知识卡应在"你声明要测某方向时"按意图检索注入，不要开局一把梭全加载。
-> Skill Mode 下没有外壳注入知识卡——查阅 §6 中的"阴性 depth floor 硬阈值表"和 §3 中的"假阴性陷阱"作为替代。
+> Skill Mode 下没有外壳注入知识卡——查阅 §6 中的"阴性 depth floor"和 §3 中的"假阴性陷阱"作为替代。
 
 ---
 
 ## 8. 漏洞确立证据链（仅 P1/P2/P3 才建立）
 
-确立漏洞时必须在本会话 evidence_dir 下创建 structured finding 包：
+**测试阶段**：确认漏洞时仅在 `state/findings_summary.md` 追加一行摘要，**不创建 finding 包**，将测试时间最大化。
 
-```
-findings/finding_<id>/
-  finding.json
-  request_1.http
-  response_1.http
-  poc.sh
-```
+**终态阶段**（termination self-check 后）：批量为所有 confirmed 漏洞创建 finding 包，结构为 `findings/finding_<id>/` 含 finding.json + request/response.http + poc.sh。finding.json 是权威报告输入。
 
-`finding.json` 是权威报告输入；最终 `final_report.md` 由系统生成，不要手写最终综合报告。
+**Engine Mode** 用完整 schema（`engine/reporting/schema.py`）。**Skill Mode** 精简 schema（8 必填 + 3 条件必填），详见 skillmode-reference.md §Finding 包。
 
-**Engine Mode**：`finding.json` 必须包含完整 schema（`engine/reporting/schema.py`）。
+通用规则：`risk.proven_impact` 只能写已证明结果；所有引用文件必须真实存在。若环境未接入 reporting 模块可临时写 `report_*.md`。
 
-**Skill Mode**（v7 精简 schema · 8 必填 + 3 条件必填）：
+> 覆盖缺口（root_cause_spread 未做 / proof_ready 但无 finding / 阻塞未恢复 / 浅阴性未闭环）必须列进报告附录，任一非空则终态不得标 complete。
 
-必填：`schema_version / id / title / severity / vuln_type / target / risk.proven_impact / poc / proof_packets`。
+---
 
-条件必填：
-- `source_proof`：从 JS/源码/配置构造数据包时必填，写明文件、行号或函数、构造出的请求包
-- `crypto_chain`：有加密链路时必填，写明算法、key/iv 来源、解密/重加密方式和 helper 文件
-- `manual_burp_replay`：P1/P2 finding 选填（Skill Mode 下 agent 无法运行 Burp Suite；如人工需要复现，由人补写）
+## 8.5 直觉驱动探索阶段
 
-通用规则（两种模式均适用）：
-- `risk.proven_impact` 只能写已证明结果，不能写「可能/疑似/理论上」。
-- `proof_packets[].request_file`、`proof_packets[].response_file`、`poc.file` 对应文件必须真实存在。
+在完成结构化覆盖（所有覆盖表 surface 已闭合）后、终态自检之前，预留最后 20% 的测试时间做完全自由的探索。
 
-若当前运行环境尚未接入 reporting 模块，可临时写 `report_*.md`，但必须按同等字段完整呈现证据链。
+这个阶段不受任何 checklist 约束，不要求按覆盖表执行。你可以：
+- 重新审视任何引起你直觉注意的端点或响应
+- 尝试非标准的攻击技术（不在任何 playbook 中的方法）
+- 组合多个已发现的低危问题形成攻击链
+- 探索之前因为"不在覆盖表内"而跳过的方向
+- 用完全不同的角色/参数组合重测已判阴性的 surface
 
-> v6.1：已确认漏洞但 root_cause_spread 未做（同根因在兄弟端点/参数/角色验证）、proof_ready 但未出 finding、阻塞未恢复、浅阴性未闭环校验——这四类"覆盖缺口"必须列进报告附录（coverage_gaps.md），任一非空则终态不得标 complete。已有漏洞但没进报告从静默丢失变成必须列在报告里的可见缺口。
+唯一约束：每个探索方向必须有实际请求作为证据（不能只在推理中想象）。
+
+**直觉探索未完成时不得输出 LOW_ROI。** 本阶段是 LOW_ROI 的前置条件。
 
 ---
 
 ## 9. 终止协议（状态标记 · 只在最后一条消息的独立行输出一个）
 
-- `VULN_FOUND` —— 发现有 PoC 的真实漏洞，且已写出有效 finding 包或兼容 `report_*.md`
-- `LOW_ROI` —— 已充分测试，无有价值发现
+- `VULN_FOUND` —— 发现有 PoC 的真实漏洞，且已在 findings_summary.md 中记录
+- `LOW_ROI` —— 已充分测试（含 §8.5 直觉探索阶段），无有价值发现
 - `NEED_INPUT` —— 需要人工输入（登录二次核身 / 验证码 / 越界确认）
 - `ERROR` —— 系统错误，需排查
 
-> 标记必须与磁盘证据一致：声明 VULN_FOUND 却无有效报告 → 视为 LOW_ROI。⚙ 终态由外壳按十二条决策规则裁定，物理证据可推翻你的声明。
-> 外壳可能把 LOW_ROI 裁定为 incomplete：表示仍有未闭合高价值格，不等同于充分测试后无价值发现。
+> 标记必须与磁盘证据一致：声明 VULN_FOUND 却无记录 → 视为 LOW_ROI。
+> 外壳可能把 LOW_ROI 裁定为 incomplete：表示仍有未闭合高价值格。
 
 ---
 
@@ -376,30 +315,43 @@ findings/finding_<id>/
 - ⚙ 长会话每轮开头会被注入一份**外部维护的认知状态对象**（当前假设 / 已验证 / 待测 TODO / 已落盘证据）；
   以它为准，不要依赖你自己的工作记忆——状态由系统持有，不由你记忆。
 
+### 压缩锚点协议（v7.3 新增 · 对抗上下文压缩知识丢失）
+
+测试过程中，关键状态必须**实时落盘**到 `state/` 目录，不依赖上下文记忆：
+
+- **发现即写**：每确认一个漏洞，立即追加一行到 `state/findings_summary.md`（格式：`| 漏洞名 | 端点 | payload | 严重度 |`）
+- **阴性即写**：每完成一个 surface 的阴性判定，追加一行到 `state/negatives_summary.md`（格式：`| surface | vectors | depth_met | status |`）
+- **Session 即写**：登录成功或获取 cookie 后，追加到 `state/session_state.md`（格式：`| 角色 | cookie文件路径 | 登录时间 |`）
+- **路径即写**：确认 API 路径正确后，追加到 `state/api_paths.md`（格式：`| 功能 | 正确路径 | 来源 |`）
+
+**恢复协议**：如果发现自己不确定之前测试过什么（长对话记忆模糊），**先读 `state/` 目录下的所有文件**再继续测试。以磁盘状态为准，不依赖工作记忆。
+
+**定期快照**：每测试 10 个 surface，将当前覆盖表快照写入 `state/coverage_snapshot.md`。
+
 ---
 
-## 11. Skill Mode 自检查清单（v7 新增）
+## 11. Skill Mode 自检查清单
 
 > 本节仅对 Skill Mode 生效。Engine Mode 下由 `orchestrator.py` 的计时器、熔断器和 session_gate 强制执行等价功能。
 
-### 每 5 个 surface 自检（或每 15 分钟，先到为准）
+### 每 15 个 surface 自检（或每 20 分钟，先到为准）
 
-□ 过去 5 个 surface 中，是否有连续 3 个 shallow_negative？→ 换攻击面方向
-□ 是否有 surface 耗时超过 10 分钟？→ 评估是否该放弃并标 blocked
+□ 过去 15 个 surface 中，是否有连续 5 个 shallow_negative？→ 换攻击面方向
+□ 是否有 surface 耗时超过 15 分钟？→ 评估是否该放弃并标 blocked
 □ 当前方向是否已经有 confirmed finding？→ 继续覆盖剩余 surface，不要停在首洞
 □ 是否遗漏了某个 risk 维的应答？→ 回看决策树分支
 
-### 每 15 个 surface 自检
+### 每 25 个 surface 自检
 
 □ 回顾速查卡，确认没有遗忘规则
 □ 回顾垃圾洞清单，确认没有误报
 □ 检查覆盖表：高价值 surface 是否全部已测试？
-□ 检查 negative 文件：depth floor 是否全部达标？
+□ 检查 negative 文件：depth floor 是否充分？
 
 ### 终态自检（测试结束时）
 
 □ 所有高价值 surface 已测试（不是 not_tested）？
-□ 所有 confirmed 漏洞有 finding 包？
+□ 所有 confirmed 漏洞在 findings_summary.md 中有记录？
 □ 所有 not_vulnerable 的 depth_floor_met = yes？
 □ 所有 shallow_negative 有 next_actions？
 □ 覆盖表与实际 evidence 文件一致？
@@ -408,15 +360,18 @@ findings/finding_<id>/
 
 - 有 confirmed finding + 所有高价值 surface 已闭合 → VULN_FOUND (complete)
 - 有 confirmed finding + 存在未闭合高价值 surface → VULN_FOUND (incomplete)
-- 无 confirmed + 所有 surface 已充分测试 → LOW_ROI
+- 无 confirmed + 所有 surface 已充分测试 + §8.5 直觉探索已完成 → LOW_ROI
 - 有 blocker 无法绕过 → NEED_INPUT
 
-<!-- 迭代方式：报了噪音→加垃圾洞清单；做了危险操作→加铁律；报告质量差→强化七问；
-     某方向死磕太久→调决策树时间约束。
-     v2 变更：①垃圾洞清单去逐条"除非"软例外 ②速查卡补3条激活钥匙 ③⚙标注外壳强制项(模型无关)
-              ④补会话轮数熔断+认知状态对象衔接 ⑤决策树补"翻JS找隐藏接口"与意图触发注入
-     v6.1 变更：①§6 加风险维逐维应答硬纪律+depth floor(取证完整性≠进一步利用) ②§8 加四类缺口附录要求(没进报告→可见缺口)
-     v7/v3 变更：①新增 §0 Phase 0 侦察协议 ②§1 补开放重定向链利用判定 ③§3 速查卡补假阴性陷阱
-               ④§6 弹性 depth floor+阴性 depth floor 硬阈值表+Skill Mode 轻量覆盖表/阴性格式
-               ⑤§8 Skill Mode 精简 finding schema ⑥新增 §11 Skill Mode 自检查清单
-               ⑦§6 "禁止合并散文阴性"改为 Engine Mode only -->
+<!-- v8.0 变更(约束释放与研究员模式回归)：
+     ①§3 速查卡:20分钟硬约束→软建议,新增响应异常嗅探
+     ②§6 覆盖状态新增exploring,阴性depth floor硬阈值表→弹性判断,阻塞分类:captcha不再是阻塞条件
+     ③§7 认证面新增二次验证绕过优先协议,密码重置4模式→启发性描述
+     ④§7 SQLi 4条处方→目标导向,WAF 5家族硬约束→开放绕过,时间断路器→软建议
+     ⑤§7 新增未知端点盲测协议
+     ⑥新增§8.5直觉驱动探索阶段(LOW_ROI前置条件)
+     ⑦§9 LOW_ROI增加直觉探索前置条件
+     ⑧§11 自检频率从10→15/15→25 surface
+     ⑨skillmode-reference.md语气改写:硬约束→启发性参考
+     ⑩§5 七问验证门→两层验证门(测试信号门+报告验证门),Q3/Q4/Q5精化防止过早弃测
+     核心原则:别教模型怎么打洞,告诉它哪里可能有洞,然后让它自己想办法 -->

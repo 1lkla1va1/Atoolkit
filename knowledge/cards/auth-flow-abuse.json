@@ -1,33 +1,41 @@
 {
   "id": "auth-flow-abuse",
   "title": "认证流程滥用",
-  "description": "覆盖注册、登录、重置、验证码、会话、令牌、管理入口等认证流程风险。",
+  "description": "覆盖注册、登录、重置、验证码、会话、令牌、管理入口等认证流程风险。v7.2 新增密码重置 4 模式检测和验证码攻击模式。",
   "match": {
     "vuln_classes": ["认证绕过/枚举", "未授权访问"],
-    "endpoints": ["register", "login", "reset-password", "password", "captcha", "sms", "verify-code", "change-audit", "admin", "token", "session", "sub-login", "role"],
-    "keywords": ["register", "login", "password", "captcha", "sms", "token", "session", "admin"]
+    "endpoints": ["register", "login", "reset-password", "password", "captcha", "sms", "verify-code", "change-audit", "admin", "token", "session", "sub-login", "role", "forgot", "recover", "send-code", "send-sms"],
+    "keywords": ["register", "login", "password", "captcha", "sms", "token", "session", "admin", "forgot", "recover", "reset"]
   },
   "dimensions": [
     "不同认证状态下的可达性差异",
     "验证码、短信、重置、换绑流程的状态绑定",
     "登录失败、注册、重置中的用户枚举信号",
-    "会话、令牌、角色切换后的权限一致性"
+    "会话、令牌、角色切换后的权限一致性",
+    "验证码响应 body/headers/cookie 中是否泄露验证码值（回显模式）",
+    "验证码是否绑定用户——用自己的手机收验证码能否用于重置他人密码（跨用户模式）",
+    "密码重置流程是否可跳步——直接构造第 3 步（设置新密码）请求跳过第 2 步验证",
+    "重置请求中是否可指定 username/phone/user_id 参数控制重置目标（可控目标模式）"
   ],
   "false_negative_rules": [
     "只用已登录身份访问不能证明未授权闭合",
     "只测成功路径不能证明重置和验证码流程闭合",
-    "只比较页面文案不能证明后端权限一致"
+    "只比较页面文案不能证明后端权限一致",
+    "发送验证码后必须检查响应 body/headers/cookie 中是否泄露验证码值",
+    "密码重置流程必须按 4 种模式（回显/跨用户/跳步/可控目标）逐一检测，仅测正常流程不够"
   ],
   "evidence_required": [
     "anonymous_baseline",
     "authenticated_baseline",
     "state_transition",
-    "role_comparison"
+    "role_comparison",
+    "captcha_leak_check",
+    "reset_flow_bypass"
   ],
   "negative_sufficiency": {
-    "min_vectors": 4,
+    "min_vectors": 5,
     "min_response_count": 2,
-    "required_evidence_types": ["anonymous_baseline", "authenticated_baseline"],
+    "required_evidence_types": ["anonymous_baseline", "authenticated_baseline", "captcha_leak_check"],
     "min_identities": 2
   },
   "positive_depth_floor": {

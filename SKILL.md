@@ -1,7 +1,7 @@
 ---
 name: Atoolkit
 description: Authorized AI-assisted SRC/bug-bounty vulnerability research toolkit. Use whenever the user wants to read, install, configure, or run this Atoolkit package; mentions SRC 漏洞挖掘, 授权靶场, bug bounty, Codex AGENTS.md, /src, Guardian 质检, PoC 复验, or model-independent security testing automation. Only proceed for clearly authorized defensive testing or educational lab contexts.
-version: 7.1.0
+version: 8.0.0
 ---
 
 # Atoolkit Skill
@@ -42,6 +42,7 @@ When not using `run.py` engine, run by this framework:
 2. Read `hint.md` to confirm testing strategy and priorities.
 3. Execute Phase 0 recon per `skill/recon-checklist.md`, output `attack_surface_list.md`.
 4. Initialize the coverage ledger from the attack surface list.
+4.5 If `state/` directory exists with prior session files, read all files to restore testing context.
 5. Sort the test queue by `hint.md` priority.
 
 ### Per-surface loop
@@ -52,6 +53,7 @@ For each surface in the queue:
 2. Look up the corresponding knowledge card summary for the risk_tags.
 3. Execute testing; for each risk dimension respond: `CANDIDATE` / `NONE:<reason>`.
 4. Write evidence (finding package or negative record).
+4.5 Write state to disk per compression anchor protocol (§10 of core skill file).
 5. Update coverage ledger status.
 6. Run the termination self-check (see §9 of `skill/核心技能文件.v3.md`): depth floor met? Time to pivot?
 
@@ -194,6 +196,7 @@ Skill Mode uses a streamlined schema (8 required + 3 conditional fields). Engine
 | `source_proof` | Request was constructed from JS / frontend source code -- provide file and line number |
 | `crypto_chain` | Finding involves encryption / signing -- provide algorithm and key source |
 | `manual_burp_replay` | P1/P2 finding where human wants Burp reproduction steps (optional in Skill Mode; agent cannot run Burp Suite) |
+| `chain_assessment` | Every CANDIDATE/finding must include chain exploitation assessment -- fields: `chain_feasible` (bool), `chain_path` (string), `final_impact` (string), `blockers` (list) |
 
 ### JSON example
 
