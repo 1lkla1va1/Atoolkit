@@ -1036,13 +1036,56 @@ def _run_self_check() -> int:
         ), "stats high_priority_pending 与实际不一致"
         print("  断言18 ✅ Fact-Intent 管道完整性（status/兜底/norm_vc/stats）")
 
+    def _assert19():
+        """v8.5.2: resolve_intent 生命周期 + fact_from_candidate 归一化"""
+        from engine.graph import FactIntentGraph
+        from engine.vuln_classes import norm_vc
+        # 19a: fact_from_candidate normalizes vuln_class
+        g = FactIntentGraph()
+        cand = {"candidate_id": "c1", "endpoint": "/api/test",
+                "vuln_class": "越权访问", "hypothesis": "test", "param": "id"}
+        fact_data = g.fact_from_candidate(cand, fact_type="confirmed")
+        assert fact_data["vuln_class"] == norm_vc("越权访问"), (
+            f"fact_from_candidate 未归一化: {fact_data['vuln_class']} != {norm_vc('越权访问')}")
+        assert fact_data["vuln_class"] == "idor", f"norm_vc(越权访问)={fact_data['vuln_class']}"
+        # 19b: resolve_intent transitions work
+        fact, intents = g.add_fact({
+            "source_type": "confirmed", "endpoint": "/api/refund",
+            "vuln_class": "amount-tamper", "summary": "退款无上限", "params": ["amount"],
+            "chain_feasible": True,
+        })
+        assert len(intents) >= 1, "应生成至少1个intent"
+        first_id = intents[0]["intent_id"]
+        assert intents[0]["status"] == "pending", "新intent应为pending"
+        # resolve as completed
+        resolved = g.resolve_intent(first_id, "completed",
+                                     summary="产出1个新发现", spawned_facts=["fact_002"])
+        assert resolved is not None, "resolve_intent 应返回已更新的intent"
+        assert resolved["status"] == "completed", f"status应为completed: {resolved['status']}"
+        assert resolved["spawned_facts"] == ["fact_002"], "spawned_facts 未正确存储"
+        assert resolved["resolved_at"], "resolved_at 应被设置"
+        # get_pending_intents should exclude resolved
+        pending = g.get_pending_intents(limit=10)
+        assert all(i["intent_id"] != first_id for i in pending), (
+            "已completed的intent不应出现在pending列表中")
+        # 19c: deferred status also works
+        if len(intents) >= 2:
+            second_id = intents[1]["intent_id"]
+            g.resolve_intent(second_id, "deferred", summary="3次无结果")
+            deferred_intent = next(i for i in g.intents if i["intent_id"] == second_id)
+            assert deferred_intent["status"] == "deferred", "deferred状态未正确设置"
+        # 19d: stats reflect resolved intents
+        stats = g.stats()
+        assert "completed" in stats["intents_by_status"], "stats应包含completed状态"
+        print("  断言19 ✅ Intent生命周期（resolve/归一化/pending过滤）")
+
     for name, fn in (("断言1", _assert1), ("断言2", _assert2), ("断言3", _assert3),
                      ("断言4", _assert4), ("断言5", _assert5), ("断言6", _assert6),
                      ("断言7", _assert7), ("断言8", _assert8), ("断言9", _assert9),
                      ("断言10", _assert10), ("断言11", _assert11), ("断言12", _assert12),
                      ("断言13", _assert13), ("断言14", _assert14), ("断言15", _assert15),
                      ("断言16", _assert16), ("断言17", _assert17),
-                     ("断言18", _assert18)):
+                     ("断言18", _assert18), ("断言19", _assert19)):
         try:
             fn()
         except AssertionError as exc:

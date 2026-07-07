@@ -1287,6 +1287,10 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
             graph._next_intent_id = saved.get("_next_intent_id", len(graph.intents) + 1)
         except Exception:
             pass
+    # v8.5.2: Intent lifecycle tracking (resolve_intent pipeline)
+    _active_intent = None          # currently claimed intent for next turn
+    _intent_seen_count = {}        # intent_id -> times shown without result
+
     last_progress = time.time()
     last_marker = None
     _log_event(wd, {"ev": "start", "target": target, "resumed": resumed,
@@ -1328,16 +1332,59 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                 no_flow_surfaces=no_flow_surfaces,
             )
             candidate_block = "\n\n".join(x for x in (loop_control, candidate_block) if x)
-        # v8.4: Graph context for model
+        # v8.5.2: Intent lifecycle — resolve previous, claim next
         graph_stats = graph.stats()
+
+        # Resolve previous turn's active intent based on whether new facts were produced
+        if _active_intent is not None:
+            aid = _active_intent.get("intent_id", "")
+            _intent_seen_count[aid] = _intent_seen_count.get(aid, 0) + 1
+            # Any new confirmed facts since last turn → intent produced results
+            _new_facts = [
+                f["fact_id"] for f in graph.facts
+                if (f.get("source_type") == "confirmed"
+                    and not f.get("_pre_existing")
+                    and not f.get("_pre_turn"))
+            ]
+            if _new_facts:
+                graph.resolve_intent(aid, "completed",
+                                     summary=f"产出 {len(_new_facts)} 个新发现",
+                                     spawned_facts=_new_facts)
+                if verbose:
+                    print(f"  [turn {turn}] ✅ Intent {aid} resolved (completed)")
+            elif _intent_seen_count.get(aid, 0) >= 3:
+                graph.resolve_intent(aid, "deferred",
+                                     summary="展示3次无新发现，推迟")
+                if verbose:
+                    print(f"  [turn {turn}] ⏭ Intent {aid} deferred (3x no result)")
+            _active_intent = None
+
+        # Claim next intent and build graph context
         pending_intents = graph.get_pending_intents(limit=5)
         if pending_intents or graph_stats["total_facts"] > 0:
+            # Claim top intent for this turn
+            if pending_intents:
+                _active_intent = pending_intents[0]
+                backup_intents = pending_intents[1:4]
+
             graph_context_lines = [
-                f"\n[Fact-Intent Graph] facts={graph_stats['total_facts']} intents={graph_stats['total_intents']} pending_high={graph_stats['high_priority_pending']}",
+                f"\n[Fact-Intent Graph] facts={graph_stats['total_facts']} "
+                f"intents={graph_stats['total_intents']} "
+                f"pending_high={graph_stats['high_priority_pending']}",
             ]
-            for intent in pending_intents:
+            if _active_intent:
                 graph_context_lines.append(
-                    f"  → Intent {intent['intent_id']}: {intent['description']} [{intent['priority']}]")
+                    f"  ▶ 当前跟进 Intent {_active_intent['intent_id']}: "
+                    f"{_active_intent['description']} [{_active_intent['priority']}]")
+                for intent in backup_intents:
+                    graph_context_lines.append(
+                        f"  → 备选 Intent {intent['intent_id']}: "
+                        f"{intent['description']} [{intent['priority']}]")
+            else:
+                for intent in pending_intents:
+                    graph_context_lines.append(
+                        f"  → Intent {intent['intent_id']}: "
+                        f"{intent['description']} [{intent['priority']}]")
             graph_context = "\n".join(graph_context_lines)
         else:
             graph_context = ""
@@ -1347,6 +1394,9 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                                  skill_hint=combined_hint, evidence_dir=ev_dir,
                                  candidate_block=candidate_block)
         prev = count_evidence_files(wd)                       # S3：本轮跑模型「之前」的证据计数（F1：只数不读，免一次全量 harvest）
+        # v8.5.2: mark existing facts so post-turn we can detect new ones
+        for _f in graph.facts:
+            _f.setdefault("_pre_turn", True)
         text_parts = []
         try:                                                  # 流式中断（网络波动/适配器异常）→ 抢救本轮
             for chunk in adapter.run(prompt, session_id=sid): # 流式

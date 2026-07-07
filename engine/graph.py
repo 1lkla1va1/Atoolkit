@@ -130,7 +130,7 @@ class FactIntentGraph:
             "endpoint": candidate.get("endpoint", ""),
             "method": candidate.get("method", "GET"),
             "params": [candidate.get("param", "")] if candidate.get("param") else [],
-            "vuln_class": candidate.get("vuln_class", ""),
+            "vuln_class": norm_vc(candidate.get("vuln_class", "")),  # v8.5.2: normalize at creation
             "summary": candidate.get("hypothesis", ""),
             "evidence_refs": candidate.get("evidence_refs", []),
             "chain_feasible": chain.get("chain_feasible", False),
