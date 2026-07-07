@@ -258,3 +258,191 @@ redirect_uri（OAuth）, redir, next, return_to, redirect_to, goto, target, resp
 
 **AuthBypass 次级**（当 username/password 均阴性时）
 authenticity_token, auth_type, client_id, redirect_uri, _method（HTTP 方法覆盖）, auth_code
+
+---
+
+## 12. Payload 多样性与编码感知
+
+### 为什么同一 payload 在不同格式下结果不同
+
+Web 应用通常有多层输入处理：Web 服务器解码 → 框架预处理 → 应用层验证 → 数据库查询。
+每一层可能对特殊字符做不同的处理（解码、转义、截断、过滤）。
+
+常见场景：
+- PHP `$_GET`/`$_POST` 自动 URL 解码一次，但 `php://input`（JSON body）不解码
+- Apache mod_rewrite 对 URL 路径做一次解码，query string 不解码
+- WAF 在解码后的字符串上匹配关键字，但应用层在原始字符串上查询
+- JSON body 中的 `\u0027`（单引号 Unicode）可能绕过基于字节匹配的 WAF
+
+### 实战案例
+
+| 场景 | 原始格式 | 结果 | 编码格式 | 结果 |
+|------|---------|------|---------|------|
+| search.php keyword | `' OR '1'='1` | 空结果（被预处理拦截） | `'+OR+'1'%3D'1` (URL编码) | 返回全部商品 |
+| product-delete product_no | `' OR 1=1--` | WAF拦截 | `%27%20OR%201%3D1--` | WAF放行 |
+| upload category | `../../../etc` | 字面存储 | `..%2f..%2f..%2fetc` | 路径穿越 |
+
+### 编码变体测试顺序（启发性）
+
+当 payload 无效果时，按以下顺序尝试编码变体，而不是立即切换 payload：
+1. 原始格式（直接发送）
+2. URL 编码（`%xx`）
+3. 双重 URL 编码（`%25xx`）
+4. Unicode 转义（`\u00xx`，适用于 JSON body）
+5. 混合编码（关键字 URL 编码，非关键字原始）
+
+---
+
+## 13. 支付流程端点追踪
+
+### 为什么容易遗漏支付端点
+
+电商/商城类应用的支付流程通常由多个端点组成，但前端 JS 可能只暴露部分端点
+（如 batch 版本隐藏了单条版本，前端跳转隐藏了 API 端点）。
+
+### 完整支付生命周期
+
+```
+create-order ──→ pay/index ──→ payment-gateway ──→ callback
+    │               │                                │
+    │               └── redirect（支付后跳转）         │
+    │                                                 │
+    └── create-batch-order（批量版本）                 │
+                                                      ▼
+                              recharge-create ──→ recharge-callback
+                                   │
+                                   └── balance-pay ──→ single-balance-pay
+                                                           │
+                                                           ▼
+                                                     refund / cancel
+```
+
+### 必须检查的端点
+
+每个支付相关端点都必须：
+1. 检查是否有单条/批量两个版本（`create-order` vs `create-batch-order`）
+2. 检查支付页面（`pay/index.php`）中的 redirect/return_url/callback_url 参数
+3. 检查回调接口是否验证签名来源（不能只依赖前端传来的 sign）
+4. 检查充值和支付是否共享余额通道（充值漏洞可能影响支付）
+5. 检查取消/退款是否在支付完成后仍可执行
+
+### 常见遗漏模式
+
+- `pay/index.php` 的 GET 参数（redirect, sign, order_no）经常被忽略，
+  因为前端 JS 可能只使用 POST body
+- 单条操作端点（`create-order.php`）在只有批量版本（`create-batch-order.php`）
+  的 JS 中不可见，但服务端可能两个都存在
+- 支付回调的 `callback_sign` 可能在 create 接口的响应中泄露
+
+---
+
+## 14. Intent 驱动链式利用实战案例
+
+> 以下 3 个案例展示 Fact-Intent Graph 如何将单点发现转化为完整攻击链。
+> 每个案例对应一条 IntentRuleEngine 规则，演示从 Fact 生成 Intent 到执行验证的完整流程。
+
+### 案例 1：充值回调签名泄露 → 伪造充值
+
+**触发规则：`info_leak_credential`**（信息泄露 → 凭证利用）
+
+**Fact**
+- 来源端点：`GET /api/user/recharge-create.php`
+- 发现：响应 JSON 中包含 `callback_sign` 字段（本应只在服务端使用的签名密钥）
+- `source_type: info_disclosure`，`vuln_class: info-leak`
+- 规则匹配：summary 含 "泄露" + "sign" → 触发 `info_leak_credential`
+
+**Intent 生成**
+```json
+{
+  "source": "escalation",
+  "description": "利用泄露的 callback_sign 伪造充值回调（寻找使用该凭证的下游端点）",
+  "vuln_class": "privilege-escalation",
+  "priority": "high",
+  "target_endpoint": ""
+}
+```
+> `target_endpoint` 为空——agent 需自行从业务图谱或端点枚举中发现充值回调端点。
+
+**Action**
+1. 从业务图谱 `business_flows` 中找到充值流程：`recharge-create → recharge-callback`
+2. 定位 `POST /api/user/recharge-callback.php`
+3. 用泄露的 `callback_sign` 构造伪造回调请求：
+   ```
+   POST /api/user/recharge-callback.php
+   trade_no=FAKE001&amount=10000&status=success&sign={泄露的callback_sign}
+   ```
+4. 发送伪造回调 → 服务端验证签名通过 → 余额增加 10000
+
+**Result**：充值回调被成功伪造，任意金额充值已验证。从 info-leak 升级为 P1 资金漏洞。
+
+**关键教训**：`info_leak_credential` 规则的核心价值是引导 agent **主动寻找使用泄露凭证的下游端点**，而不是停留在"发现了泄露"这一步。泄露本身是 P3，但伪造回调是 P1。
+
+---
+
+### 案例 2：验证码不消耗 → SMS 暴力破解 → 任意密码重置
+
+**触发规则：`auth_chain`**（认证组件弱点 → 链式利用）
+
+**Fact**
+- 来源端点：`POST /register.php`（验证码校验）
+- 发现：captcha 验证码不消耗——同一个验证码可重复提交多次，服务端不标记已使用
+- `source_type: confirmed`，`vuln_class: captcha-bypass`，`chain_feasible: true`
+- 规则匹配：confirmed + auth 类 vuln_class + chain_feasible → 触发 `auth_chain`
+
+**Intent 生成**
+```json
+{
+  "source": "chain",
+  "description": "链式利用：captcha不消耗→暴力破解SMS码→密码重置",
+  "vuln_class": "auth-bypass-chain",
+  "priority": "high"
+}
+```
+
+**Action**
+1. 确认密码重置流程：`forgot-password.php` → 发送 SMS 验证码 → 输入验证码 → 设置新密码
+2. 用固定 captcha 值反复提交 SMS 验证码猜测请求（6 位数字 = 1,000,000 种组合）
+3. 因为 captcha 不消耗，无需每次重新获取验证码，单次请求成本极低
+4. 批量发送 `POST /forgot-password.php`，body 中 captcha 固定 + sms_code 从 000000 遍历
+5. 命中正确 SMS 码后进入密码重置步骤 → 设置新密码
+
+**Result**：成功重置任意用户密码。从 captcha-bypass（P3）升级为完整 ATO 攻击链（P1）。
+
+**关键教训**：`auth_chain` 规则将**单点认证弱点**（captcha 不消耗）自动升级为**完整认证攻击链**。单独的 captcha 不消耗看似影响有限，但它是暴力破解 SMS 码的关键前置条件——没有这个弱点，每次猜错都需要新 captcha，暴力破解不可行。
+
+---
+
+### 案例 3：WAF 拦截后的 Intent 驱动重测
+
+**触发规则：`waf_bypass_retry`**（WAF 拦截 → 编码变体重试）
+
+**Fact（阴性）**
+- 来源端点：`GET /api/user/search.php?keyword=`
+- 发现：经典 SQL payload（`' OR '1'='1`、`UNION SELECT`）全部被 WAF 拦截
+- `source_type: negative`，summary 含 "WAF 拦截" / "blocked"
+- 规则匹配：negative + WAF 关键字 → 触发 `waf_bypass_retry`
+
+**Intent 生成**
+```json
+{
+  "source": "anomaly",
+  "description": "WAF 绕过重测：search.php keyword 参数编码变体",
+  "vuln_class": "sql-injection",
+  "priority": "medium",
+  "target_endpoint": "/api/user/search.php",
+  "target_params": ["keyword"]
+}
+```
+
+**Action**
+1. 按编码变体优先级顺序重试（参考 §12 Payload 多样性与编码感知）：
+   - 原始：`' OR '1'='1` → 403 WAF 拦截
+   - URL 编码：`%27%20OR%20%271%27%3D%271` → 403 WAF 拦截
+   - 双重 URL 编码：`%2527%2520OR%2520%25271%2527%253D%25271` → 403 WAF 拦截
+   - Unicode 转义（JSON body）：`{"keyword": "'\u0020OR\u0020'\u0031'\u003D'\u0031"}` → 403
+   - 混合编码（关键字 URL 编码）：`%27 OR '1'='1` → **200 正常响应，返回全部商品**
+2. 确认绕过有效 → 进一步验证数据提取能力 → UNION 查询成功
+
+**Result**：URL 编码单引号 + 原始 OR 关键字的组合绕过了 WAF。search.php SQLi 从阴性翻转为 confirmed（P2）。
+
+**关键教训**：`waf_bypass_retry` 规则确保 **WAF 拦截 ≠ "不存在漏洞"**。v8.3 中 WAF 拦截直接标记阴性并跳过；v8.4 的 Intent 机制将"WAF 拦截"视为一个**异常信号**而非终点，驱动 agent 系统性尝试编码变体。很多真实漏洞就藏在 WAF 的解码盲区中。

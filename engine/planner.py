@@ -336,3 +336,171 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ---------------------------------------------------------------------------
+# v8.4 additions — domain-scoped testing (Cairn Fact-Intent architecture)
+#
+# These additions enable deterministic domain classification of endpoints
+# so that each run can scope testing to specific attack-surface domains
+# (auth, txn, idor, input, admin, file, info).  Classification is purely
+# keyword/rule-based — no LLM calls required.
+#
+# See: design/迭代方案/迭代方案v8.4_Cairn式Fact-Intent架构.md §10.2
+# ---------------------------------------------------------------------------
+
+DOMAIN_RULES: dict[str, dict] = {
+    "auth": {
+        "endpoint_keywords": [
+            "register", "login", "logout", "signin", "signup",
+            "forgot", "reset", "recover", "password", "captcha",
+            "sms", "verify-code", "verify_code", "token", "session",
+            "2fa", "mfa", "otp",
+        ],
+        "param_keywords": [
+            "username", "password", "email", "phone", "captcha",
+            "sms_code", "verify_code", "token", "session_id",
+        ],
+        "risk_tags": ["auth-flow", "auth-flow-abuse"],
+    },
+    "txn": {
+        "endpoint_keywords": [
+            "order", "pay", "payment", "refund", "recharge", "charge",
+            "balance", "points", "coupon", "discount", "lottery",
+            "cart", "checkout", "invoice", "withdraw", "transfer",
+        ],
+        "param_keywords": [
+            "amount", "price", "refund_amount", "use_points", "coupon_id",
+            "discount", "total", "fee", "stock", "quantity",
+        ],
+        "risk_tags": ["amount-tamper", "payment", "accounting"],
+    },
+    "idor": {
+        "endpoint_keywords": [
+            "detail", "edit", "delete", "update", "view", "get",
+            "profile", "info", "record",
+        ],
+        "param_keywords": [
+            "id", "uid", "user_id", "order_id", "product_id",
+            "merchant_id", "address_id", "hash", "account_id",
+        ],
+        "risk_tags": ["object-ownership", "idor"],
+    },
+    "input": {
+        "endpoint_keywords": [
+            "search", "query", "filter", "sort", "preview",
+            "comment", "review", "feedback", "description",
+        ],
+        "param_keywords": [
+            "keyword", "search", "query", "sort", "orderby", "filter",
+            "url", "image_url", "redirect", "return_url", "callback_url",
+            "name", "title", "description", "content", "comment",
+        ],
+        "risk_tags": ["input-validation", "injection", "ssrf", "redirect-chain"],
+    },
+    "admin": {
+        "endpoint_keywords": [
+            "admin", "manage", "audit", "approve", "reject", "toggle",
+            "config", "setting", "system", "dashboard", "console",
+            "merchant-audit", "user-manage",
+        ],
+        "param_keywords": [
+            "status", "role", "permission", "level", "privilege",
+        ],
+        "risk_tags": ["privilege"],
+    },
+    "file": {
+        "endpoint_keywords": [
+            "upload", "download", "export", "import", "file",
+            "image", "photo", "avatar", "attachment", "document",
+        ],
+        "param_keywords": [
+            "file", "filename", "filepath", "category", "dir",
+            "folder", "module", "type",
+        ],
+        "risk_tags": ["file-upload", "path-traversal"],
+    },
+    "info": {
+        "endpoint_keywords": [
+            "config", "debug", "info", "phpinfo", "env",
+            "swagger", "api-doc", "graphql", ".git", ".svn",
+            "robots", "sitemap", "status", "health", "version",
+        ],
+        "param_keywords": [],
+        "risk_tags": [],
+    },
+}
+
+
+def _has_keyword_match(text: str, keywords: list[str]) -> bool:
+    """分隔符边界匹配：防止 'sort' 匹配 'resort'、'order' 匹配 'disorder'。"""
+    for kw in keywords:
+        pattern = r'(?:^|[-_/.])' + re.escape(kw) + r'(?:$|[-_/.])'
+        if re.search(pattern, text):
+            return True
+    return False
+
+
+def classify_endpoint_domain(endpoint: str, params: list[str] | None = None,
+                             risk_tags: list[str] | None = None) -> list[str]:
+    """将一个端点分类到一个或多个域。
+
+    返回匹配的域 ID 列表（一个端点可能属于多个域，
+    如 submit-audit.php 同时属于 admin 和 input）。
+
+    Scoring:
+      - endpoint_keywords match (separator-boundary): +2
+      - param_keywords match (exact or prefix):       +1 per keyword
+      - risk_tags match (exact):                      +1 per tag
+
+    Returns the top 1-2 domains by score, or ["info"] when nothing matches.
+    """
+    ep_lower = endpoint.lower()
+    params_lower = [p.lower() for p in (params or [])]
+    tags_lower = [t.lower() for t in (risk_tags or [])]
+
+    matched: list[tuple[str, int]] = []
+    for domain_id, rules in DOMAIN_RULES.items():
+        score = 0
+        # Endpoint keyword match (separator-boundary)
+        if _has_keyword_match(ep_lower, rules["endpoint_keywords"]):
+            score += 2
+        # Param keyword match (exact or prefix with underscore)
+        for kw in rules["param_keywords"]:
+            if any(kw == p or p.startswith(kw + "_") for p in params_lower):
+                score += 1
+        # Risk tag match (exact)
+        for tag in rules["risk_tags"]:
+            if tag.lower() in tags_lower:
+                score += 1
+        if score > 0:
+            matched.append((domain_id, score))
+
+    if not matched:
+        return ["info"]  # Default: no match → info domain
+    # Return top 1-2 domains by descending score
+    matched.sort(key=lambda x: -x[1])
+    return [m[0] for m in matched[:2]]
+
+
+def filter_surfaces_by_domain(surfaces: list[dict],
+                              target_domains: list[str]) -> list[dict]:
+    """按域过滤 surface 清单。
+
+    If *target_domains* is empty, returns the full list (no domain filter).
+    Otherwise keeps only surfaces whose classified domain intersects
+    *target_domains*.
+    """
+    if not target_domains:
+        return surfaces  # No domain filter → return all
+    return [
+        s for s in surfaces
+        if any(
+            d in target_domains
+            for d in classify_endpoint_domain(
+                s.get("endpoint", ""),
+                s.get("params", []),
+                s.get("risk_tags", []),
+            )
+        )
+    ]

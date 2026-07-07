@@ -1,7 +1,7 @@
 ---
 name: Atoolkit
 description: Authorized AI-assisted SRC/bug-bounty vulnerability research toolkit. Use whenever the user wants to read, install, configure, or run this Atoolkit package; mentions SRC 漏洞挖掘, 授权靶场, bug bounty, Codex AGENTS.md, /src, Guardian 质检, PoC 复验, or model-independent security testing automation. Only proceed for clearly authorized defensive testing or educational lab contexts.
-version: 8.2.1
+version: 8.4.0
 ---
 
 # Atoolkit Skill
@@ -29,7 +29,7 @@ Paths in this skill are relative to the skill package root.
 - For deterministic replay verification: read `engine/verify.py`.
 - For Phase 0 recon: read `skill/recon-checklist.md`.
 - For Skill Mode runtime (without `run.py`): read [Skill Mode Runtime](#skill-mode-runtime) below.
-- For parallel agents: read [Parallel Agent Protocol](#parallel-agent-protocol) below.
+- For Fact-Intent architecture: read `engine/graph.py`, then [Fact-Intent Protocol](#fact-intent-protocol) below.
 - For SRC real-world workflow: read [SRC Workflow](#src-workflow) below.
 
 ## Skill Mode Runtime
@@ -61,39 +61,108 @@ For each surface in the queue:
 
 At session end, run all checks in the Skill Mode self-check list (§9 of the core skill file) -- not duplicated here to avoid multi-source definitions.
 
-## Parallel Agent Protocol
+## Fact-Intent Protocol
 
-When multiple agents run in parallel, use these conventions to avoid ID collisions.
+Testing follows a discovery-driven loop: every confirmed finding automatically
+generates exploration directions (Intents) that guide subsequent testing.
 
-### Direction naming convention
+### Pre-flight checklist (mandatory before Phase 1)
 
-| Agent direction | Finding ID prefix | Negative ID prefix |
-|---|---|---|
-| Auth & verification | `finding_auth_001`, `finding_auth_002`, ... | `negative_auth_001`, ... |
-| Transaction & payment | `finding_txn_001`, `finding_txn_002`, ... | `negative_txn_001`, ... |
-| IDOR & privilege | `finding_idor_001`, `finding_idor_002`, ... | `negative_idor_001`, ... |
-| Input validation | `finding_input_001`, `finding_input_002`, ... | `negative_input_001`, ... |
+Before starting any testing, verify:
+- [ ] All required test accounts are available (minimum: 2 users, 2 merchants
+      of same tier, 1 admin — 5 accounts total for e-commerce targets)
+- [ ] Session cookies are fresh and validated
+- [ ] `state/` directory is initialized with `session_state.md`
 
-Each agent writes its own coverage ledger file (`coverage_auth.md`, `coverage_txn.md`, `coverage_idor.md`, `coverage_input.md`) and only updates the surfaces assigned to it.
+### Intent Generation (after each confirmed finding)
 
-### Aggregation phase
+When a finding is confirmed, generate 1-3 Intents based on the finding type:
 
-After all agents complete:
+| Finding type | Auto-generated Intent direction |
+|---|---|
+| Auth component weakness (chain_feasible) | Chain exploitation: end-to-end attack |
+| Info disclosure (keys/signs/tokens) | Credential use: forge requests or escalate |
+| SQLi confirmed | Data extraction: read sensitive tables |
+| Multi-param endpoint confirmed | Cross-param: test other param types |
+| WAF-blocked negative | Bypass retry: encoding variants |
+| Business logic (payment/refund/points) | Fund chain: construct full attack chain |
+| IDOR confirmed | Impact escalation: batch access / broader scope |
+| SSRF confirmed | Internal probe: metadata / internal services |
 
-1. Merge all findings into a unified `coverage_ledger.md`.
-2. **Seam check (v7.1 · must run before de-dup):**
-   a. List all discovered endpoints (de-duplicated endpoint set).
-   b. For each endpoint, list all parameters and classify by type:
-      - State params (status/audit_status/state) → auth agent
-      - Text params (name/description/keyword/reason) → input agent
-      - Amount params (amount/price/refund_amount/use_points) → txn agent
-      - ID params (order_no/product_no/user_id/merchant_id) → idor agent
-   c. Check whether each endpoint's each parameter type has a test record from the responsible agent.
-   d. Uncovered "endpoint × parameter type" combinations → mark as `seam_gap`, queue for re-test.
-3. Re-test seam gaps (aggregation agent executes directly or assigns to the responsible direction agent).
-4. De-duplicate by root cause: `endpoint + root_cause + affected_role`.
-5. Renumber to `finding_001`, `finding_002`, ... (keep prefix for traceability).
-6. Generate `summary.json`.
+### Intent Lifecycle
+
+- **pending**: Generated but not yet tested
+- **in_progress**: Currently being tested
+- **completed**: Testing done, may have spawned new Facts
+- **abandoned**: Tested but no value found (record reason)
+
+Limits: max 5 Intents/Fact, max 30 pending globally, max 3 chain depth.
+
+### Phase 2 Work Queue
+
+Phase 2 merges two sources:
+1. Inherited Intents from Phase 1 (from `fact_intent.json`)
+2. Remaining surfaces not yet tested
+
+Priority: high Intents > untested surfaces > medium Intents > low Intents.
+
+### Recording
+
+Write to `state/<agent>/fact_intent.json`. Update status after testing.
+New findings create new Facts that may spawn further Intents.
+
+## Cross-Run Protocol
+
+For targets requiring multiple runs (large SRC programs, 50+ endpoints):
+
+### Before testing (run startup)
+
+1. Check if `runs/{target}/blackboard.json` exists
+2. If yes:
+   - Read all confirmed facts → mark as known, skip re-testing
+   - Read all depth-sufficient negatives → mark as not_vulnerable, skip
+   - Read all dead ends → mark as excluded, skip
+   - Read pending intents → add to work queue (high priority)
+   - Read domain scope from `run_scope.json` → filter test surfaces
+3. If no: first run, proceed normally
+
+### After testing (run shutdown)
+
+1. Export all new facts, intents, negatives to blackboard
+2. For each new confirmed fact: run Intent generation rules
+3. Unfinished intents → write as pending to blackboard
+4. Update domain coverage statistics
+5. Save `blackboard.json` and generate `run_summary.md`
+
+### Directory structure
+
+    runs/{target}/
+      blackboard.json          # persistent across runs
+      business_graph.json      # endpoint→domain mapping
+      run_scope.json           # current run's domain focus
+      sessions/run_NNN/        # individual run data (unchanged)
+
+## Domain Scope Declaration
+
+Before starting Phase 0, declare this run's domain scope:
+
+1. Check `runs/{target}/blackboard.json` → read `domains_covered`
+2. Identify domains with status "not_started" or "partial"
+3. Select 1-3 domains for this run (recommended: pick domains with
+   highest untested surface count)
+4. Write `runs/{target}/run_scope.json` with target_domains
+5. All surface planning must respect the declared domain scope
+
+If this is the first run (no blackboard exists), default to:
+- Run 1: `["auth", "txn"]` (highest value domains first)
+- Run 2: `["idor", "input"]` (coverage domains)
+- Run 3: `["admin", "file", "info"]` (remaining domains)
+
+**Domain scope is advisory, not a hard wall.** If during testing you
+discover cross-domain findings (e.g., an auth token that grants access
+to a txn endpoint), follow the Fact-Intent chain regardless of domain
+boundaries. Record cross-domain discoveries in the blackboard for the
+next run to pick up.
 
 ## SRC Workflow
 

@@ -1,0 +1,608 @@
+"""Fact-Intent Graph engine for Atoolkit v8.4.
+
+Manages discovery->exploration direction generation and cross-run
+knowledge persistence.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+class IntentStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"        # executed, produced new Fact(s)
+    ABANDONED = "abandoned"        # executed but no value
+    BLOCKED = "blocked"            # prerequisite not met
+
+
+class IntentSource(str, Enum):
+    CHAIN = "chain"                # derived from chain_assessment
+    CROSS_ENDPOINT = "cross"       # cross-endpoint testing
+    ESCALATION = "escalation"      # privilege escalation direction
+    RECON = "recon"                # reconnaissance expansion
+    ANOMALY = "anomaly"            # anomalous response follow-up
+
+
+class FactType(str, Enum):
+    CONFIRMED_VULN = "confirmed"
+    NEGATIVE_WITH_CONTEXT = "negative"
+    INFO_DISCLOSURE = "info_disclosure"
+    ANOMALY = "anomaly"
+
+
+# ---------------------------------------------------------------------------
+# Dataclass schemas (reference only)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Fact:
+    fact_id: str
+    source_type: str
+    source_candidate_id: str
+    endpoint: str
+    method: str = "GET"
+    params: list[str] = field(default_factory=list)
+    vuln_class: str = ""
+    summary: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
+    phase: int = 1
+    agent: str = ""
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    chain_feasible: bool = False
+    chain_path: str = ""
+    chain_final_impact: str = ""
+
+
+@dataclass
+class Intent:
+    intent_id: str
+    source_fact_id: str
+    source: str
+    description: str
+    vuln_class: str = ""
+    target_endpoint: str = ""
+    target_params: list[str] = field(default_factory=list)
+    priority: str = "medium"
+    status: str = "pending"
+    assigned_phase: int = 2
+    assigned_agent: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    resolved_at: str = ""
+    outcome_summary: str = ""
+    spawned_facts: list[str] = field(default_factory=list)
+
+
+# Note: Fact/Intent dataclasses define the field schema (for documentation and
+# IDE hints).  FactIntentGraph uses plain dicts internally so that the graph is
+# directly JSON-serializable.  Field names and types correspond 1:1.
+
+
+# ---------------------------------------------------------------------------
+# FactIntentGraph
+# ---------------------------------------------------------------------------
+
+class FactIntentGraph:
+    """Fact-Intent graph: a directed graph of discoveries and exploration
+    directions."""
+
+    def __init__(self):
+        self.facts: list[dict] = []
+        self.intents: list[dict] = []
+        self._next_fact_id = 1
+        self._next_intent_id = 1
+
+    # -- core operations (section 3.2) --------------------------------------
+
+    def add_fact(self, fact_data: dict) -> tuple:
+        fact_data.setdefault("fact_id", f"fact_{self._next_fact_id:03d}")
+        self._next_fact_id += 1
+        self.facts.append(fact_data)
+        new_intents = IntentRuleEngine.generate_intents(fact_data, self)
+        for intent in new_intents:
+            intent["intent_id"] = f"intent_{self._next_intent_id:03d}"
+            self._next_intent_id += 1
+            self.intents.append(intent)
+        return fact_data, new_intents
+
+    def fact_from_candidate(self, candidate: dict, fact_type: str = "confirmed") -> dict:
+        chain = candidate.get("chain_assessment") or {}
+        return {
+            "source_type": fact_type,
+            "source_candidate_id": candidate.get("candidate_id", ""),
+            "endpoint": candidate.get("endpoint", ""),
+            "method": candidate.get("method", "GET"),
+            "params": [candidate.get("param", "")] if candidate.get("param") else [],
+            "vuln_class": candidate.get("vuln_class", ""),
+            "summary": candidate.get("hypothesis", ""),
+            "evidence_refs": candidate.get("evidence_refs", []),
+            "chain_feasible": chain.get("chain_feasible", False),
+            "chain_path": chain.get("chain_path", ""),
+            "chain_final_impact": chain.get("final_impact", ""),
+        }
+
+    def get_pending_intents(self, *, agent: str = "", phase: int = 0,
+                            priority: str = "", limit: int = 10) -> list[dict]:
+        pending = [
+            i for i in self.intents
+            if i.get("status") == "pending"
+            and (not agent or i.get("assigned_agent") in (agent, "any", ""))
+            and (not phase or i.get("assigned_phase", 0) <= phase)
+            and (not priority or i.get("priority") == priority)
+        ]
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        pending.sort(key=lambda x: priority_order.get(x.get("priority", "low"), 9))
+        return pending[:limit]
+
+    def resolve_intent(self, intent_id, status, summary="", spawned_facts=None):
+        for intent in self.intents:
+            if intent.get("intent_id") == intent_id:
+                intent["status"] = status
+                intent["outcome_summary"] = summary
+                intent["spawned_facts"] = spawned_facts or []
+                intent["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                return intent
+        return None
+
+    def merge_graph(self, other):
+        id_map = {}
+        for fact in other.facts:
+            old_id = fact["fact_id"]
+            fact_copy = dict(fact)
+            fact_copy["fact_id"] = f"fact_{self._next_fact_id:03d}"
+            self._next_fact_id += 1
+            id_map[old_id] = fact_copy["fact_id"]
+            self.facts.append(fact_copy)
+        for intent in other.intents:
+            intent_copy = dict(intent)
+            intent_copy["intent_id"] = f"intent_{self._next_intent_id:03d}"
+            self._next_intent_id += 1
+            old_src = intent_copy.get("source_fact_id", "")
+            if old_src in id_map:
+                intent_copy["source_fact_id"] = id_map[old_src]
+            self.intents.append(intent_copy)
+
+    def stats(self) -> dict:
+        intent_by_status = {}
+        for i in self.intents:
+            s = i.get("status", "pending")
+            intent_by_status[s] = intent_by_status.get(s, 0) + 1
+        return {
+            "total_facts": len(self.facts),
+            "total_intents": len(self.intents),
+            "intents_by_status": intent_by_status,
+            "chain_links": sum(1 for f in self.facts if f.get("chain_feasible")),
+            "high_priority_pending": sum(
+                1 for i in self.intents
+                if i.get("status") == "pending" and i.get("priority") == "high"
+            ),
+        }
+
+    # -- cross-run persistence (section 9.7) --------------------------------
+
+    def export_to_blackboard(self, run_id: str) -> dict:
+        """Export this run's Graph as a blackboard-increment payload."""
+        return {
+            "new_facts": [
+                {**f, "source_run": run_id}
+                for f in self.facts
+                if f.get("source_type") == "confirmed"
+            ],
+            "new_intents": self.intents,
+            "run_id": run_id,
+            "stats": self.stats(),
+        }
+
+    def import_from_blackboard(self, blackboard: dict, domain: str = ""):
+        """Import historical state from the project-level blackboard.
+
+        - confirmed facts are loaded as pre-existing (skip re-testing)
+        - pending intents are added to the work queue
+        - dead_ends and depth-sufficient negatives are returned as a skip list
+        """
+        # Import historical facts (no domain filter -- facts are cross-domain
+        # knowledge that every domain should inherit).
+        # e.g. a token leak found in the auth domain may be exploited by a txn
+        # domain Intent.
+        for fact in blackboard.get("facts", []):
+            self.facts.append({
+                **fact,
+                "_pre_existing": True,  # mark as historical, do not re-test
+            })
+
+        # Import pending intents
+        for intent in blackboard.get("intents", []):
+            if intent.get("status") == "pending":
+                if domain and intent.get("assigned_domain", "") != domain:
+                    continue
+                self.intents.append(intent)
+
+        # Build skip list (for CoverageLedger initialisation)
+        skip_surfaces = []
+        for neg in blackboard.get("negatives", []):
+            if neg.get("depth_sufficient"):
+                skip_surfaces.append({
+                    "endpoint": neg["endpoint"],
+                    "param": neg.get("param", ""),
+                    "vuln_class": neg.get("vuln_class", ""),
+                    "status": "not_vulnerable",
+                    "reason": f"excluded in {neg.get('deepest_run', '?')}",
+                })
+        for de in blackboard.get("dead_ends", []):
+            skip_surfaces.append({
+                "endpoint": de["endpoint"],
+                "param": de.get("param", ""),
+                "status": "not_vulnerable",
+                "reason": f"dead end: {de.get('refutation', '')}",
+            })
+        return skip_surfaces
+
+
+# ---------------------------------------------------------------------------
+# IntentRuleEngine (section 3.3)
+# ---------------------------------------------------------------------------
+
+class IntentRuleEngine:
+    """Deterministic Intent generation rule engine."""
+
+    MAX_INTENTS_PER_FACT = 5  # max 5 Intents per Fact
+
+    @staticmethod
+    def generate_intents(fact, graph):
+        intents = []
+        for rule in IntentRuleEngine._rules():
+            if rule["condition"](fact, graph):
+                intent = rule["generate"](fact)
+                if intent:
+                    intents.append(intent)
+        # deduplicate + cap
+        seen = set()
+        deduped = []
+        for i in intents:
+            key = (i.get("target_endpoint"), tuple(i.get("target_params", [])),
+                   i.get("vuln_class"))
+            if key not in seen:
+                seen.add(key)
+                deduped.append(i)
+        return deduped[:IntentRuleEngine.MAX_INTENTS_PER_FACT]
+
+    @staticmethod
+    def _rules():
+        return [
+            # Rule 1: auth component weakness -> chain exploitation
+            # Fires: confirmed auth-class + chain_feasible=true
+            # Example: captcha not consumed -> brute-force SMS code -> password reset
+            {
+                "name": "auth_chain",
+                "condition": lambda f, g: (
+                    f.get("source_type") == "confirmed"
+                    and f.get("vuln_class") in (
+                        "auth-bypass", "captcha-bypass", "auth-flow-abuse",
+                        "\u9a8c\u8bc1\u7801\u7ed5\u8fc7", "\u8ba4\u8bc1\u7ed5\u8fc7")
+                    and f.get("chain_feasible")),
+                "generate": lambda f: {
+                    "source_fact_id": f["fact_id"],
+                    "source": "chain",
+                    "description": f"\u94fe\u5f0f\u5229\u7528\uff1a{f.get('chain_path', f.get('summary', ''))}",
+                    "vuln_class": "auth-bypass-chain",
+                    "priority": "high", "assigned_phase": 2,
+                    "assigned_agent": "input_precision",
+                },
+            },
+            # Rule 2: info disclosure -> credential exploitation
+            # Fires: leaked sign/key/token/secret
+            # Example: recharge-create leaks callback_sign -> forge recharge callback
+            {
+                "name": "info_leak_credential",
+                "condition": lambda f, g: (
+                    f.get("source_type") in ("confirmed", "info_disclosure")
+                    and any(kw in (f.get("summary", "") + f.get("vuln_class", "")).lower()
+                            for kw in ("\u6cc4\u9732", "leak", "disclosure", "sign", "key",
+                                       "secret", "token", "credential", "\u5bc6\u7801", "\u5bc6\u94a5"))),
+                "generate": lambda f: {
+                    "source_fact_id": f["fact_id"],
+                    "source": "escalation",
+                    "description": (
+                        f"\u5229\u7528\u6cc4\u9732\u51ed\u8bc1\u5c1d\u8bd5\u4f2a\u9020\u8bf7\u6c42\u6216\u63d0\u6743"
+                        f"\uff08\u6765\u6e90: {f.get('endpoint', '?')}\uff0c"
+                        f"\u5bfb\u627e\u4f7f\u7528\u8be5\u51ed\u8bc1\u7684\u4e0b\u6e38\u7aef\u70b9\uff09"),
+                    "vuln_class": "privilege-escalation",
+                    "target_endpoint": "",  # agent must discover the downstream endpoint
+                    "priority": "high", "assigned_phase": 2,
+                    "assigned_agent": "input_precision",
+                },
+            },
+            # Rule 3: SQLi confirmed -> data extraction escalation
+            # Example: search.php SQLi -> extract users table password hashes
+            {
+                "name": "sqli_extraction",
+                "condition": lambda f, g: (
+                    f.get("source_type") == "confirmed"
+                    and f.get("vuln_class", "").lower() in (
+                        "sqli", "sql-injection", "sql\u6ce8\u5165")),
+                "generate": lambda f: {
+                    "source_fact_id": f["fact_id"],
+                    "source": "escalation",
+                    "description": "SQLi \u6570\u636e\u63d0\u53d6\uff1a\u5c1d\u8bd5\u8bfb\u53d6\u654f\u611f\u8868/\u5217",
+                    "vuln_class": "sqli",
+                    "target_endpoint": f.get("endpoint", ""),
+                    "target_params": f.get("params", []),
+                    "priority": "high", "assigned_phase": 2,
+                    "assigned_agent": "input_precision",
+                },
+            },
+            # Rule 4: cross-endpoint cross-type testing
+            # Fires: endpoint has >= 2 different parameter types
+            # Example: submit-audit has status+description -> cross-test
+            {
+                "name": "cross_param_type",
+                "condition": lambda f, g: (
+                    f.get("source_type") == "confirmed"
+                    and len(f.get("params", [])) >= 2),
+                "generate": lambda f: {
+                    "source_fact_id": f["fact_id"],
+                    "source": "cross",
+                    "description": f"\u8de8\u7c7b\u578b\u4ea4\u53c9\u6d4b\u8bd5\uff1a{f.get('endpoint', '')} \u591a\u53c2\u6570\u7c7b\u578b",
+                    "vuln_class": "cross-validation",
+                    "target_endpoint": f.get("endpoint", ""),
+                    "target_params": f.get("params", []),
+                    "priority": "medium", "assigned_phase": 2,
+                    "assigned_agent": "input_precision",
+                },
+            },
+            # Rule 5: WAF blocked -> bypass retry
+            # Fires: negative + WAF interception evidence
+            {
+                "name": "waf_bypass_retry",
+                "condition": lambda f, g: (
+                    f.get("source_type") == "negative"
+                    and any(kw in (f.get("summary", "")).lower()
+                            for kw in ("waf", "\u62e6\u622a", "blocked", "forbidden",
+                                       "\u975e\u6cd5", "\u5173\u952e\u5b57"))),
+                "generate": lambda f: {
+                    "source_fact_id": f["fact_id"],
+                    "source": "anomaly",
+                    "description": f"WAF \u7ed5\u8fc7\u91cd\u6d4b\uff1a{f.get('endpoint', '')}",
+                    "vuln_class": f.get("vuln_class", "input-validation"),
+                    "target_endpoint": f.get("endpoint", ""),
+                    "target_params": f.get("params", []),
+                    "priority": "medium", "assigned_phase": 2,
+                    "assigned_agent": "input_precision",
+                },
+            },
+            # Rule 6: business logic confirmed -> fund chain
+            # Example: refund uncapped -> "buy->refund" loop -> balance inflation
+            {
+                "name": "business_logic_chain",
+                "condition": lambda f, g: (
+                    f.get("source_type") == "confirmed"
+                    and any(kw in (f.get("vuln_class", "") + f.get("endpoint", "")).lower()
+                            for kw in ("amount", "refund", "recharge", "payment", "points",
+                                       "balance", "coupon", "order", "lottery",
+                                       "\u91d1\u989d", "\u9000\u6b3e", "\u5145\u503c", "\u79ef\u5206", "\u652f\u4ed8"))),
+                "generate": lambda f: {
+                    "source_fact_id": f["fact_id"],
+                    "source": "chain",
+                    "description": f"\u4e1a\u52a1\u903b\u8f91\u94fe\uff1a\u9a8c\u8bc1\u662f\u5426\u53ef\u6784\u9020\u5b8c\u6574\u8d44\u91d1\u653b\u51fb\u94fe",
+                    "vuln_class": "business-logic-chain",
+                    "priority": "high", "assigned_phase": 2,
+                    "assigned_agent": "input_precision",
+                },
+            },
+            # Rule 7: IDOR confirmed -> impact escalation
+            {
+                "name": "idor_impact",
+                "condition": lambda f, g: (
+                    f.get("source_type") == "confirmed"
+                    and f.get("vuln_class", "").lower() in (
+                        "idor", "\u8d8a\u6743", "\u8d8a\u6743\u8bbf\u95ee", "bac")),
+                "generate": lambda f: {
+                    "source_fact_id": f["fact_id"],
+                    "source": "escalation",
+                    "description": "IDOR \u5f71\u54cd\u5347\u7ea7\uff1a\u8bc4\u4f30\u6279\u91cf\u8bbf\u95ee\u6216\u66f4\u5927\u5f71\u54cd",
+                    "vuln_class": "idor",
+                    "target_endpoint": f.get("endpoint", ""),
+                    "target_params": f.get("params", []),
+                    "priority": "medium", "assigned_phase": 2,
+                    "assigned_agent": "input_precision",
+                },
+            },
+            # Rule 8: SSRF confirmed -> internal network probing
+            {
+                "name": "ssrf_internal",
+                "condition": lambda f, g: (
+                    f.get("source_type") == "confirmed"
+                    and f.get("vuln_class", "").lower() in ("ssrf",)),
+                "generate": lambda f: {
+                    "source_fact_id": f["fact_id"],
+                    "source": "recon",
+                    "description": "SSRF \u5185\u7f51\u63a2\u6d4b\uff1a\u63a2\u6d4b\u5185\u7f51\u670d\u52a1\u548c\u5143\u6570\u636e\u7aef\u70b9",
+                    "vuln_class": "ssrf",
+                    "target_endpoint": f.get("endpoint", ""),
+                    "target_params": f.get("params", []),
+                    "priority": "high", "assigned_phase": 2,
+                    "assigned_agent": "input_precision",
+                },
+            },
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Module-level helper functions
+# ---------------------------------------------------------------------------
+
+def merge_agent_graphs(agent_graphs: list) -> FactIntentGraph:
+    """Merge multiple agent Graphs at a phase transition, deduplicating Intents."""
+    merged = FactIntentGraph()
+    for g in agent_graphs:
+        merged.merge_graph(g)
+    # Intent dedup: same source_fact_id + target_endpoint + vuln_class keeps
+    # only the highest-priority copy.
+    # NOTE: source_fact_id MUST be part of the dedup key -- otherwise Intents
+    # from *different* Facts targeting the same endpoint would be incorrectly
+    # merged (e.g. refund.php and coupon.php both produce business-logic-chain
+    # with target_endpoint="" and would collide).
+    seen = {}
+    deduped = []
+    prio = {"high": 0, "medium": 1, "low": 2}
+    for intent in merged.intents:
+        key = (intent.get("source_fact_id"), intent.get("target_endpoint"),
+               intent.get("vuln_class"))
+        if key in seen:
+            existing = seen[key]
+            if prio.get(intent.get("priority"), 9) < prio.get(existing.get("priority"), 9):
+                deduped = [i for i in deduped
+                           if i.get("intent_id") != existing.get("intent_id")]
+                deduped.append(intent)
+                seen[key] = intent
+        else:
+            seen[key] = intent
+            deduped.append(intent)
+    merged.intents = deduped
+    return merged
+
+
+def intent_work_queue(graph, remaining_surfaces, phase=2):
+    """Build a unified work queue: Intents + Surfaces, sorted by priority."""
+    queue = []
+    for intent in graph.get_pending_intents(phase=phase, limit=30):
+        tier = 0 if intent.get("priority") == "high" else (
+               2 if intent.get("priority") == "medium" else 4)
+        queue.append({"type": "intent", "data": intent, "sort_key": (tier,)})
+    for surface in remaining_surfaces:
+        is_high = any(t in ("auth-flow", "amount-tamper", "idor", "payment")
+                      for t in surface.get("risk_tags", []))
+        queue.append({"type": "surface", "data": surface,
+                      "sort_key": (1 if is_high else 3,)})
+    queue.sort(key=lambda x: x["sort_key"])
+    return queue
+
+
+def merge_run_to_blackboard(blackboard_path: str, run_graph: FactIntentGraph,
+                            run_id: str, run_negatives: list[dict] = None):
+    """Merge a run's output into the project-level blackboard at run end."""
+    bb_path = pathlib.Path(blackboard_path)
+    bb = json.loads(bb_path.read_text(encoding="utf-8")) if bb_path.exists() else {
+        "schema_version": "1.0", "facts": [], "intents": [],
+        "negatives": [], "dead_ends": [], "discovered_endpoints": [],
+    }
+
+    # -- merge facts --------------------------------------------------------
+    existing_fact_keys = {
+        (f.get("endpoint"), f.get("vuln_class"))
+        for f in bb.get("facts", [])
+    }
+    for fact in run_graph.facts:
+        if fact.get("source_type") != "confirmed":
+            continue
+        key = (fact.get("endpoint"), fact.get("vuln_class"))
+        if key not in existing_fact_keys:
+            fact_copy = dict(fact)
+            fact_copy["fact_id"] = f"bb_fact_{len(bb['facts']) + 1:03d}"
+            fact_copy["source_run"] = run_id
+            bb["facts"].append(fact_copy)
+
+    # -- merge intents (update status) --------------------------------------
+    existing_intent_keys = {
+        (i.get("source_fact_id"), i.get("description"))
+        for i in bb.get("intents", [])
+    }
+    for intent in run_graph.intents:
+        key = (intent.get("source_fact_id"), intent.get("description"))
+        if key in existing_intent_keys:
+            # update existing intent's status
+            for existing in bb["intents"]:
+                if (existing.get("source_fact_id") == intent.get("source_fact_id")
+                        and existing.get("description") == intent.get("description")):
+                    existing["status"] = intent.get("status", existing.get("status"))
+                    existing["outcome_summary"] = intent.get("outcome_summary", "")
+                    break
+        else:
+            intent_copy = dict(intent)
+            intent_copy["intent_id"] = f"bb_intent_{len(bb['intents']) + 1:03d}"
+            intent_copy["created_in_run"] = run_id
+            bb["intents"].append(intent_copy)
+
+    # -- merge negatives -----------------------------------------------------
+    for neg in (run_negatives or []):
+        surface_key = neg.get("surface_key", "")
+        existing_neg = next(
+            (n for n in bb.get("negatives", []) if n.get("surface_key") == surface_key),
+            None,
+        )
+        if existing_neg:
+            # keep the deeper record
+            if neg.get("vectors_tried", 0) > existing_neg.get("vectors_tried", 0):
+                existing_neg.update(neg)
+                existing_neg["deepest_run"] = run_id
+        else:
+            neg_copy = dict(neg)
+            neg_copy["deepest_run"] = run_id
+            bb.setdefault("negatives", []).append(neg_copy)
+
+    # -- Intent decay -------------------------------------------------------
+    # Decay formula: effective_priority = base_priority * 0.9^(runs_without_execution)
+    # Threshold 0.5: low ~7 runs / medium ~13 runs / high ~17 runs -> auto-abandoned
+    DECAY_FACTOR = 0.9
+    ABANDON_THRESHOLD = 0.5  # priority_score < this -> abandoned
+    PRIO_BASE = {"high": 3.0, "medium": 2.0, "low": 1.0}
+    for intent in bb.get("intents", []):
+        if intent.get("status") != "pending":
+            continue
+        if intent.get("created_in_run", "") == run_id:
+            continue  # intents created this run are not decayed
+        runs_since = bb.get("total_runs", 0) - int(
+            intent.get("created_in_run", "run_000").replace("run_", "") or 0)
+        if runs_since < 1:
+            runs_since = 1
+        base_score = PRIO_BASE.get(intent.get("priority", "low"), 1.0)
+        effective = base_score * (DECAY_FACTOR ** runs_since)
+        if effective < ABANDON_THRESHOLD:
+            intent["status"] = "abandoned"
+            intent["outcome_summary"] = (
+                f"\u8870\u51cf\u653e\u5f03: {runs_since} run \u672a\u6267\u884c, effective={effective:.2f}")
+
+    # -- update metadata ----------------------------------------------------
+    bb["total_runs"] = bb.get("total_runs", 0) + 1
+    bb["last_run"] = run_id
+    bb["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+    bb_path.parent.mkdir(parents=True, exist_ok=True)
+    bb_path.write_text(json.dumps(bb, ensure_ascii=False, indent=2), encoding="utf-8")
+    return bb
+
+
+# ---------------------------------------------------------------------------
+# Smoke test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    g = FactIntentGraph()
+    fact_data = {
+        "source_type": "confirmed",
+        "source_candidate_id": "cand_001",
+        "endpoint": "/api/user/refund.php",
+        "method": "POST",
+        "params": ["refund_amount"],
+        "vuln_class": "amount-tamper",
+        "summary": "\u9000\u6b3e\u91d1\u989d\u65e0\u4e0a\u9650\u6821\u9a8c",
+        "chain_feasible": True,
+        "chain_path": "\u9000\u6b3e\u65e0\u4e0a\u9650\u2192\u53cd\u590d\u9000\u6b3e\u2192\u4f59\u989d\u81a8\u80c0",
+    }
+    fact, intents = g.add_fact(fact_data)
+    print(f"Added fact: {fact['fact_id']}")
+    print(f"Generated {len(intents)} intent(s):")
+    for i in intents:
+        print(f"  - {i['intent_id']}: {i['description']}  [{i['priority']}]")
+    print(f"\nGraph stats: {g.stats()}")

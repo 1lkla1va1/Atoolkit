@@ -40,6 +40,20 @@
 5. **攻击面清单生成**：合并以上产出，每个 surface = endpoint/method/param/role/risk_tags/status → `attack_surface_list.md`
 6. **完整性检查**：对照决策树分支确认无空白方向，缺失方向继续侦察或标 NEED_INPUT
 
+### 测试账号完备性验证
+
+Phase 0 结束前，确认已获取目标系统所有可用角色的测试账号（至少包含：2个同级别普通用户、2个同级别商户、1个管理员）。账号不完备时，IDOR双向测试和跨商户测试无法充分覆盖——缺少的角色应在 `state/session_state.md` 中标 `missing` 并在 hint.md 中申请。
+
+### 攻击域声明
+
+Phase 0 结束前，确认本轮的攻击域声明已落盘：
+
+1. **检查**：确认 `runs/{target}/run_scope.json` 是否存在
+2. **不存在则创建**：读取 `blackboard.json` 的 `domains_covered` 选择本轮域并写入；首次 run（无 blackboard）按默认规则创建：Run 1 `["auth", "txn"]`，Run 2 `["idor", "input"]`，Run 3 `["admin", "file", "info"]`。`run_scope.json` 须含 `target_domains`、`excluded_domains`、`reason` 字段
+3. **变更时更新**：测试中发现域范围需调整（如跨域 Fact-Intent 链要求扩展、或当前域端点已充分覆盖需切换），同步更新 `run_scope.json` 并记录调整原因
+
+Phase 0 侦察应优先覆盖本轮域内的端点——其他域的端点记录到 `discovered_endpoints` 但不展开测试。
+
 ---
 
 ## 1. 垃圾洞清单（置顶 · 第一眼就要看到）
@@ -182,6 +196,10 @@
 
 未充分测试的阴性一律标 `shallow_negative`，不得标 `not_vulnerable`。
 
+### 跨阶段阴性重测
+
+多阶段测试架构下，前一阶段标记为 `not_vulnerable` 的输入验证类 surface，后一阶段必须使用不同的 payload 编码格式和注入策略重新测试。前阶段的阴性记录（含已测试 payload 列表和响应模式）是后阶段的测试起点，不是终点。
+
 **阴性落盘格式**：Skill Mode 使用合并文件 `negative_findings.md`（完整格式见 skillmode-reference.md §阴性落盘）。每条阴性须含已测试向量描述 + depth_floor_met + status。
 
 ### 阻塞要分类
@@ -236,6 +254,7 @@
   - keyword / search / sort / orderBy / filter → `input-validation`
   - status / discount / role / state → `privilege`
   - **SQLi 注入测试**：对每个可能存在注入的参数，根据参数语义和响应特征自适应选择注入策略。需要覆盖的 SQL 上下文包括但不限于：等值查询、LIKE 模糊查询、ORDER BY 排序、INSERT/UPDATE 写入、数字型（无引号）和字符型（需闭合引号）。对每种上下文，根据你的判断选择合适的 payload 和闭合方式。观察响应的多维度差异：返回行数、内容变化、状态码、响应长度、响应时间、错误信息。不同 DBMS（MySQL / PostgreSQL / SQLite / MSSQL / Oracle）有不同的语法方言和特征函数，根据技术栈线索选择对应的 payload 变体。**SQLi 与 IDOR 是独立测试面**：对同一个含 ID 参数的端点，IDOR 测试阴性不等于 SQLi 阴性——每个含用户可控 ID/数值/字符串参数的端点都应独立考虑 SQLi 测试
+  - **Payload 编码多样性**：同一 payload 在不同编码格式下可能产生不同结果。当原始 payload 返回空/无变化时，在切换 payload 之前先尝试同一 payload 的 URL 编码、双重编码、Unicode 变体。特别是含引号和等号的 payload，URL 编码格式（`%27`、`%3D`）可能绕过前端/中间件层的预处理
 - **按 role/object-pair 分支**
   - 对象参数（id / uid / user_id / order_id / product_id / merchant_id / hash / *_no）：owner 创建 → attacker 读取/修改/删除 → owner 回查影响
   - 普通用户覆盖 owner→attacker；商户覆盖 merchant_a→merchant_b；高权限面覆盖 anon/user/merchant/admin 角色差异格
@@ -259,6 +278,7 @@
   - **端点变体推测**：对已发现的每个端点，根据命名规律推测可能存在的"兄弟端点"并发送 probe 请求。常见命名模式（启发性提示）：`xxx-batch` / `xxx-list` → 推测 `xxx`（单条操作）；`xxx-detail` → 推测 `xxx-list` / `xxx-edit` / `xxx-delete`；`xxx-create` → 推测 `xxx-update` / `xxx-delete` / `xxx-read`；带版本号的端点（v1/v2）→ 检查其他版本是否存在。推测出的端点发送 GET + POST probe，有新发现则加入攻击面清单。这不是字典扫描——只推测与已知端点有明确命名关系的变体。
 - **什么攻击面都不明显时** → 翻 JS 找隐藏接口 / 未文档化参数，再回到上面分支
 - **时间管理**：如果连续 20 分钟无任何进展信号——包括响应变化、新发现的端点/参数、partial success、有趣的信息泄露——考虑换方向。但如果有任何微弱信号（哪怕只是"响应长度有 2 字节差异"），继续追。模型的直觉比计时器更可靠。
+- **Intent 驱动探索**：确认漏洞后先不急着跳到下一个 surface。停下来问："这个发现能链式利用到什么方向？" 如果存在明确的下游攻击方向（如泄露凭证→找使用凭证的端点、弱组件→验证端到端利用链），优先执行下游测试并记录为 Intent。具体规则见 SKILL.md Fact-Intent Protocol。
 
 > 知识卡的作用是**兜底与激活攻击面灵感**，不是限制——始终保留动态调整的自由度。
 > 知识卡应在"你声明要测某方向时"按意图检索注入，不要开局一把梭全加载。
@@ -290,6 +310,8 @@
 - 组合多个已发现的低危问题形成攻击链
 - 探索之前因为"不在覆盖表内"而跳过的方向
 - 用完全不同的角色/参数组合重测已判阴性的 surface
+- 审视 Phase 1/2 遗留的未解决 Intent，选择最有价值的方向深入探索
+- 直觉探索中产生新发现同样生成 Fact 和后续 Intent
 
 唯一约束：每个探索方向必须有实际请求作为证据（不能只在推理中想象）。
 
@@ -398,3 +420,18 @@
      核心原则:与v8.0哲学8/8对齐(措辞从"教做事"回到"提醒者"),核心文件净变化+1行
      约束密度诚实计算:12.4%(v8.2声称9.3%失真),仍低于v7.3的25.1%健康线
      预期:能力基线3400-3600 + 方差区间四档(悲观2400-2700/保守3000-3300/基线3300-3600/乐观3600-3850) -->
+
+<!-- v8.3 变更(分阶段精确打击)：
+     ①§0 新增Pre-flight账号验证(提醒型,+3行):确保5角色完备,防止缺账号导致IDOR测试缺失
+     ②§6 新增跨阶段阴性重测规则(提醒型,+3行):后阶段必须用不同编码格式重测前阶段阴性
+     ③§7 SQLi注入测试新增payload编码多样性提醒(+2行):URL编码/双重编码/Unicode变体
+     ④reference新增§12 Payload多样性教训(+20行):编码感知知识+实战案例
+     ⑤reference新增§13 支付流程端点追踪(+20行):完整支付生命周期+常见遗漏模式
+     ⑥SKILL.md: Parallel Agent Protocol→Phased Precision Protocol(架构重写)
+        · Phase 1: 2并行agent(txn_idor + auth_admin)广度扫描,不测输入验证
+        · Phase 过渡: 缝隙检查+黑板聚合(blackboard.json)
+        · Phase 2: 1个input_precision agent精度深扫,继承Phase 1上下文
+        · Phase 3: §8.5直觉探索(保留v8.2.1有效机制)
+     核心原则:保留v8.2.1的并行广度+恢复v8.2的单agent精度,通过黑板机制桥接
+     约束密度:9.1%→9.2%(实测口径,+1行约束关键词),几乎无增长
+     预期:基线3900-4100(81-85%),命中率15→18+项 -->
