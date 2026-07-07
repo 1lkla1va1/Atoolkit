@@ -1000,12 +1000,49 @@ def _run_self_check() -> int:
         assert (tmp / "scorecard.md").exists()
         print("  断言17 ✅ score: 离线评分写 scorecard.json/md 且 oracle_used_post_run_only=true")
 
+    # 断言18：Fact-Intent 管道完整性（v8.5.1 P0 修复验证）。
+    def _assert18():
+        from engine.graph import FactIntentGraph
+        from engine.vuln_classes import norm_vc, vc_matches, is_chainable
+        g = FactIntentGraph()
+        # 18a: Intent status 必须被设置
+        fact, intents = g.add_fact({
+            "source_type": "confirmed", "endpoint": "/api/test",
+            "vuln_class": "ssrf", "summary": "SSRF test", "params": ["url"],
+        })
+        assert all("status" in i for i in g.intents), "intent 缺少 status 键"
+        assert all(i["status"] == "pending" for i in g.intents), "status 不是 pending"
+        pending = g.get_pending_intents(limit=10)
+        assert len(pending) == len(intents), (
+            f"get_pending_intents 返回 {len(pending)}，应有 {len(intents)}")
+        # 18b: stored-xss 必须触发兜底规则（不再 zero-trigger）
+        g2 = FactIntentGraph()
+        _, i2 = g2.add_fact({
+            "source_type": "confirmed", "endpoint": "/api/field",
+            "vuln_class": "stored-xss", "params": ["name"], "summary": "XSS",
+        })
+        assert len(i2) >= 1, "stored-xss 零触发（兜底规则失效）"
+        # 18c: norm_vc 归一化正确
+        assert norm_vc("越权") == "idor", f"norm_vc(越权)={norm_vc('越权')}"
+        assert norm_vc("stored-xss") == "xss"
+        assert vc_matches("privilege-escalation", "idor")
+        assert is_chainable("auth-bypass")
+        assert not is_chainable("xss")
+        # 18d: stats 不掩盖假阳性
+        stats = g.stats()
+        assert stats["high_priority_pending"] == sum(
+            1 for i in g.intents
+            if i.get("priority") == "high" and i.get("status") == "pending"
+        ), "stats high_priority_pending 与实际不一致"
+        print("  断言18 ✅ Fact-Intent 管道完整性（status/兜底/norm_vc/stats）")
+
     for name, fn in (("断言1", _assert1), ("断言2", _assert2), ("断言3", _assert3),
                      ("断言4", _assert4), ("断言5", _assert5), ("断言6", _assert6),
                      ("断言7", _assert7), ("断言8", _assert8), ("断言9", _assert9),
                      ("断言10", _assert10), ("断言11", _assert11), ("断言12", _assert12),
                      ("断言13", _assert13), ("断言14", _assert14), ("断言15", _assert15),
-                     ("断言16", _assert16), ("断言17", _assert17)):
+                     ("断言16", _assert16), ("断言17", _assert17),
+                     ("断言18", _assert18)):
         try:
             fn()
         except AssertionError as exc:

@@ -14,6 +14,11 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+try:
+    from .vuln_classes import norm_vc, vc_matches, is_chainable
+except ImportError:
+    from vuln_classes import norm_vc, vc_matches, is_chainable
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -112,6 +117,7 @@ class FactIntentGraph:
         new_intents = IntentRuleEngine.generate_intents(fact_data, self)
         for intent in new_intents:
             intent["intent_id"] = f"intent_{self._next_intent_id:03d}"
+            intent.setdefault("status", "pending")  # v8.5.1: ensure status is always set
             self._next_intent_id += 1
             self.intents.append(intent)
         return fact_data, new_intents
@@ -176,7 +182,7 @@ class FactIntentGraph:
     def stats(self) -> dict:
         intent_by_status = {}
         for i in self.intents:
-            s = i.get("status", "pending")
+            s = i.get("status")  # v8.5.1: no default — expose missing status
             intent_by_status[s] = intent_by_status.get(s, 0) + 1
         return {
             "total_facts": len(self.facts),
@@ -279,17 +285,16 @@ class IntentRuleEngine:
 
     @staticmethod
     def _rules():
+        """Intent generation rules. v8.5.1: uses vc_matches() for vuln_class
+        matching instead of hardcoded strings. Single source of truth in
+        vuln_classes.py."""
         return [
-            # Rule 1: auth component weakness -> chain exploitation
-            # Fires: confirmed auth-class + chain_feasible=true
-            # Example: captcha not consumed -> brute-force SMS code -> password reset
+            # Rule 1: auth weakness -> chain exploitation
             {
                 "name": "auth_chain",
                 "condition": lambda f, g: (
                     f.get("source_type") == "confirmed"
-                    and f.get("vuln_class") in (
-                        "auth-bypass", "captcha-bypass", "auth-flow-abuse",
-                        "\u9a8c\u8bc1\u7801\u7ed5\u8fc7", "\u8ba4\u8bc1\u7ed5\u8fc7")
+                    and vc_matches(f.get("vuln_class", ""), "auth")
                     and f.get("chain_feasible")),
                 "generate": lambda f: {
                     "source_fact_id": f["fact_id"],
@@ -301,8 +306,7 @@ class IntentRuleEngine:
                 },
             },
             # Rule 2: info disclosure -> credential exploitation
-            # Fires: leaked sign/key/token/secret
-            # Example: recharge-create leaks callback_sign -> forge recharge callback
+            # (keyword-based on summary text, not vuln_class)
             {
                 "name": "info_leak_credential",
                 "condition": lambda f, g: (
@@ -318,19 +322,17 @@ class IntentRuleEngine:
                         f"\uff08\u6765\u6e90: {f.get('endpoint', '?')}\uff0c"
                         f"\u5bfb\u627e\u4f7f\u7528\u8be5\u51ed\u8bc1\u7684\u4e0b\u6e38\u7aef\u70b9\uff09"),
                     "vuln_class": "privilege-escalation",
-                    "target_endpoint": "",  # agent must discover the downstream endpoint
+                    "target_endpoint": "",
                     "priority": "high", "assigned_phase": 2,
                     "assigned_agent": "input_precision",
                 },
             },
-            # Rule 3: SQLi confirmed -> data extraction escalation
-            # Example: search.php SQLi -> extract users table password hashes
+            # Rule 3: SQLi -> data extraction
             {
                 "name": "sqli_extraction",
                 "condition": lambda f, g: (
                     f.get("source_type") == "confirmed"
-                    and f.get("vuln_class", "").lower() in (
-                        "sqli", "sql-injection", "sql\u6ce8\u5165")),
+                    and vc_matches(f.get("vuln_class", ""), "sqli")),
                 "generate": lambda f: {
                     "source_fact_id": f["fact_id"],
                     "source": "escalation",
@@ -342,9 +344,7 @@ class IntentRuleEngine:
                     "assigned_agent": "input_precision",
                 },
             },
-            # Rule 4: cross-endpoint cross-type testing
-            # Fires: endpoint has >= 2 different parameter types
-            # Example: submit-audit has status+description -> cross-test
+            # Rule 4: cross-param testing (param-count based, no vuln_class)
             {
                 "name": "cross_param_type",
                 "condition": lambda f, g: (
@@ -361,8 +361,7 @@ class IntentRuleEngine:
                     "assigned_agent": "input_precision",
                 },
             },
-            # Rule 5: WAF blocked -> bypass retry
-            # Fires: negative + WAF interception evidence
+            # Rule 5: WAF blocked -> bypass retry (summary keyword based)
             {
                 "name": "waf_bypass_retry",
                 "condition": lambda f, g: (
@@ -381,32 +380,32 @@ class IntentRuleEngine:
                     "assigned_agent": "input_precision",
                 },
             },
-            # Rule 6: business logic confirmed -> fund chain
-            # Example: refund uncapped -> "buy->refund" loop -> balance inflation
+            # Rule 6: business logic -> fund chain
             {
                 "name": "business_logic_chain",
                 "condition": lambda f, g: (
                     f.get("source_type") == "confirmed"
-                    and any(kw in (f.get("vuln_class", "") + f.get("endpoint", "")).lower()
-                            for kw in ("amount", "refund", "recharge", "payment", "points",
-                                       "balance", "coupon", "order", "lottery",
-                                       "\u91d1\u989d", "\u9000\u6b3e", "\u5145\u503c", "\u79ef\u5206", "\u652f\u4ed8"))),
+                    and (vc_matches(f.get("vuln_class", ""), "business")
+                         or any(kw in f.get("endpoint", "").lower()
+                                for kw in ("amount", "refund", "recharge", "payment",
+                                           "points", "balance", "coupon", "order",
+                                           "lottery", "\u91d1\u989d", "\u9000\u6b3e",
+                                           "\u5145\u503c", "\u79ef\u5206", "\u652f\u4ed8")))),
                 "generate": lambda f: {
                     "source_fact_id": f["fact_id"],
                     "source": "chain",
-                    "description": f"\u4e1a\u52a1\u903b\u8f91\u94fe\uff1a\u9a8c\u8bc1\u662f\u5426\u53ef\u6784\u9020\u5b8c\u6574\u8d44\u91d1\u653b\u51fb\u94fe",
+                    "description": "\u4e1a\u52a1\u903b\u8f91\u94fe\uff1a\u9a8c\u8bc1\u662f\u5426\u53ef\u6784\u9020\u5b8c\u6574\u8d44\u91d1\u653b\u51fb\u94fe",
                     "vuln_class": "business-logic-chain",
                     "priority": "high", "assigned_phase": 2,
                     "assigned_agent": "input_precision",
                 },
             },
-            # Rule 7: IDOR confirmed -> impact escalation
+            # Rule 7: IDOR -> impact escalation
             {
                 "name": "idor_impact",
                 "condition": lambda f, g: (
                     f.get("source_type") == "confirmed"
-                    and f.get("vuln_class", "").lower() in (
-                        "idor", "\u8d8a\u6743", "\u8d8a\u6743\u8bbf\u95ee", "bac")),
+                    and vc_matches(f.get("vuln_class", ""), "idor")),
                 "generate": lambda f: {
                     "source_fact_id": f["fact_id"],
                     "source": "escalation",
@@ -418,12 +417,12 @@ class IntentRuleEngine:
                     "assigned_agent": "input_precision",
                 },
             },
-            # Rule 8: SSRF confirmed -> internal network probing
+            # Rule 8: SSRF -> internal probing
             {
                 "name": "ssrf_internal",
                 "condition": lambda f, g: (
                     f.get("source_type") == "confirmed"
-                    and f.get("vuln_class", "").lower() in ("ssrf",)),
+                    and vc_matches(f.get("vuln_class", ""), "ssrf")),
                 "generate": lambda f: {
                     "source_fact_id": f["fact_id"],
                     "source": "recon",
@@ -432,6 +431,30 @@ class IntentRuleEngine:
                     "target_endpoint": f.get("endpoint", ""),
                     "target_params": f.get("params", []),
                     "priority": "high", "assigned_phase": 2,
+                    "assigned_agent": "input_precision",
+                },
+            },
+            # Rule 9: generic fallback — ensures EVERY confirmed finding
+            # produces at least one Intent, even if no specific rule matches.
+            # This prevents the pipeline from silently dropping vuln_classes
+            # like 'stored-xss' or 'privilege-escalation' that have no
+            # dedicated rule.
+            {
+                "name": "generic_followup",
+                "condition": lambda f, g: (
+                    f.get("source_type") == "confirmed"
+                    and not any(
+                        r["condition"](f, g)
+                        for r in IntentRuleEngine._rules()[:-1]
+                    )),
+                "generate": lambda f: {
+                    "source_fact_id": f["fact_id"],
+                    "source": "escalation",
+                    "description": f"\u8bc4\u4f30\u5f71\u54cd\u8303\u56f4\u548c\u5229\u7528\u6df1\u5ea6\uff1a{f.get('endpoint', '')} ({f.get('vuln_class', '?')})",
+                    "vuln_class": f.get("vuln_class", ""),
+                    "target_endpoint": f.get("endpoint", ""),
+                    "target_params": f.get("params", []),
+                    "priority": "low", "assigned_phase": 2,
                     "assigned_agent": "input_precision",
                 },
             },

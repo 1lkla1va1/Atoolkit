@@ -277,8 +277,14 @@ def plan_auth_flow_tasks(endpoint: str, method: str, roles: list[str],
     )]
 
 
-def plan_surfaces(endpoints: list[str | dict[str, Any]], *, default_roles: list[str] | None = None) -> list[dict[str, Any]]:
-    """Expand endpoint inventory into ledger-ready surface dictionaries."""
+def plan_surfaces(endpoints: list[str | dict[str, Any]], *, default_roles: list[str] | None = None,
+                  target_domains: list[str] | None = None) -> list[dict[str, Any]]:
+    """Expand endpoint inventory into ledger-ready surface dictionaries.
+
+    target_domains: optional domain filter — when non-empty, only surfaces whose
+    classified domain intersects *target_domains* are returned.  Each surface
+    dict is annotated with a ``domains`` key regardless of filtering.
+    """
     surfaces: list[PlannedSurface] = []
     seen: set[str] = set()
     for item in endpoints:
@@ -320,7 +326,21 @@ def plan_surfaces(endpoints: list[str | dict[str, Any]], *, default_roles: list[
                     source=source,
                     tasks=[asdict(task) for task in tasks],
                 ))
-    return [surface.to_dict() for surface in surfaces]
+    result_dicts = []
+    for surface in surfaces:
+        d = surface.to_dict()
+        # Annotate each surface with its classified domain(s)
+        d["domain_scores"] = classify_endpoint_domain(
+            d["endpoint"], [d["param"]] if d.get("param") else [],
+            d.get("risk_tags", []))
+        # Backward compat: domains list from scores
+        d["domains"] = sorted(d["domain_scores"].keys(),
+                              key=lambda k: -d["domain_scores"][k]) if d["domain_scores"] else ["info"]
+        result_dicts.append(d)
+    # Apply domain filter if target_domains specified
+    if target_domains:
+        result_dicts = filter_surfaces_by_domain(result_dicts, target_domains)
+    return result_dicts
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -433,74 +453,83 @@ DOMAIN_RULES: dict[str, dict] = {
 
 
 def _has_keyword_match(text: str, keywords: list[str]) -> bool:
-    """分隔符边界匹配：防止 'sort' 匹配 'resort'、'order' 匹配 'disorder'。"""
+    """Token-prefix 匹配：对端点命名约定零假设。
+
+    v8.5.1: 替代原分隔符边界匹配。将路径按分隔符切为 token，
+    检查关键词是否匹配任何 token 或其前缀（>=3字符）。
+    - order 匹配 order, orders, ordering, order_list, order-items
+    - order 不匹配 disorder, reorder (order 不是这些 token 的前缀)
+    - pay 匹配 pay, payment, payments, pay_order
+    """
+    tokens = re.split(r'[-_/.]', text.lower())
     for kw in keywords:
-        pattern = r'(?:^|[-_/.])' + re.escape(kw) + r'(?:$|[-_/.])'
-        if re.search(pattern, text):
-            return True
+        kw_lower = kw.lower()
+        for token in tokens:
+            if not token:
+                continue
+            if token == kw_lower:
+                return True
+            # token 以 keyword 开头，且 keyword >= 3 字符（防 "id" 匹配 "idea"）
+            if len(kw_lower) >= 3 and token.startswith(kw_lower):
+                return True
     return False
 
 
 def classify_endpoint_domain(endpoint: str, params: list[str] | None = None,
-                             risk_tags: list[str] | None = None) -> list[str]:
-    """将一个端点分类到一个或多个域。
+                             risk_tags: list[str] | None = None) -> dict[str, int]:
+    """将一个端点分类到域，返回评分字典。
 
-    返回匹配的域 ID 列表（一个端点可能属于多个域，
-    如 submit-audit.php 同时属于 admin 和 input）。
+    v8.5.1: 返回 {domain: score} 字典而非列表，支持软优先级排序。
+    不再截断为 top-2 — 所有匹配的域都保留评分。
 
     Scoring:
-      - endpoint_keywords match (separator-boundary): +2
-      - param_keywords match (exact or prefix):       +1 per keyword
-      - risk_tags match (exact):                      +1 per tag
-
-    Returns the top 1-2 domains by score, or ["info"] when nothing matches.
+      - endpoint_keywords match (token-prefix): +2
+      - param_keywords match (exact or prefix): +1 per keyword
+      - risk_tags match (exact):                +1 per tag
     """
     ep_lower = endpoint.lower()
     params_lower = [p.lower() for p in (params or [])]
     tags_lower = [t.lower() for t in (risk_tags or [])]
 
-    matched: list[tuple[str, int]] = []
+    scores: dict[str, int] = {}
     for domain_id, rules in DOMAIN_RULES.items():
         score = 0
-        # Endpoint keyword match (separator-boundary)
         if _has_keyword_match(ep_lower, rules["endpoint_keywords"]):
             score += 2
-        # Param keyword match (exact or prefix with underscore)
         for kw in rules["param_keywords"]:
             if any(kw == p or p.startswith(kw + "_") for p in params_lower):
                 score += 1
-        # Risk tag match (exact)
         for tag in rules["risk_tags"]:
             if tag.lower() in tags_lower:
                 score += 1
         if score > 0:
-            matched.append((domain_id, score))
+            scores[domain_id] = score
 
-    if not matched:
-        return ["info"]  # Default: no match → info domain
-    # Return top 1-2 domains by descending score
-    matched.sort(key=lambda x: -x[1])
-    return [m[0] for m in matched[:2]]
+    return scores  # {} when nothing matches (treated as "info" domain)
 
 
 def filter_surfaces_by_domain(surfaces: list[dict],
                               target_domains: list[str]) -> list[dict]:
-    """按域过滤 surface 清单。
+    """v8.5.1: 软优先级排序替代硬过滤。
 
-    If *target_domains* is empty, returns the full list (no domain filter).
-    Otherwise keeps only surfaces whose classified domain intersects
-    *target_domains*.
+    不丢弃任何端点。匹配目标域的排前面，不匹配的排后面。
+    每个 surface 标注 domain_scores 和 _domain_priority。
     """
     if not target_domains:
-        return surfaces  # No domain filter → return all
-    return [
-        s for s in surfaces
-        if any(
-            d in target_domains
-            for d in classify_endpoint_domain(
-                s.get("endpoint", ""),
-                s.get("params", []),
-                s.get("risk_tags", []),
-            )
+        return surfaces  # No domain target → return as-is
+
+    for s in surfaces:
+        scores = classify_endpoint_domain(
+            s.get("endpoint", ""),
+            s.get("params", []),
+            s.get("risk_tags", []),
         )
-    ]
+        s["domain_scores"] = scores
+        # Priority 0 = matches target domain (test first)
+        # Priority 1 = doesn't match (test later, but don't skip)
+        domain_match = any(d in target_domains for d in scores)
+        s["_domain_priority"] = 0 if domain_match else 1
+
+    # Sort: target-domain surfaces first, others after
+    surfaces.sort(key=lambda s: s.get("_domain_priority", 1))
+    return surfaces
