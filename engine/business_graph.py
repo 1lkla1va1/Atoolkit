@@ -71,6 +71,34 @@ def _infer_state_effect(method: str, endpoint: str) -> str:
         return "state_transition"
     return _METHOD_STATE.get(method.upper(), "read")
 
+# Financial / auth keywords for value inference
+_FINANCIAL_KW = re.compile(
+    r"(refund|pay|transfer|withdraw|balance|recharge|approve|reject"
+    r"|cancel|confirm|freeze|unfreeze)"
+)
+_AUTH_KW = re.compile(r"(login|register|password|token|oauth|mfa)")
+
+def _infer_value(method: str, path: str) -> str:
+    """Infer endpoint value tier: high / medium / low.
+
+    - high: admin paths, or write ops on financial/auth endpoints
+    - medium: read ops on sensitive keywords, or generic write ops
+    - low: plain read-only endpoints with no sensitive keywords
+    """
+    path_lower = path.lower()
+    if "/admin" in path_lower:
+        return "high"
+    if method in ("POST", "PUT", "PATCH", "DELETE"):
+        if _FINANCIAL_KW.search(path_lower) or _AUTH_KW.search(path_lower):
+            return "high"
+        if "order" in path_lower:
+            return "high"
+        return "medium"
+    # GET / HEAD / OPTIONS
+    if _FINANCIAL_KW.search(path_lower) or _AUTH_KW.search(path_lower):
+        return "medium"
+    return "low"
+
 # ---------------------------------------------------------------------------
 # BusinessGraph
 # ---------------------------------------------------------------------------
@@ -117,6 +145,7 @@ class BusinessGraph:
                 "objects": [obj],
                 "roles": roles,
                 "state_effect": state,
+                "value": _infer_value(method, path),
             }
             for r in roles:
                 if r not in self.roles:
@@ -141,6 +170,7 @@ class BusinessGraph:
                 "objects": [_infer_object(endpoint)],
                 "roles": _infer_roles(endpoint),
                 "state_effect": _infer_state_effect(method, endpoint),
+                "value": _infer_value(method, endpoint),
             }
             self.endpoint_map[key] = entry
 
@@ -211,16 +241,35 @@ class BusinessGraph:
         }
 
     def _rebuild_flows(self) -> None:
-        """Group endpoint keys by shared object for planner quick-view."""
+        """Group endpoint keys by shared object for planner quick-view.
+
+        D1: Emit ``steps`` (list of ``{endpoint, order}``) instead of a flat
+        ``endpoints`` list so that scheduler._flow_completion_endpoints can
+        track partial flow progress.
+        """
         obj_groups: dict[str, list[str]] = {}
         for key, meta in self.endpoint_map.items():
             for obj in meta.get("objects", []):
                 obj_groups.setdefault(obj, []).append(key)
-        self.flows = [
-            {"object": obj, "endpoints": keys}
-            for obj, keys in sorted(obj_groups.items())
-            if len(keys) > 1 or obj not in ("unknown",)
-        ]
+        flows: list[dict[str, Any]] = []
+        for obj, keys in sorted(obj_groups.items()):
+            if len(keys) <= 1 and obj in ("unknown",):
+                continue
+            # Derive primary domain from the first endpoint that has domains
+            primary_domain = ""
+            for k in keys:
+                meta = self.endpoint_map.get(k, {})
+                doms = meta.get("domains", [])
+                if doms:
+                    primary_domain = doms[0]
+                    break
+            steps = [{"endpoint": k, "order": i} for i, k in enumerate(keys)]
+            flows.append({
+                "object": obj,
+                "domain": primary_domain,
+                "steps": steps,
+            })
+        self.flows = flows
 
     def stats(self) -> dict[str, int]:
         return {

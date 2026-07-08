@@ -1,0 +1,93 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.0, pytest-9.1.1, pluggy-1.6.0 -- C:\Users\cr0zy\AppData\Local\Programs\Python\Python312\python.exe
+cachedir: .pytest_cache
+rootdir: C:\claw\Atoolkit
+plugins: anyio-4.14.1
+collecting ... collected 18 items
+
+tests/test_blackboard_population.py::TestD3_BlackboardPopulation::test_domains_covered_is_populated FAILED [  5%]
+tests/test_blackboard_population.py::TestD3_BlackboardPopulation::test_surface_index_is_populated FAILED [ 11%]
+tests/test_blackboard_schema.py::TestBlackboardV2Schema::test_schema_v2_has_all_required_keys PASSED [ 16%]
+tests/test_blackboard_schema.py::TestBlackboardV2Schema::test_total_runs_preserved PASSED [ 22%]
+tests/test_blackboard_schema.py::TestBlackboardV2Schema::test_import_reads_v2_fields PASSED [ 27%]
+tests/test_business_graph.py::TestD2_ValueField::test_endpoint_has_value_field FAILED [ 33%]
+tests/test_business_graph.py::TestD2_ValueField::test_value_is_valid_tier FAILED [ 38%]
+tests/test_business_graph.py::TestD2_ValueField::test_high_value_endpoints_exist FAILED [ 44%]
+tests/test_business_graph.py::TestD1_FlowsSchema::test_flows_have_steps_key FAILED [ 50%]
+tests/test_business_graph.py::TestD1_FlowsSchema::test_flow_steps_contain_endpoint FAILED [ 55%]
+tests/test_orchestrator_output.py::TestD4_SchedulerStats::test_scheduler_stats_in_result FAILED [ 61%]
+tests/test_orchestrator_output.py::TestD4_SchedulerStats::test_scheduler_stats_not_empty FAILED [ 66%]
+tests/test_orchestrator_output.py::TestD5_LowRoiAdvisory::test_low_roi_advisory_called FAILED [ 72%]
+tests/test_orchestrator_output.py::TestD6_RunSummaryMd::test_run_summary_generation FAILED [ 77%]
+tests/test_orchestrator_output.py::TestD6_RunSummaryMd::test_run_summary_write_call FAILED [ 83%]
+tests/test_scheduler_integration.py::TestD2_SchedulerHighValue::test_refund_before_orders_within_txn FAILED [ 88%]
+tests/test_scheduler_integration.py::TestD1_FlowCompletion::test_flow_completion_returns_endpoints FAILED [ 94%]
+tests/test_scheduler_integration.py::TestD1_FlowCompletion::test_flow_completion_excludes_tested SKIPPED [100%]
+
+================================== FAILURES ===================================
+E   AssertionError: D3 FAIL: domains_covered is only set via setdefault({}). No code populates it with actual domain coverage data.
+    assert 0 > 0
+     +  where 0 = len([])
+C:\claw\Atoolkit\tests\test_blackboard_population.py:30: AssertionError: D3 FAIL: domains_covered is only set via setdefault({}). No code populates it with actual domain coverage data.
+E   AssertionError: D3 FAIL: surface_index is only set via setdefault({}). No code populates it with actual surface indexing data.
+    assert 0 > 0
+     +  where 0 = len([])
+C:\claw\Atoolkit\tests\test_blackboard_population.py:51: AssertionError: D3 FAIL: surface_index is only set via setdefault({}). No code populates it with actual surface indexing data.
+E   AssertionError: D2 FAIL: endpoint 'POST /api/refund' has no 'value' field. Keys: ['domains', 'objects', 'roles', 'state_effect']
+    assert 'value' in {'domains': ['txn'], 'objects': ['refund'], 'roles': ['anonymous'], 'state_effect': 'resource_created'}
+C:\claw\Atoolkit\tests\test_business_graph.py:14: AssertionError: D2 FAIL: endpoint 'POST /api/refund' has no 'value' field. Keys: ['domains', 'objects', 'roles', 'state_effect']
+E   AssertionError: D2 FAIL: endpoint 'POST /api/refund' value=None not in {'low', 'high', 'medium'}
+    assert None in {'high', 'low', 'medium'}
+C:\claw\Atoolkit\tests\test_business_graph.py:25: AssertionError: D2 FAIL: endpoint 'POST /api/refund' value=None not in {'low', 'high', 'medium'}
+E   AssertionError: D2 FAIL: no endpoint was inferred as high value. Expected /api/refund, /api/pay, /admin/* to be high.
+    assert 0 > 0
+     +  where 0 = len([])
+C:\claw\Atoolkit\tests\test_business_graph.py:34: AssertionError: D2 FAIL: no endpoint was inferred as high value. Expected /api/refund, /api/pay, /admin/* to be high.
+E   AssertionError: D1 FAIL: flow {'object': 'dashboard', 'endpoints': ['GET /admin/dashboard']} has no 'steps' key. Keys: ['object', 'endpoints']. Scheduler expects flow.get('steps') with step objects.
+    assert 'steps' in {'object': 'dashboard', 'endpoints': ['GET /admin/dashboard']}
+C:\claw\Atoolkit\tests\test_business_graph.py:50: AssertionError: D1 FAIL: flow {'object': 'dashboard', 'endpoints': ['GET /admin/dashboard']} has no 'steps' key. Keys: ['object', 'endpoints']. Scheduler expects flow.get('steps') with step objects.
+E   AssertionError: D1 FAIL: flow steps is empty for flow {'object': 'dashboard', 'endpoints': ['GET /admin/dashboard']}
+    assert 0 > 0
+     +  where 0 = len([])
+C:\claw\Atoolkit\tests\test_business_graph.py:64: AssertionError: D1 FAIL: flow steps is empty for flow {'object': 'dashboard', 'endpoints': ['GET /admin/dashboard']}
+E   AssertionError: D4 FAIL: orchestrator.py never sets scheduler_stats in output dict.
+    assert (False or False)
+C:\claw\Atoolkit\tests\test_orchestrator_output.py:21: AssertionError: D4 FAIL: orchestrator.py never sets scheduler_stats in output dict.
+E   AssertionError: D4 FAIL: scheduler_stats not found in orchestrator.py
+    assert False
+C:\claw\Atoolkit\tests\test_orchestrator_output.py:33: AssertionError: D4 FAIL: scheduler_stats not found in orchestrator.py
+E   AssertionError: D5 FAIL: low_roi_advisory() never called in orchestrator.py. PLAN: LOW_ROI invalid if high-value nodes untested.
+    assert False
+C:\claw\Atoolkit\tests\test_orchestrator_output.py:42: AssertionError: D5 FAIL: low_roi_advisory() never called in orchestrator.py. PLAN: LOW_ROI invalid if high-value nodes untested.
+E   AssertionError: D6 FAIL: no code generates run_summary.md. PLAN Section 7 requires it.
+    assert False
+C:\claw\Atoolkit\tests\test_orchestrator_output.py:56: AssertionError: D6 FAIL: no code generates run_summary.md. PLAN Section 7 requires it.
+E   AssertionError: D6 FAIL: run_summary.md mentioned but no file write call found.
+    assert (False or False)
+C:\claw\Atoolkit\tests\test_orchestrator_output.py:73: AssertionError: D6 FAIL: run_summary.md mentioned but no file write call found.
+E   AssertionError: D2 FAIL: /api/refund value='medium', expected 'high'. BusinessGraph does not infer value field for sensitive endpoints.
+    assert 'medium' == 'high'
+      
+      - high
+      + medium
+C:\claw\Atoolkit\tests\test_scheduler_integration.py:32: AssertionError: D2 FAIL: /api/refund value='medium', expected 'high'. BusinessGraph does not infer value field for sensitive endpoints.
+E   AssertionError: D1 FAIL: _flow_completion_endpoints returned empty list. BusinessGraph.flows schema: ['object', 'endpoints']. Scheduler expects 'steps' key with endpoint objects.
+    assert 0 > 0
+     +  where 0 = len([])
+C:\claw\Atoolkit\tests\test_scheduler_integration.py:57: AssertionError: D1 FAIL: _flow_completion_endpoints returned empty list. BusinessGraph.flows schema: ['object', 'endpoints']. Scheduler expects 'steps' key with endpoint objects.
+=========================== short test summary info ===========================
+FAILED tests/test_blackboard_population.py::TestD3_BlackboardPopulation::test_domains_covered_is_populated
+FAILED tests/test_blackboard_population.py::TestD3_BlackboardPopulation::test_surface_index_is_populated
+FAILED tests/test_business_graph.py::TestD2_ValueField::test_endpoint_has_value_field
+FAILED tests/test_business_graph.py::TestD2_ValueField::test_value_is_valid_tier
+FAILED tests/test_business_graph.py::TestD2_ValueField::test_high_value_endpoints_exist
+FAILED tests/test_business_graph.py::TestD1_FlowsSchema::test_flows_have_steps_key
+FAILED tests/test_business_graph.py::TestD1_FlowsSchema::test_flow_steps_contain_endpoint
+FAILED tests/test_orchestrator_output.py::TestD4_SchedulerStats::test_scheduler_stats_in_result
+FAILED tests/test_orchestrator_output.py::TestD4_SchedulerStats::test_scheduler_stats_not_empty
+FAILED tests/test_orchestrator_output.py::TestD5_LowRoiAdvisory::test_low_roi_advisory_called
+FAILED tests/test_orchestrator_output.py::TestD6_RunSummaryMd::test_run_summary_generation
+FAILED tests/test_orchestrator_output.py::TestD6_RunSummaryMd::test_run_summary_write_call
+FAILED tests/test_scheduler_integration.py::TestD2_SchedulerHighValue::test_refund_before_orders_within_txn
+FAILED tests/test_scheduler_integration.py::TestD1_FlowCompletion::test_flow_completion_returns_endpoints
+=================== 14 failed, 3 passed, 1 skipped in 0.08s ===================

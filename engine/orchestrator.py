@@ -1499,7 +1499,7 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
             if verbose:
                 print(f"  [turn {turn}] ⚠ 流式中断已抢救: {repr(e)[:120]} → 收口（可 --resume 续）")
             out = _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
-                            candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph)
+                            candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph, run_scope=run_scope)
             out.update(status="interrupted", interrupted=True, error=repr(e)[:300])
             return out
         text = "".join(text_parts)
@@ -1588,12 +1588,12 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
             last_marker = marker.group(1)
             if not has_matrix:                                # 退化：无矩阵 → 旧行为，首个标记即结
                 return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
-                                 candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph)
+                                 candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph, run_scope=run_scope)
             # 有矩阵：VULN_FOUND/LOW_ROI 不立即 return。
             # NEED_INPUT/ERROR 视为「需人工/系统中断」→ 仍然立即收口（属终止②的人工/系统侧）。
             if last_marker in ("NEED_INPUT", "ERROR"):
                 return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
-                                 candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph)
+                                 candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph, run_scope=run_scope)
             # 否则：注入「继续下一未覆盖格」指令，进入下一轮（支柱 1 的机制化「继续测试」）
             nxt = state.next_untested()
             if nxt:
@@ -1610,7 +1610,7 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         if has_matrix and state.matrix_closed():
             if verbose: print(f"  [turn {turn}] ✅ 覆盖矩阵全格闭合 → 收口")
             return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
-                             candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph)
+                             candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph, run_scope=run_scope)
 
         if time.time() - last_progress > no_progress_timeout: # ⚙ 无进展切向（不终止，仅推动）
             state.inject_directive("无进展超时，立刻切换到下一未覆盖格，重读速查卡")
@@ -1623,7 +1623,7 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
     state.restart_with(summary="达到轮数上限，按已落盘证据与覆盖台账收口")
     return _conclude(last_marker, harvest_evidence(wd, authorized_hosts=authorized_hosts),
                      wd, state, authorized_hosts, max_turns, verify_fn,
-                     candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph)
+                     candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph, run_scope=run_scope)
 
 
 # ── Prompt 拼装（§4：约束放头尾，易变放中间）──────────────────────────────
@@ -1657,7 +1657,7 @@ def assemble_prompt(core_skill: str, authz: str, target: str,
 def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=None,
               candidate_ledger: "CandidateLedger | None" = None,
               cards: list[dict] | None = None,
-              graph=None, biz_graph=None) -> dict:
+              graph=None, biz_graph=None, run_scope=None) -> dict:
     """Guardian 质检所有报告 → 物理证据裁定终态（证据可翻案）；可选确定性重放复验。
     支柱 2：终态附带覆盖台账统计与负向留证数，让「测了什么/收口到哪」可见。
 
@@ -1755,6 +1755,19 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
             status = "incomplete"
         elif needs_cells:
             status = "needs_input"
+        # D5: LOW_ROI is invalid if high-value business graph nodes remain untested
+        if biz_graph is not None:
+            _cov_matrix: dict[str, Any] = {}
+            for s in coverage_ledger.surfaces:
+                _ep = s.get("endpoint", "")
+                if _ep:
+                    _cov_matrix[_ep] = {
+                        "tested": s.get("status") not in ("untested", "not_tested")
+                    }
+            if biz_graph.low_roi_advisory(_cov_matrix):
+                print("  [low_roi_advisory] high-value nodes remain untested, "
+                      "overriding LOW_ROI → incomplete")
+                status = "incomplete"
     gate_result = session_gate.get("result")
     if gate_result and gate_result != "pass":
         status = {
@@ -1848,6 +1861,13 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
         "hit_count": None,                          # 无 oracle；有 oracle 时由 run.py 算
         # v8.4: Fact-Intent Graph 统计
         "graph_stats": graph.stats() if graph else {},
+        # D4: scheduler run scope statistics
+        "scheduler_stats": {
+            "target_domains": run_scope.get("target_domains", []) if run_scope else [],
+            "must_test_count": len(run_scope.get("must_test", [])) if run_scope else 0,
+            "carryover_intents": len(run_scope.get("carryover_intents", [])) if run_scope else 0,
+            "surface_budget": run_scope.get("surface_budget", 0) if run_scope else 0,
+        },
         "state": asdict(state),
     }
     # v8.5: Cross-run blackboard write-back (Cairn architecture §9.7)
@@ -1896,11 +1916,67 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
     # v8.6: include graph and scheduler stats in output for summary.json
     if graph is not None:
         out["graph_stats"] = graph.stats()
+    # D3: populate domains_covered and surface_index from biz_graph
     if biz_graph is not None:
-        out["domains_coveraged"] = {
-            ep: meta.get("domains", [])
-            for ep, meta in biz_graph.endpoint_map.items()
+        _domain_stats: dict[str, dict[str, int]] = {}
+        for _ep, _meta in biz_graph.endpoint_map.items():
+            _ep_tested = any(
+                s.get("endpoint") == _ep and s.get("status") not in ("not_tested", None)
+                for s in coverage_ledger.surfaces
+            ) if coverage_ledger else False
+            for _dom in _meta.get("domains", []):
+                if _dom not in _domain_stats:
+                    _domain_stats[_dom] = {"tested": 0, "total": 0}
+                _domain_stats[_dom]["total"] += 1
+                if _ep_tested:
+                    _domain_stats[_dom]["tested"] += 1
+        out["domains_covered"] = _domain_stats
+        out["surface_index"] = {
+            _ep: {"domains": _meta.get("domains", []), "value": _meta.get("state_effect", "")}
+            for _ep, _meta in biz_graph.endpoint_map.items()
         }
+        # Write domains_covered / surface_index into blackboard
+        try:
+            _bb_final_path = pathlib.Path(wd).parent.parent / "blackboard.json"
+            if _bb_final_path.exists():
+                _bb_final = json.loads(_bb_final_path.read_text(encoding="utf-8"))
+                _bb_final["domains_covered"] = out["domains_covered"]
+                _bb_final["surface_index"] = out["surface_index"]
+                _bb_final_path.write_text(
+                    json.dumps(_bb_final, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+    # D6: generate run_summary.md in the project directory
+    _project_dir = pathlib.Path(wd).parent.parent
+    _run_summary_path = _project_dir / "run_summary.md"
+    _confirmed_count = len(findings)
+    _candidate_count = len(cand_list) if candidate_ledger else 0
+    _pending_intents = len(graph.get_pending_intents()) if graph else 0
+    _completed_intents = len([i for i in (graph.intents if graph else [])
+                              if i.get("status") == "completed"])
+    _deferred_intents = len([i for i in (graph.intents if graph else [])
+                             if i.get("status") == "deferred"])
+    _domains_summary = ", ".join(
+        f"{d}: {s['tested']}/{s['total']}" for d, s in out.get("domains_covered", {}).items()
+    ) or "N/A"
+    _surfaces_tested = sum(
+        1 for s in (coverage_ledger.surfaces if coverage_ledger else [])
+        if s.get("status") not in ("not_tested", None)
+    )
+    _run_session_id = pathlib.Path(wd).name
+    run_summary_md = (
+        f"# Run Summary\n"
+        f"- Session: {_run_session_id}\n"
+        f"- Date: {datetime.now(timezone.utc).isoformat()}\n"
+        f"- Surfaces tested: {_surfaces_tested}\n"
+        f"- Findings: {_confirmed_count} confirmed, {_candidate_count} candidate\n"
+        f"- Intents: {_pending_intents} pending, {_completed_intents} completed, {_deferred_intents} deferred\n"
+        f"- Domains covered: {_domains_summary}\n"
+    )
+    try:
+        _run_summary_path.write_text(run_summary_md, encoding="utf-8")
+    except Exception:
+        pass
     return out
 
 
