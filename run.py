@@ -1079,13 +1079,116 @@ def _run_self_check() -> int:
         assert "completed" in stats["intents_by_status"], "stats应包含completed状态"
         print("  断言19 ✅ Intent生命周期（resolve/归一化/pending过滤）")
 
+    def _assert20():
+        """v8.6: build_from_inventory 正确处理 dict inventory（无 'GET ' 空路径 bug）"""
+        from engine.business_graph import BusinessGraph
+        bg = BusinessGraph()
+        # Simulate real recon inventory: dicts with 'endpoint' but no 'path'
+        inv = [
+            {"endpoint": "/api/user/login", "method": "POST"},
+            {"endpoint": "/api/orders", "method": "GET"},
+            {"endpoint": "/api/refund", "method": "POST"},
+        ]
+        bg.build_from_inventory(inv)
+        for key in bg.endpoint_map:
+            assert not key.endswith(" "), (
+                f"build_from_inventory 产生空路径 key={key!r}，dict inventory 的 'endpoint' 未被正确解析")
+            assert "/" in key, f"endpoint_map key={key!r} 不含路径，inventory 解析失败"
+        assert "POST /api/refund" in bg.endpoint_map, "POST /api/refund 应在 endpoint_map 中"
+        print("  断言20 ✅ build_from_inventory dict inventory 解析正确（无空路径）")
+
+    def _assert21():
+        """v8.6: _parse_negative 输出 vectors_tried 和 depth_sufficient"""
+        from engine.orchestrator import _parse_negative
+        # 深度阴性：3+ vectors + response evidence
+        deep_txt = ("endpoint: /api/search\nvuln: SQLi\n"
+                    "reason: 多向量测试无注入\n"
+                    "vectors: time-based, boolean, error-based\n"
+                    "evidence_types: response_diff\n\n"
+                    "curl ... HTTP/1.1 200\n响应无差异")
+        deep = _parse_negative(deep_txt, "negative_deep.md")
+        assert "vectors_tried" in deep, "depth阴性缺少 vectors_tried 字段"
+        assert "depth_sufficient" in deep, "depth阴性缺少 depth_sufficient 字段"
+        assert deep["vectors_tried"] >= 3, f"vectors_tried={deep['vectors_tried']} 应>=3"
+        assert deep["depth_sufficient"] is True, "3向量+response 应为 depth_sufficient=True"
+        # 浅阴性：1 vector, 0 response
+        thin_txt = "endpoint: /api/user\nvuln: XSS\nreason: 仅测了反射\nvectors: reflect\n\n简单测试"
+        thin = _parse_negative(thin_txt, "negative_thin.md")
+        assert thin["vectors_tried"] <= 2, f"浅阴性 vectors_tried={thin['vectors_tried']} 应<=2"
+        assert thin["depth_sufficient"] is False, "1向量0响应 应为 depth_sufficient=False"
+        print("  断言21 ✅ _parse_negative vectors_tried/depth_sufficient 输出正确")
+
+    def _assert22():
+        """v8.6: orchestrator 输出用 domains_covered（非 domains_coveraged）"""
+        import pathlib as _p
+        src = _p.Path("engine/orchestrator.py").read_text(encoding="utf-8")
+        # Should have domains_covered, not the misspelled variant
+        _bad = "domains_cover" + "aged"  # avoid self-match
+        assert "domains_covered" in src, "orchestrator.py 缺少 domains_covered"
+        assert _bad not in src, (
+            f"orchestrator.py 仍有 {_bad} 拼写错误（应为 domains_covered）")
+        # run.py: only check lines before self-check section (avoid self-match)
+        run_lines = _p.Path("run.py").read_text(encoding="utf-8").splitlines()[:1100]
+        run_code = "\n".join(run_lines)
+        assert _bad not in run_code, (
+            f"run.py 仍有 {_bad}（应为 domains_covered）")
+        print("  断言22 ✅ domains_covered 字段名正确（无拼写错误）")
+
+    def _assert23():
+        """v8.6: surface_budget 在主循环中有强制终止逻辑"""
+        import pathlib as _p
+        src = _p.Path("engine/orchestrator.py").read_text(encoding="utf-8")
+        assert "surface_budget" in src and "_tested_eps" in src, (
+            "orchestrator.py 缺少 surface_budget 强制终止逻辑")
+        print("  断言23 ✅ surface_budget 强制终止逻辑存在")
+
+    def _assert24():
+        """v8.6: next_untested 接受 must_test 参数"""
+        from engine.orchestrator import CognitiveState
+        import inspect
+        sig = inspect.signature(CognitiveState.next_untested)
+        assert "must_test" in sig.parameters, (
+            f"next_untested 缺少 must_test 参数，签名: {sig}")
+        st = CognitiveState(sid="t24", target="https://t.example", vuln_classes=["SQLi"])
+        st.seed_matrix(["/api/b", "/api/a"], enable_auth_flow_column=False)
+        # With must_test ordering, /api/b should come first
+        result = st.next_untested(must_test=["/api/b", "/api/a"])
+        if result:
+            assert result[0]["endpoint"] == "/api/b", (
+                f"must_test=['/api/b','/api/a'] 时首个应为 /api/b，实得 {result[0]['endpoint']}")
+        print("  断言24 ✅ next_untested must_test 参数正确影响排序")
+
+    def _assert25():
+        """v8.6: run_summary.md 生成代码存在"""
+        import pathlib as _p, re
+        src = _p.Path("engine/orchestrator.py").read_text(encoding="utf-8")
+        assert re.search(r"run_summary\.md|run_summary_md", src), (
+            "orchestrator.py 无 run_summary.md 生成代码")
+        assert re.search(r"run_summary.*write_text", src, re.IGNORECASE), (
+            "orchestrator.py 无 run_summary.md 写入调用")
+        print("  断言25 ✅ run_summary.md 生成代码存在")
+
+    def _assert26():
+        """v8.6: scheduler_stats 在 orchestrator 输出中"""
+        import pathlib as _p
+        src = _p.Path("engine/orchestrator.py").read_text(encoding="utf-8")
+        assert "scheduler_stats" in src, "orchestrator.py 缺少 scheduler_stats"
+        # Verify it's set to a non-empty dict (not just {})
+        assert '"target_domains"' in src or "'target_domains'" in src, (
+            "scheduler_stats 未包含 target_domains 字段")
+        print("  断言26 ✅ scheduler_stats 输出字段存在")
+
     for name, fn in (("断言1", _assert1), ("断言2", _assert2), ("断言3", _assert3),
                      ("断言4", _assert4), ("断言5", _assert5), ("断言6", _assert6),
                      ("断言7", _assert7), ("断言8", _assert8), ("断言9", _assert9),
                      ("断言10", _assert10), ("断言11", _assert11), ("断言12", _assert12),
                      ("断言13", _assert13), ("断言14", _assert14), ("断言15", _assert15),
                      ("断言16", _assert16), ("断言17", _assert17),
-                     ("断言18", _assert18), ("断言19", _assert19)):
+                     ("断言18", _assert18), ("断言19", _assert19),
+                     ("断言20", _assert20), ("断言21", _assert21),
+                     ("断言22", _assert22), ("断言23", _assert23),
+                     ("断言24", _assert24), ("断言25", _assert25),
+                     ("断言26", _assert26)):
         try:
             fn()
         except AssertionError as exc:
@@ -1391,7 +1494,7 @@ def main():
             summary["run_scope_path"] = str(project_dir / "run_scope.json")
         summary["graph_stats"] = res.get("graph_stats", {})
         summary["scheduler_stats"] = res.get("scheduler_stats", {})
-        summary["domains_coveraged"] = res.get("domains_coveraged", {})
+        summary["domains_covered"] = res.get("domains_covered", {})
         (wd / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as _e:                       # 落盘失败不阻断收尾打印

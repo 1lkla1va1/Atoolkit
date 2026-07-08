@@ -424,9 +424,12 @@ class CognitiveState:
             for c in self.matrix.values()
         )
 
-    def next_untested(self, n: int = 8) -> list[dict]:
+    def next_untested(self, n: int = 8, must_test: list[str] | None = None) -> list[dict]:
         """高价值 surface 队列：浅阴性/next_actions 最先，高价值面其次，
-        已开工 feature 内未闭格优先。只排「建议顺序」，不改闭合判定。"""
+        已开工 feature 内未闭格优先。只排「建议顺序」，不改闭合判定。
+
+        v8.6: must_test 来自 scheduler 的优先级排序，排在前面的 endpoint 优先测试。"""
+        _must_order = {ep: i for i, ep in enumerate(must_test or [])}
         def _feat(c):
             return c.get("feature") or _feature_of(c["endpoint"])
         def _priority(c):
@@ -448,6 +451,7 @@ class CognitiveState:
                    if c["state"] not in (UNTESTED, SHALLOW_NEGATIVE)}
         todo.sort(key=lambda c: (
             _priority(c),
+            _must_order.get(c.get("endpoint", ""), 9999),  # v8.6: scheduler priority
             0 if _feat(c) in started else 1,
             _feat(c),
             c.get("endpoint", ""),
@@ -817,6 +821,8 @@ def _parse_negative(txt: str, path: str) -> dict:
         "reason": fm.get("reason", "已测，无可利用结果"),
         "file": path,
         "vectors": vectors,
+        "vectors_tried": len(vectors),
+        "depth_sufficient": len(vectors) >= 3 or response_count >= 2,
         "next_actions": next_actions,
         "evidence_types": evidence_types,
         "identities": identities,
@@ -1595,7 +1601,7 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                 return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
                                  candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph, run_scope=run_scope)
             # 否则：注入「继续下一未覆盖格」指令，进入下一轮（支柱 1 的机制化「继续测试」）
-            nxt = state.next_untested()
+            nxt = state.next_untested(must_test=run_scope.get("must_test") if run_scope else None)
             if nxt:
                 tip = "；".join(f"{c['endpoint']}×{c['vuln']}" for c in nxt)
                 state.inject_directive(f"已闭部分格，继续未覆盖格（自主选序）：{tip}")
@@ -1611,6 +1617,18 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
             if verbose: print(f"  [turn {turn}] ✅ 覆盖矩阵全格闭合 → 收口")
             return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
                              candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph, run_scope=run_scope)
+
+        # v8.6: surface_budget enforcement — stop when tested endpoints >= budget
+        if surface_budget and surface_budget > 0 and has_matrix:
+            _tested_eps = set()
+            for _c in state.matrix.values():
+                if _c["state"] not in (UNTESTED,):
+                    _tested_eps.add(_c.get("endpoint", ""))
+            if len(_tested_eps) >= surface_budget:
+                if verbose: print(f"  [turn {turn}] ✅ surface_budget={surface_budget} reached "
+                                  f"({len(_tested_eps)} endpoints tested) → 收口")
+                return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
+                                 candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph, run_scope=run_scope)
 
         if time.time() - last_progress > no_progress_timeout: # ⚙ 无进展切向（不终止，仅推动）
             state.inject_directive("无进展超时，立刻切换到下一未覆盖格，重读速查卡")

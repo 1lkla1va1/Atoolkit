@@ -124,7 +124,7 @@ class BusinessGraph:
         for ep in endpoints:
             if isinstance(ep, dict):
                 method = ep.get("method", "GET").upper()
-                path = ep.get("path", "")
+                path = ep.get("path", "") or ep.get("endpoint", "")
             else:
                 # Parse "METHOD /path" or just "/path"
                 parts = str(ep).strip().split(None, 1)
