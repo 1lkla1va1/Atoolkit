@@ -1164,6 +1164,17 @@ def main():
     ap.add_argument("--oracle", default="",
                     help="可选 oracle 文件(JSON/YAML/CSV/PHP array)；存在则用 engine.benchmark_eval "
                          "算 hit/total（oracle 命中 confirmed surface 数）并打印")
+    # v8.6: project-level state layout
+    ap.add_argument("--project", default="",
+                    help="v8.6：项目名（目录 slug）。指定后状态落盘到 runs/targets/<slug>/sessions/<sid>/；"
+                         "省略则从 target host 派生，或退回旧 runs/<sid>/ 布局")
+    ap.add_argument("--target-domains", default="",
+                    help="v8.6：逗号分隔的目标域（auth,txn,idor,file,business）。"
+                         "域内 surface 优先测试，域外不丢弃仅降优先级")
+    ap.add_argument("--surface-budget", type=int, default=0,
+                    help="v8.6：本次 run 最多测试 surface 数（0=不限）")
+    ap.add_argument("--intent-budget", type=int, default=0,
+                    help="v8.6：本次 run 最多追踪 intent 数（0=不限）")
     args = ap.parse_args()
 
     # --self-check：临时生成 fixture 跑断言，不接模型/网络，独立于 --target/--authz。
@@ -1175,8 +1186,19 @@ def main():
 
     # 会话目录与落盘（runs/ 已被 .gitignore）
     sid = args.sid or time.strftime("sess-%Y%m%d-%H%M%S")
-    wd = ROOT / "runs" / sid
+    # v8.6: project-level state layout
+    _project_slug = args.project or (
+        host_of(args.target).replace(".", "_") if args.target else "")
+    if _project_slug:
+        project_dir = ROOT / "runs" / "targets" / _project_slug
+        project_dir.mkdir(parents=True, exist_ok=True)
+        wd = project_dir / "sessions" / sid
+    else:
+        project_dir = None
+        wd = ROOT / "runs" / sid
     wd.mkdir(parents=True, exist_ok=True)
+    # v8.6: parse target-domains
+    _target_domains = [d.strip() for d in args.target_domains.split(",") if d.strip()] if args.target_domains else None
     authz = (pathlib.Path(args.authz).read_text(encoding="utf-8")
              if pathlib.Path(args.authz).exists() else args.authz)
     (wd / "authz.md").write_text(authz, encoding="utf-8")
@@ -1329,6 +1351,13 @@ def main():
         run_kwargs["lens"] = [x.strip() for x in args.lens.split(",") if x.strip()]
     if "exclude_endpoints" in inspect.signature(run_session).parameters:
         run_kwargs["exclude_endpoints"] = args.exclude_endpoint
+    # v8.6: project-level state — domain scope + budgets
+    if _target_domains:
+        run_kwargs["target_domains"] = _target_domains
+    if args.surface_budget:
+        run_kwargs["surface_budget"] = args.surface_budget
+    if args.intent_budget:
+        run_kwargs["intent_budget"] = args.intent_budget
     res = run_session(adapter, **run_kwargs)
     # 硬门：正式覆盖跑必须同时有 inventory 与 ledger；否则终态强制 incomplete。
     led_stats = (res.get("coverage_ledger") or {}).get("stats") or {}
@@ -1354,6 +1383,15 @@ def main():
             "final_report_status": res.get("final_report_status", "not_generated"),
             "structured_findings": res.get("structured_findings", {"accepted": 0, "rejected": 0}),
         }
+        # v8.6: project-level state paths and stats
+        if project_dir:
+            summary["project_path"] = str(project_dir)
+            summary["blackboard_path"] = str(project_dir / "blackboard.json")
+            summary["business_graph_path"] = str(project_dir / "business_graph.json")
+            summary["run_scope_path"] = str(project_dir / "run_scope.json")
+        summary["graph_stats"] = res.get("graph_stats", {})
+        summary["scheduler_stats"] = res.get("scheduler_stats", {})
+        summary["domains_coveraged"] = res.get("domains_coveraged", {})
         (wd / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as _e:                       # 落盘失败不阻断收尾打印

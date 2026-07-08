@@ -34,6 +34,10 @@ class CodexModelUnsupportedError(CodexExecError):
 class CodexAdapter:
     name = "codex"
 
+    # Windows 上 npm 全局安装的 codex 是 shell 脚本（非 .exe），
+    # Python subprocess.Popen 需要 .cmd 包装器才能执行。
+    _codex_bin = "codex.cmd" if os.name == "nt" else "codex"
+
     def __init__(self, model: str = "gpt-5.5", workdir: str = ".",
                  allow_hosts: list[str] | None = None):
         self.model = model
@@ -45,7 +49,7 @@ class CodexAdapter:
     def run(self, prompt: str, *, session_id: str) -> Iterator[str]:
         wd_abs = os.path.abspath(self.workdir)
         cmd = [
-            "codex", "exec",
+            self._codex_bin, "exec",
             "--skip-git-repo-check",             # 工作区可能非 git 仓库（runs/ 下）
             "-m", self.model,
             "--sandbox", "workspace-write",      # 硬约束地板：只能写工作区

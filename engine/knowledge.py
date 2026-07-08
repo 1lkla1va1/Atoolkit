@@ -22,7 +22,21 @@ NEGATIVE_WITH_EVIDENCE = "negative_with_evidence"
 SHALLOW_NEGATIVE = "shallow_negative"
 
 _DEFAULT_MISSING = "补足至少 3 个独立探测向量，并保留响应证据"
-_CARD_DIR = pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "cards"
+def _get_card_dir() -> pathlib.Path:
+    """Resolve knowledge/cards directory, with fallback when __file__ is unavailable."""
+    try:
+        return pathlib.Path(__file__).resolve().parent.parent / "knowledge" / "cards"
+    except NameError:
+        # Fallback: search upward from CWD for the knowledge/cards directory
+        cwd = pathlib.Path.cwd()
+        candidate = cwd / "knowledge" / "cards"
+        if candidate.exists():
+            return candidate
+        for parent in cwd.parents:
+            candidate = parent / "knowledge" / "cards"
+            if candidate.exists():
+                return candidate
+        return cwd / "knowledge" / "cards"  # last resort, load_cards returns [] if missing
 
 # v6.1: 漏洞类 → 风险维映射（payload-free，与 ledger.VULN_RISK_MAP 同意图但自洽，
 # 避免 knowledge ↔ ledger 循环导入）。用于 risk_dimensions_for 把卡的 vuln_classes
@@ -210,7 +224,7 @@ def _validate_card(card: dict, *, source: pathlib.Path | None = None) -> dict:
 
 def load_cards(cards_dir: str | pathlib.Path | None = None) -> list[dict]:
     """Load knowledge cards from JSON files, sorted for deterministic prompts."""
-    base = pathlib.Path(cards_dir) if cards_dir is not None else _CARD_DIR
+    base = pathlib.Path(cards_dir) if cards_dir is not None else _get_card_dir()
     if not base.exists():
         return []
     cards: list[dict] = []

@@ -26,10 +26,13 @@ except ImportError:
 
 class IntentStatus(str, Enum):
     PENDING = "pending"
+    CLAIMED = "claimed"             # v8.6: actively being worked on this turn
     IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"        # executed, produced new Fact(s)
-    ABANDONED = "abandoned"        # executed but no value
-    BLOCKED = "blocked"            # prerequisite not met
+    COMPLETED = "completed"         # executed, produced new Fact(s)
+    ABANDONED = "abandoned"         # executed but no value
+    BLOCKED = "blocked"             # prerequisite not met
+    DEFERRED = "deferred"           # v8.6: postponed with structured reason
+    SUPERSEDED = "superseded"       # v8.6: replaced by a better Intent
 
 
 class IntentSource(str, Enum):
@@ -151,13 +154,34 @@ class FactIntentGraph:
         pending.sort(key=lambda x: priority_order.get(x.get("priority", "low"), 9))
         return pending[:limit]
 
-    def resolve_intent(self, intent_id, status, summary="", spawned_facts=None):
+    def resolve_intent(self, intent_id, status, summary="", spawned_facts=None,
+                       *, reason="", attempts=0):
+        """Resolve an Intent with status, summary, and optional structured reason.
+
+        Structured reasons (for deferred/blocked):
+          missing_account, missing_object_state, human_verification_needed,
+          insufficient_traffic, no_observable_signal.
+        """
         for intent in self.intents:
             if intent.get("intent_id") == intent_id:
                 intent["status"] = status
                 intent["outcome_summary"] = summary
                 intent["spawned_facts"] = spawned_facts or []
                 intent["resolved_at"] = datetime.now(timezone.utc).isoformat()
+                if reason:
+                    intent["defer_reason"] = reason
+                if attempts:
+                    intent["attempts"] = attempts
+                return intent
+        return None
+
+    def claim_intent(self, intent_id):
+        """Mark an Intent as claimed (actively being worked on)."""
+        for intent in self.intents:
+            if intent.get("intent_id") == intent_id:
+                intent["status"] = "claimed"
+                intent.setdefault("attempts", 0)
+                intent["attempts"] += 1
                 return intent
         return None
 
@@ -517,8 +541,9 @@ def merge_run_to_blackboard(blackboard_path: str, run_graph: FactIntentGraph,
     """Merge a run's output into the project-level blackboard at run end."""
     bb_path = pathlib.Path(blackboard_path)
     bb = json.loads(bb_path.read_text(encoding="utf-8")) if bb_path.exists() else {
-        "schema_version": "1.0", "facts": [], "intents": [],
+        "schema_version": "2.0", "facts": [], "intents": [],
         "negatives": [], "dead_ends": [], "discovered_endpoints": [],
+        "domains_covered": {}, "surface_index": {},
     }
 
     # -- merge facts --------------------------------------------------------
@@ -597,9 +622,12 @@ def merge_run_to_blackboard(blackboard_path: str, run_graph: FactIntentGraph,
                 f"\u8870\u51cf\u653e\u5f03: {runs_since} run \u672a\u6267\u884c, effective={effective:.2f}")
 
     # -- update metadata ----------------------------------------------------
+    bb["schema_version"] = "2.0"
     bb["total_runs"] = bb.get("total_runs", 0) + 1
     bb["last_run"] = run_id
     bb["last_updated"] = datetime.now(timezone.utc).isoformat()
+    bb.setdefault("domains_covered", {})
+    bb.setdefault("surface_index", {})
 
     bb_path.parent.mkdir(parents=True, exist_ok=True)
     bb_path.write_text(json.dumps(bb, ensure_ascii=False, indent=2), encoding="utf-8")
