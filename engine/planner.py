@@ -88,8 +88,18 @@ def _split_method(method: Any) -> list[str]:
 def _endpoint_from_item(item: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if isinstance(item, dict):
         endpoint = item.get("endpoint") or item.get("path") or item.get("url") or ""
-        return str(endpoint).strip(), dict(item)
-    return str(item or "").strip(), {}
+        meta = dict(item)
+    else:
+        endpoint = str(item or "").strip()
+        meta = {}
+    text = str(endpoint).strip()
+    parts = text.split(None, 1)
+    if len(parts) == 2 and parts[0].upper() in {
+        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
+    }:
+        meta.setdefault("method", parts[0].upper())
+        text = parts[1]
+    return text, meta
 
 
 def extract_params(endpoint: str, meta: dict[str, Any] | None = None) -> list[str]:

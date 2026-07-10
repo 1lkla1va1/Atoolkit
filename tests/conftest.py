@@ -8,6 +8,7 @@ sys.path.insert(0, str(ROOT))
 def sample_endpoints():
     return [
         "POST /api/refund",
+        "GET /api/refund",   # rc3: pairs with POST /api/refund → 2-step flow
         "POST /api/login",
         "POST /api/register",
         "GET /api/users",

@@ -12,6 +12,12 @@ import re
 from typing import Any
 
 
+try:
+    from .surface_key import canonical_surface_key
+except ImportError:
+    from surface_key import canonical_surface_key
+
+
 # ---------------------------------------------------------------------------
 # Keyword / pattern tables
 # ---------------------------------------------------------------------------
@@ -120,22 +126,23 @@ class BusinessGraph:
         endpoints: list[str | dict[str, str]],
         target_domains: list[str] | None = None,
     ) -> None:
-        """Seed the graph from inventory. Accepts strings ("POST /api/x") or dicts."""
+        """Seed the graph from inventory. Accepts strings ("POST /api/x") or dicts.
+
+        All endpoint_map keys are canonicalized via canonical_surface_key so
+        downstream consumers (scheduler, planner) see a consistent
+        ``"METHOD /path"`` form — never a bare path or ``"GET "`` (trailing space).
+        """
         for ep in endpoints:
-            if isinstance(ep, dict):
-                method = ep.get("method", "GET").upper()
-                path = ep.get("path", "") or ep.get("endpoint", "")
-            else:
-                # Parse "METHOD /path" or just "/path"
-                parts = str(ep).strip().split(None, 1)
-                if len(parts) == 2 and parts[0].upper() in _HTTP_METHODS:
-                    method, path = parts[0].upper(), parts[1]
-                else:
-                    method, path = "GET", str(ep).strip()
-            key = f"{method} {path}"
+            key = canonical_surface_key(ep)
+            if not key:
+                continue
+            # Extract path (without method prefix) for inference helpers.
+            _method, _, path = key.partition(" ")
+            method = _method
+            # target_domains is a scheduling hint, never a graph filter.  A
+            # cross-domain endpoint must keep every inferred domain so later
+            # runs can follow Fact-Intent chains outside the current focus.
             domains = _infer_domains(path)
-            if target_domains:
-                domains = [d for d in domains if d in target_domains] or domains
             roles = _infer_roles(path)
             obj = _infer_object(path)
             state = _infer_state_effect(method, path)
@@ -161,7 +168,7 @@ class BusinessGraph:
         """Update the graph when a confirmed Fact is recorded."""
         method = fact_data.get("method", "GET").upper()
         endpoint = fact_data.get("endpoint", "")
-        key = f"{method} {endpoint}"
+        key = canonical_surface_key({"method": method, "endpoint": endpoint})
 
         entry = self.endpoint_map.get(key)
         if entry is None:

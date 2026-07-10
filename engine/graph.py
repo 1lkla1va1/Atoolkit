@@ -16,8 +16,10 @@ from typing import Any
 
 try:
     from .vuln_classes import norm_vc, vc_matches, is_chainable
+    from .surface_key import canonical_surface_key
 except ImportError:
     from vuln_classes import norm_vc, vc_matches, is_chainable
+    from surface_key import canonical_surface_key
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +187,17 @@ class FactIntentGraph:
                 return intent
         return None
 
+    def release_intent(self, intent_id, summary=""):
+        """Return a claimed Intent to pending for another evidence attempt."""
+        for intent in self.intents:
+            if intent.get("intent_id") == intent_id:
+                intent["status"] = "pending"
+                if summary:
+                    intent["outcome_summary"] = summary
+                intent["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+                return intent
+        return None
+
     def merge_graph(self, other):
         id_map = {}
         for fact in other.facts:
@@ -264,6 +277,7 @@ class FactIntentGraph:
             if neg.get("depth_sufficient"):
                 skip_surfaces.append({
                     "endpoint": neg["endpoint"],
+                    "method": neg.get("method", ""),
                     "param": neg.get("param", ""),
                     "vuln_class": neg.get("vuln_class", ""),
                     "status": "not_vulnerable",
@@ -272,6 +286,7 @@ class FactIntentGraph:
         for de in blackboard.get("dead_ends", []):
             skip_surfaces.append({
                 "endpoint": de["endpoint"],
+                "method": de.get("method", ""),
                 "param": de.get("param", ""),
                 "status": "not_vulnerable",
                 "reason": f"dead end: {de.get('refutation', '')}",
@@ -547,39 +562,66 @@ def merge_run_to_blackboard(blackboard_path: str, run_graph: FactIntentGraph,
     }
 
     # -- merge facts --------------------------------------------------------
-    existing_fact_keys = {
-        (f.get("endpoint"), f.get("vuln_class"))
-        for f in bb.get("facts", [])
-    }
+    def _fact_key(f):
+        return (
+            canonical_surface_key({
+                "endpoint": f.get("endpoint", ""),
+                "method": f.get("method", "GET"),
+            }),
+            norm_vc(f.get("vuln_class", "")),
+            str(f.get("affected_role", "")),
+        )
+
+    existing_facts = {_fact_key(f): f for f in bb.get("facts", [])}
+    fact_id_map = {str(f.get("fact_id", "")): str(f.get("fact_id", ""))
+                   for f in bb.get("facts", []) if f.get("fact_id")}
     for fact in run_graph.facts:
         if fact.get("source_type") != "confirmed":
             continue
-        key = (fact.get("endpoint"), fact.get("vuln_class"))
-        if key not in existing_fact_keys:
-            fact_copy = dict(fact)
+        key = _fact_key(fact)
+        old_id = str(fact.get("fact_id", ""))
+        if key in existing_facts:
+            if old_id:
+                fact_id_map[old_id] = str(existing_facts[key].get("fact_id", old_id))
+        else:
+            fact_copy = {k: v for k, v in fact.items() if not str(k).startswith("_")}
             fact_copy["fact_id"] = f"bb_fact_{len(bb['facts']) + 1:03d}"
             fact_copy["source_run"] = run_id
             bb["facts"].append(fact_copy)
+            existing_facts[key] = fact_copy
+            if old_id:
+                fact_id_map[old_id] = fact_copy["fact_id"]
 
     # -- merge intents (update status) --------------------------------------
-    existing_intent_keys = {
-        (i.get("source_fact_id"), i.get("description"))
-        for i in bb.get("intents", [])
-    }
+    def _intent_key(i):
+        return (
+            str(i.get("source_fact_id", "")),
+            str(i.get("description", "")),
+            str(i.get("vuln_class", "")),
+            canonical_surface_key(i.get("target_endpoint", ""))
+            if i.get("target_endpoint") else "",
+        )
+
     for intent in run_graph.intents:
-        key = (intent.get("source_fact_id"), intent.get("description"))
-        if key in existing_intent_keys:
-            # update existing intent's status
-            for existing in bb["intents"]:
-                if (existing.get("source_fact_id") == intent.get("source_fact_id")
-                        and existing.get("description") == intent.get("description")):
-                    existing["status"] = intent.get("status", existing.get("status"))
-                    existing["outcome_summary"] = intent.get("outcome_summary", "")
-                    break
+        intent_copy = {k: v for k, v in intent.items() if not str(k).startswith("_")}
+        source_id = str(intent_copy.get("source_fact_id", ""))
+        intent_copy["source_fact_id"] = fact_id_map.get(source_id, source_id)
+        by_id = next((i for i in bb.get("intents", [])
+                      if i.get("intent_id") == intent_copy.get("intent_id")), None)
+        by_key = next((i for i in bb.get("intents", [])
+                       if _intent_key(i) == _intent_key(intent_copy)), None)
+        existing = by_id or by_key
+        if existing is not None:
+            stable_id = existing.get("intent_id")
+            created_in_run = existing.get("created_in_run")
+            existing.update(intent_copy)
+            existing["intent_id"] = stable_id
+            if created_in_run:
+                existing["created_in_run"] = created_in_run
         else:
-            intent_copy = dict(intent)
             intent_copy["intent_id"] = f"bb_intent_{len(bb['intents']) + 1:03d}"
             intent_copy["created_in_run"] = run_id
+            intent_copy.setdefault("runs_without_execution", 0)
             bb["intents"].append(intent_copy)
 
     # -- merge negatives -----------------------------------------------------
@@ -600,8 +642,9 @@ def merge_run_to_blackboard(blackboard_path: str, run_graph: FactIntentGraph,
             bb.setdefault("negatives", []).append(neg_copy)
 
     # -- Intent decay -------------------------------------------------------
-    # Decay formula: effective_priority = base_priority * 0.9^(runs_without_execution)
-    # Threshold 0.5: low ~7 runs / medium ~13 runs / high ~17 runs -> auto-abandoned
+    # Never infer run age from the spelling of run_id: the public default is
+    # sess-YYYYMMDD-HHMMSS and callers may provide any --sid.  Persist an
+    # explicit counter instead.
     DECAY_FACTOR = 0.9
     ABANDON_THRESHOLD = 0.5  # priority_score < this -> abandoned
     PRIO_BASE = {"high": 3.0, "medium": 2.0, "low": 1.0}
@@ -609,11 +652,10 @@ def merge_run_to_blackboard(blackboard_path: str, run_graph: FactIntentGraph,
         if intent.get("status") != "pending":
             continue
         if intent.get("created_in_run", "") == run_id:
+            intent["runs_without_execution"] = 0
             continue  # intents created this run are not decayed
-        runs_since = bb.get("total_runs", 0) - int(
-            intent.get("created_in_run", "run_000").replace("run_", "") or 0)
-        if runs_since < 1:
-            runs_since = 1
+        runs_since = int(intent.get("runs_without_execution", 0) or 0) + 1
+        intent["runs_without_execution"] = runs_since
         base_score = PRIO_BASE.get(intent.get("priority", "low"), 1.0)
         effective = base_score * (DECAY_FACTOR ** runs_since)
         if effective < ABANDON_THRESHOLD:

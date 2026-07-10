@@ -9,22 +9,60 @@ from __future__ import annotations
 import json
 import pathlib
 
+try:
+    from .surface_key import canonical_surface_key, is_canonical
+except ImportError:
+    from surface_key import canonical_surface_key, is_canonical
+
 _PRIORITY_SCORE = {"high": 0, "medium": 1, "low": 2}
+_DOMAIN_SEQUENCE = ["auth", "txn", "idor", "input", "admin", "file", "info"]
+
+# Default vuln classes used to expand surfaces into cells when no explicit
+# vuln_class list is provided to compute_run_scope.
+_DEFAULT_VC = ["未授权访问", "越权/IDOR", "SQLi", "XSS", "SSRF",
+               "命令执行/RCE", "文件读取/穿越", "CSRF", "业务逻辑"]
 
 
 # -- Internal helpers -------------------------------------------------------
 
+def _canonicalize_set(items) -> set[str]:
+    """Canonicalize an iterable of endpoint-like values into a set of surface keys."""
+    out: set[str] = set()
+    for it in items:
+        if isinstance(it, dict):
+            ep = it.get("endpoint", "") or it.get("path", "") or it.get("url", "")
+            m = it.get("method", "")
+        else:
+            ep = str(it or "")
+            m = ""
+        if not ep:
+            continue
+        ck = canonical_surface_key({"endpoint": ep, "method": m} if m else ep)
+        if ck:
+            out.add(ck)
+    return out
+
+
 def _endpoints_in_blackboard(bb: dict) -> set[str]:
-    """Return the set of endpoint strings already recorded in the blackboard."""
+    """Return the set of canonical surface keys already recorded in the blackboard."""
     eps: set[str] = set()
     for fact in bb.get("facts", []):
-        if ep := fact.get("endpoint", ""):
-            eps.add(ep)
+        ck = canonical_surface_key({"endpoint": fact.get("endpoint", ""),
+                                     "method": fact.get("method", "GET")})
+        if ck:
+            eps.add(ck)
     for neg in bb.get("negatives", []):
-        if ep := neg.get("endpoint", ""):
-            eps.add(ep)
+        ck = canonical_surface_key({"endpoint": neg.get("endpoint", ""),
+                                     "method": neg.get("method", "GET")})
+        if ck:
+            eps.add(ck)
     for ep in bb.get("discovered_endpoints", []):
-        eps.add(ep if isinstance(ep, str) else ep.get("endpoint", ""))
+        if isinstance(ep, dict):
+            ck = canonical_surface_key(ep)
+        else:
+            ck = canonical_surface_key(str(ep))
+        if ck:
+            eps.add(ck)
     return eps
 
 def _high_value_endpoints(bg: dict, target_domains: list[str]) -> list[str]:
@@ -52,22 +90,24 @@ def _flow_completion_endpoints(bg: dict, bb: dict) -> list[str]:
     needed: list[str] = []
     for flow in bg.get("flows", []):
         steps = flow.get("steps", [])
-        tested_count = sum(1 for s in steps if s.get("endpoint", "") in tested)
+        tested_count = sum(1 for s in steps
+                           if canonical_surface_key(s.get("endpoint", "")) in tested)
         if 0 < tested_count < len(steps):
             for s in steps:
-                ep = s.get("endpoint", "")
-                if ep and ep not in tested and ep not in needed:
-                    needed.append(ep)
+                ck = canonical_surface_key(s.get("endpoint", ""))
+                if ck and ck not in tested and ck not in needed:
+                    needed.append(ck)
     return needed
 
 def _shallow_negatives(bb: dict) -> list[str]:
-    """Endpoints from negatives where depth_sufficient=False."""
+    """Canonical surface keys from negatives where depth_sufficient=False."""
     result: list[str] = []
     for neg in bb.get("negatives", []):
         if not neg.get("depth_sufficient", True):
-            ep = neg.get("endpoint", "")
-            if ep and ep not in result:
-                result.append(ep)
+            ck = canonical_surface_key({"endpoint": neg.get("endpoint", ""),
+                                         "method": neg.get("method", "GET")})
+            if ck and ck not in result:
+                result.append(ck)
     return result
 
 def _carryover_intents(bb: dict) -> list[dict]:
@@ -75,6 +115,27 @@ def _carryover_intents(bb: dict) -> list[dict]:
     return [{"intent_id": i.get("intent_id", ""), "priority": i.get("priority", "high")}
             for i in bb.get("intents", [])
             if i.get("status") == "pending" and i.get("priority") == "high"]
+
+
+def select_target_domains(blackboard: dict, requested: list[str] | None = None) -> list[str]:
+    """Choose the next advisory domain focus from cumulative coverage."""
+    if requested:
+        return list(dict.fromkeys(requested))
+    covered = (blackboard or {}).get("domains_covered", {}) or {}
+    if not covered:
+        return ["auth", "txn"]
+    partial = []
+    for domain, stats in covered.items():
+        total = int((stats or {}).get("total", 0) or 0)
+        tested = int((stats or {}).get("tested", 0) or 0)
+        if total and tested < total:
+            partial.append((tested / total, _DOMAIN_SEQUENCE.index(domain)
+                            if domain in _DOMAIN_SEQUENCE else 99, domain))
+    if partial:
+        partial.sort()
+        return [domain for _, _, domain in partial[:2]]
+    unseen = [domain for domain in _DOMAIN_SEQUENCE if domain not in covered]
+    return unseen[:2] or ["auth", "txn"]
 
 # -- Core scheduling function -----------------------------------------------
 
@@ -85,6 +146,7 @@ def compute_run_scope(
     target_domains: list[str],
     surface_budget: int = 80,
     intent_budget: int = 15,
+    vuln_classes: list[str] | None = None,
 ) -> dict:
     """Compute the run scope: which surfaces to test and in what order.
 
@@ -93,25 +155,27 @@ def compute_run_scope(
     """
     bb = blackboard or {}
     bg = business_graph or {}
-    target_domains = target_domains or []
+    target_domains = select_target_domains(bb, target_domains)
     known_eps = _endpoints_in_blackboard(bb)
 
-    # Normalize inventory: accept both strings and dicts
-    inv_eps = []
+    # Normalize inventory: accept both strings and dicts → canonical surface keys
+    inv_eps: list[str] = []
     for item in (inventory or []):
-        if isinstance(item, dict):
-            inv_eps.append(item.get("endpoint", ""))
-        else:
-            inv_eps.append(str(item))
+        ck = canonical_surface_key(item)
+        if ck:
+            inv_eps.append(ck)
+    inv_set = set(inv_eps)
 
     # Tier 1: high-priority pending intents (carried over)
     carryover = _carryover_intents(bb)
     # Tier 2: high-value target-domain surfaces
-    biz_surfaces = _high_value_endpoints(bg, target_domains)
+    biz_surfaces = [ep for ep in _high_value_endpoints(bg, target_domains)
+                    if ep in inv_set]
     # Tier 3: flow completion surfaces
-    flow_surfaces = _flow_completion_endpoints(bg, bb)
+    flow_surfaces = [ep for ep in _flow_completion_endpoints(bg, bb)
+                     if ep in inv_set]
     # Tier 4: shallow negatives with signal
-    shallow_negs = _shallow_negatives(bb)
+    shallow_negs = [ep for ep in _shallow_negatives(bb) if ep in inv_set]
     # Tier 5: newly discovered endpoints (in inventory, not in bb)
     new_eps = [ep for ep in inv_eps if ep and ep not in known_eps]
     # Tier 6: low-value remaining coverage
@@ -132,6 +196,28 @@ def compute_run_scope(
     for batch in (biz_surfaces, flow_surfaces, shallow_negs, new_eps, remaining):
         _add(batch)
 
+    # Hard invariant: every must_test entry must be canonical "METHOD /path".
+    # This is the contract that prevents bare paths (e.g. "/api/refund") from
+    # mixing with canonical keys in downstream budget/match logic.
+    _bad = [k for k in must_test if not is_canonical(k)]
+    if _bad:
+        # Defensive: canonicalize stragglers rather than silently emitting
+        # non-canonical keys.  This should not trigger if helpers are correct.
+        must_test = [canonical_surface_key(k) if not is_canonical(k) else k
+                     for k in must_test]
+
+    # Product budget contract: surface_budget counts canonical METHOD/path
+    # surfaces.  Every vuln-class cell belonging to an admitted surface is
+    # authorized; otherwise a budget of N would accidentally mean "N columns
+    # of the first endpoint" rather than N attack surfaces.
+    vuln_classes = list(vuln_classes or _DEFAULT_VC)
+    all_cells: list[str] = []
+    for sk in must_test:
+        for vc in vuln_classes:
+            all_cells.append(f"{sk} × {vc}")
+    surface_cell_total = len(all_cells)
+    must_test_cells = all_cells
+
     # Reason string
     if carryover:
         reason = "highest high-value untested domain count"
@@ -148,10 +234,15 @@ def compute_run_scope(
 
     return {
         "target_domains": target_domains,
+        "excluded_domains": [d for d in _DOMAIN_SEQUENCE if d not in target_domains],
         "surface_budget": surface_budget,
         "intent_budget": intent_budget,
         "must_test": must_test,
-        "carryover_intents": carryover[:intent_budget],
+        "budget_unit": "surface",
+        "must_test_cells": must_test_cells,
+        "surface_cell_total": surface_cell_total,
+        "carryover_intents": (carryover[:intent_budget]
+                              if intent_budget and intent_budget > 0 else carryover),
         "reason": reason,
     }
 

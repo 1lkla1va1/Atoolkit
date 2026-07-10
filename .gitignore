@@ -19,7 +19,7 @@ __pycache__/
 # 本地设计/说明/测试材料（核心运行不依赖，不随运行提交上传）
 # design/ 下默认全部忽略，仅放出 迭代方案/ 和 评估方案/ 两类文档
 README.md
-CHANGELOG.md
+# Release changes are part of the runtime contract and must be reviewable.
 design/*
 !design/迭代方案/
 !design/评估方案/

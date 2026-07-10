@@ -16,7 +16,7 @@
 换模型：改 --model 即可；换运行时：把 CodexAdapter 换成别的 ModelAdapter（本文件 1 处）。
 """
 from __future__ import annotations
-import argparse, inspect, sys, time, re, pathlib, json
+import argparse, inspect, sys, time, re, pathlib, json, shutil
 from fnmatch import fnmatch
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -31,6 +31,12 @@ from engine.verify import (verify_idor, extract_poc, urllib_transport,  # noqa: 
 def host_of(url: str) -> str:
     m = re.match(r"https?://([^/:]+)", url)
     return m.group(1) if m else url
+
+
+def safe_project_slug(value: str) -> str:
+    """Return a path-safe project slug; never allow project path traversal."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "")).strip("._-")
+    return slug or "target"
 
 
 def build_verify_fn(identities: dict, victim_marker: str, hosts: list[str]):
@@ -1119,64 +1125,306 @@ def _run_self_check() -> int:
         print("  断言21 ✅ _parse_negative vectors_tried/depth_sufficient 输出正确")
 
     def _assert22():
-        """v8.6: orchestrator 输出用 domains_covered（非 domains_coveraged）"""
-        import pathlib as _p
-        src = _p.Path("engine/orchestrator.py").read_text(encoding="utf-8")
-        # Should have domains_covered, not the misspelled variant
-        _bad = "domains_cover" + "aged"  # avoid self-match
-        assert "domains_covered" in src, "orchestrator.py 缺少 domains_covered"
-        assert _bad not in src, (
-            f"orchestrator.py 仍有 {_bad} 拼写错误（应为 domains_covered）")
-        # run.py: only check lines before self-check section (avoid self-match)
-        run_lines = _p.Path("run.py").read_text(encoding="utf-8").splitlines()[:1100]
-        run_code = "\n".join(run_lines)
-        assert _bad not in run_code, (
-            f"run.py 仍有 {_bad}（应为 domains_covered）")
-        print("  断言22 ✅ domains_covered 字段名正确（无拼写错误）")
+        """rc3: canonical_surface_key helper 统一归一所有输入形态"""
+        from engine.surface_key import canonical_surface_key, is_canonical, canonical_cell_key
+        expected = "GET /api/refund"
+        forms = [
+            "/api/refund",
+            "GET /api/refund",
+            {"endpoint": "/api/refund", "method": "GET"},
+            {"endpoint": "GET /api/refund"},
+            {"path": "/api/refund", "method": "POST"},   # POST variant
+            {"url": "https://t.example/api/refund", "method": "GET"},
+            {"method": "POST", "path": "/api/refund", "endpoint": "POST /api/refund"},
+        ]
+        for f in forms:
+            ck = canonical_surface_key(f)
+            assert ck, f"canonical_surface_key({f!r}) 返回空"
+        # The first 5 forms (excluding POST variants) should produce GET /api/refund
+        assert canonical_surface_key(forms[0]) == expected, f"裸路径未归一: {canonical_surface_key(forms[0])}"
+        assert canonical_surface_key(forms[1]) == expected, f"METHOD /path 未保持: {canonical_surface_key(forms[1])}"
+        assert canonical_surface_key(forms[2]) == expected, f"dict+method 未归一: {canonical_surface_key(forms[2])}"
+        assert canonical_surface_key(forms[3]) == expected, f"dict endpoint含method 未剥前缀: {canonical_surface_key(forms[3])}"
+        assert canonical_surface_key(forms[4]) == "POST /api/refund", f"dict path+method=POST 未归一: {canonical_surface_key(forms[4])}"
+        assert canonical_surface_key(forms[5]) == expected, f"url+method 未剥host: {canonical_surface_key(forms[5])}"
+        assert canonical_surface_key(forms[6]) == "POST /api/refund", (
+            f"dict 同时含 method+endpoint(含method) 双重method: {canonical_surface_key(forms[6])}")
+        # is_canonical
+        assert is_canonical("GET /api/refund"), "is_canonical 应接受 GET /api/refund"
+        assert not is_canonical("/api/refund"), "is_canonical 应拒绝裸路径"
+        assert not is_canonical(""), "is_canonical 应拒绝空串"
+        # canonical_cell_key
+        ck = canonical_cell_key("GET /api/refund", "业务逻辑")
+        assert ck == "GET /api/refund × 业务逻辑", f"canonical_cell_key 错误: {ck}"
+        print("  断言22 ✅ canonical_surface_key 统一归一（6种输入形态 + is_canonical + cell_key）")
+
+    # ── rc3 端到端 dry-run fixture（断言23-29 共用） ──────────────────────
+    def _run_budget_dryrun(fixture_dir: pathlib.Path) -> dict:
+        """跑一个最小 dry-run session，surface_budget=1, intent_budget=2。
+        返回 run_session 结果 dict + 落盘路径，供断言23-29 校验真实产物。"""
+        from engine.orchestrator import run_session, MockAdapter
+        import tempfile
+        _proj = fixture_dir / "budget_proj"
+        _proj.mkdir(parents=True, exist_ok=True)
+        _wd = _proj / "sessions" / "run1"
+        _wd.mkdir(parents=True, exist_ok=True)
+        res = run_session(
+            MockAdapter(_wd),
+            target="https://t.example",
+            authz="仅限 https://t.example，已授权。",
+            core_skill="（测试占位技能文件）",
+            workdir=str(_wd),
+            authorized_hosts=["t.example"],
+            max_turns=20,
+            endpoints=["/api/user/login", "/api/refund"],
+            target_domains=["auth", "txn"],
+            surface_budget=1,
+            intent_budget=2,
+            verbose=False,
+        )
+        return res
 
     def _assert23():
-        """v8.6: surface_budget 在主循环中有强制终止逻辑"""
-        import pathlib as _p
-        src = _p.Path("engine/orchestrator.py").read_text(encoding="utf-8")
-        assert "surface_budget" in src and "_tested_eps" in src, (
-            "orchestrator.py 缺少 surface_budget 强制终止逻辑")
-        print("  断言23 ✅ surface_budget 强制终止逻辑存在")
+        """v8.6.1 端到端: surface_budget 限制 METHOD/path Surface。"""
+        import tempfile
+        _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_rc3_"))
+        try:
+            res = _run_budget_dryrun(_fdir)
+            sched = res.get("scheduler_stats", {})
+            assert sched.get("budget_unit") == "surface", (
+                f"budget_unit 应为 surface，实得 {sched.get('budget_unit')}")
+            assert sched.get("must_test_count") == 1, sched
+            _accepted = sched.get("accepted_updates", 0)
+            _ignored = sched.get("ignored_by_budget", 0)
+            _closed_cells = [c for c in (res.get("state", {}).get("matrix", {}) or {}).values()
+                             if c.get("state") != "untested"]
+            _closed_surfaces = {
+                f"{c.get('method', 'GET')} {c.get('endpoint', '')}" for c in _closed_cells
+            }
+            assert len(_closed_surfaces) <= 1, _closed_surfaces
+            print(f"  断言23 ✅ surface_budget=1 真实限制 "
+                  f"(accepted={_accepted}, ignored={_ignored}, surfaces={_closed_surfaces})")
+        finally:
+            import shutil
+            shutil.rmtree(_fdir, ignore_errors=True)
 
     def _assert24():
-        """v8.6: next_untested 接受 must_test 参数"""
-        from engine.orchestrator import CognitiveState
-        import inspect
-        sig = inspect.signature(CognitiveState.next_untested)
-        assert "must_test" in sig.parameters, (
-            f"next_untested 缺少 must_test 参数，签名: {sig}")
-        st = CognitiveState(sid="t24", target="https://t.example", vuln_classes=["SQLi"])
-        st.seed_matrix(["/api/b", "/api/a"], enable_auth_flow_column=False)
-        # With must_test ordering, /api/b should come first
-        result = st.next_untested(must_test=["/api/b", "/api/a"])
-        if result:
-            assert result[0]["endpoint"] == "/api/b", (
-                f"must_test=['/api/b','/api/a'] 时首个应为 /api/b，实得 {result[0]['endpoint']}")
-        print("  断言24 ✅ next_untested must_test 参数正确影响排序")
+        """rc3 端到端: intent_budget 限制 claim/prompt intent 数"""
+        import tempfile, json
+        from engine.scheduler import compute_run_scope
+        # 构造含多个 pending high-priority intent 的 blackboard
+        bb = {"facts": [], "negatives": [], "discovered_endpoints": [],
+              "intents": [
+                  {"intent_id": "i1", "status": "pending", "priority": "high"},
+                  {"intent_id": "i2", "status": "pending", "priority": "high"},
+                  {"intent_id": "i3", "status": "pending", "priority": "high"},
+                  {"intent_id": "i4", "status": "pending", "priority": "high"},
+              ]}
+        bg = {"endpoint_map": {"GET /api/refund": {"domains": ["txn"], "value": "high"}}}
+        scope = compute_run_scope(bb, bg, ["GET /api/refund"], ["txn"],
+                                  surface_budget=10, intent_budget=2)
+        carryover = scope.get("carryover_intents", [])
+        assert len(carryover) <= 2, (
+            f"carryover_intents={len(carryover)} 超过 intent_budget=2")
+        print(f"  断言24 ✅ intent_budget=2 限制 carryover_intents={len(carryover)} ≤ 2")
 
     def _assert25():
-        """v8.6: run_summary.md 生成代码存在"""
-        import pathlib as _p, re
-        src = _p.Path("engine/orchestrator.py").read_text(encoding="utf-8")
-        assert re.search(r"run_summary\.md|run_summary_md", src), (
-            "orchestrator.py 无 run_summary.md 生成代码")
-        assert re.search(r"run_summary.*write_text", src, re.IGNORECASE), (
-            "orchestrator.py 无 run_summary.md 写入调用")
-        print("  断言25 ✅ run_summary.md 生成代码存在")
+        """rc3 端到端: 深阴性 run2 继承 skip/not_vulnerable"""
+        import tempfile, json
+        from engine.orchestrator import CognitiveState, SKIPPED, run_session, MockAdapter
+        _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_deep_"))
+        try:
+            _proj = _fdir / "deep_proj"
+            _proj.mkdir(parents=True, exist_ok=True)
+            # 写一个含深阴性 negative 的 blackboard
+            bb_data = {
+                "schema_version": "2.0",
+                "facts": [], "intents": [], "dead_ends": [],
+                "negatives": [{
+                    "endpoint": "/api/search", "method": "GET",
+                    "vuln_class": "SQLi", "surface_key": "/api/search::SQLi",
+                    "vectors_tried": 5, "depth_sufficient": True,
+                    "file": "neg.md",
+                }],
+                "discovered_endpoints": [],
+            }
+            (_proj / "blackboard.json").write_text(
+                json.dumps(bb_data, ensure_ascii=False), encoding="utf-8")
+            _wd = _proj / "sessions" / "run2"
+            _wd.mkdir(parents=True, exist_ok=True)
+            res = run_session(
+                MockAdapter(_wd),
+                target="https://t.example",
+                authz="授权",
+                core_skill="占位",
+                workdir=str(_wd),
+                authorized_hosts=["t.example"],
+                max_turns=3,
+                endpoints=["/api/search"],
+                surface_budget=0,  # 不限预算，测继承
+                verbose=False,
+            )
+            # 深阴性应在 run2 继承为 SKIPPED
+            mtx = res.get("state", {}).get("matrix", {})
+            _found_skip = any(
+                c.get("state") == SKIPPED for c in mtx.values()
+                if "search" in c.get("endpoint", ""))
+            assert _found_skip, (
+                "深阴性 negative 在 run2 未继承为 SKIPPED")
+            print("  断言25 ✅ 深阴性 run2 继承 skip/not_vulnerable")
+        finally:
+            import shutil
+            shutil.rmtree(_fdir, ignore_errors=True)
 
     def _assert26():
-        """v8.6: scheduler_stats 在 orchestrator 输出中"""
-        import pathlib as _p
-        src = _p.Path("engine/orchestrator.py").read_text(encoding="utf-8")
-        assert "scheduler_stats" in src, "orchestrator.py 缺少 scheduler_stats"
-        # Verify it's set to a non-empty dict (not just {})
-        assert '"target_domains"' in src or "'target_domains'" in src, (
-            "scheduler_stats 未包含 target_domains 字段")
-        print("  断言26 ✅ scheduler_stats 输出字段存在")
+        """rc3 端到端: 浅阴性 run2 保持 open（不被深阴性误继承为 skip）"""
+        import tempfile, json
+        from engine.orchestrator import SKIPPED, run_session, MockAdapter
+        _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_shallow_"))
+        try:
+            _proj = _fdir / "shallow_proj"
+            _proj.mkdir(parents=True, exist_ok=True)
+            bb_data = {
+                "schema_version": "2.0",
+                "facts": [], "intents": [], "dead_ends": [],
+                "negatives": [{
+                    "endpoint": "/api/user", "method": "GET",
+                    "vuln_class": "XSS", "surface_key": "/api/user::XSS",
+                    "vectors_tried": 1, "depth_sufficient": False,
+                    "file": "neg_thin.md",
+                }],
+                "discovered_endpoints": [],
+            }
+            (_proj / "blackboard.json").write_text(
+                json.dumps(bb_data, ensure_ascii=False), encoding="utf-8")
+            _wd = _proj / "sessions" / "run2"
+            _wd.mkdir(parents=True, exist_ok=True)
+            res = run_session(
+                MockAdapter(_wd),
+                target="https://t.example",
+                authz="授权",
+                core_skill="占位",
+                workdir=str(_wd),
+                authorized_hosts=["t.example"],
+                max_turns=1,   # 避免 MockAdapter 批量 SKIP 干扰继承验证
+                endpoints=["/api/user"],
+                surface_budget=0,
+                verbose=False,
+            )
+            # 浅阴性 (depth_sufficient=False) 不应被继承为 SKIPPED — 它应保持
+            # open (untested 或 shallow_negative)，带 next_actions 等待深测。
+            mtx = res.get("state", {}).get("matrix", {})
+            _user_cells = [c for c in mtx.values()
+                           if "user" in c.get("endpoint", "")]
+            assert _user_cells, "run2 未 seed /api/user 矩阵格"
+            _skipped = [c for c in _user_cells if c.get("state") == SKIPPED]
+            assert not _skipped, (
+                f"浅阴性被误继承为 SKIPPED: {[c['endpoint'] for c in _skipped]}")
+            # 至少有一个格应保持 open (untested/shallow_negative)
+            _open = [c for c in _user_cells
+                     if c.get("state") in ("untested", "shallow_negative")]
+            assert _open, (
+                f"浅阴性格未保持 open: states={[c.get('state') for c in _user_cells]}")
+            print("  断言26 ✅ 浅阴性 run2 保持 open（不被误继承为 skip）")
+        finally:
+            import shutil
+            shutil.rmtree(_fdir, ignore_errors=True)
+
+    def _assert27():
+        """rc3: completed/abandoned/superseded intent 不 reappear in pending"""
+        from engine.graph import FactIntentGraph
+        g = FactIntentGraph()
+        # 添加一个 fact 触发 intent 生成
+        fact, intents = g.add_fact({
+            "source_type": "confirmed", "endpoint": "/api/test",
+            "vuln_class": "idor", "summary": "test vuln",
+        })
+        assert len(intents) >= 1, "应生成至少1个intent"
+        first_id = intents[0]["intent_id"]
+        # resolve as completed
+        g.resolve_intent(first_id, "completed", summary="done")
+        # pending 列表不应含已 completed 的 intent
+        pending = g.get_pending_intents(limit=10)
+        assert all(i["intent_id"] != first_id for i in pending), (
+            "已 completed 的 intent 不应出现在 pending 列表中")
+        # 测试 abandoned 和 superseded
+        if len(intents) >= 2:
+            second_id = intents[1]["intent_id"]
+            g.resolve_intent(second_id, "abandoned", summary="no value")
+            pending2 = g.get_pending_intents(limit=10)
+            assert all(i["intent_id"] != second_id for i in pending2), (
+                "已 abandoned 的 intent 不应出现在 pending 列表中")
+        if len(intents) >= 3:
+            third_id = intents[2]["intent_id"]
+            g.resolve_intent(third_id, "superseded", summary="replaced")
+            pending3 = g.get_pending_intents(limit=10)
+            assert all(i["intent_id"] != third_id for i in pending3), (
+                "已 superseded 的 intent 不应出现在 pending 列表中")
+        print("  断言27 ✅ completed/abandoned/superseded intent 不 reappear")
+
+    def _assert28():
+        """rc3 端到端: summary 有 domains_covered、无 domains_coveraged、
+        含 business_graph_open_high_value、scheduler_stats 非空"""
+        import tempfile, json
+        _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_summary_"))
+        try:
+            res = _run_budget_dryrun(_fdir)
+            _bad = "domains_cover" + "aged"  # avoid self-match
+            # domains_covered
+            assert res.get("domains_covered") is not None, "summary 缺 domains_covered"
+            # no misspelled variant in output keys
+            assert _bad not in res, f"summary 含拼写错误 {_bad}"
+            # business_graph_open_high_value
+            bg_open = res.get("business_graph_open_high_value")
+            assert bg_open is not None, "summary 缺 business_graph_open_high_value"
+            # scheduler_stats non-empty
+            sched = res.get("scheduler_stats", {})
+            assert sched, "scheduler_stats 为空"
+            assert sched.get("budget_unit") == "surface", (
+                f"scheduler_stats.budget_unit 错误: {sched.get('budget_unit')}")
+            print(f"  断言28 ✅ summary 有 domains_covered + business_graph_open_high_value "
+                  f"({len(bg_open)} 项) + scheduler_stats 非空 + 无拼写错误")
+        finally:
+            import shutil
+            shutil.rmtree(_fdir, ignore_errors=True)
+
+    def _assert29():
+        """rc3: run_summary.md 生成 + 四权威产物失效导致 self-check fail"""
+        import tempfile, json, pathlib as _p
+        from engine.orchestrator import run_session, MockAdapter
+        _fdir = _p.Path(tempfile.mkdtemp(prefix="selfcheck_auth_"))
+        try:
+            _proj = _fdir / "auth_proj"
+            _proj.mkdir(parents=True, exist_ok=True)
+            _wd = _proj / "sessions" / "run1"
+            _wd.mkdir(parents=True, exist_ok=True)
+            res = run_session(
+                MockAdapter(_wd),
+                target="https://t.example", authz="授权",
+                core_skill="占位", workdir=str(_wd),
+                authorized_hosts=["t.example"], max_turns=3,
+                endpoints=["/api/refund"], target_domains=["txn"],
+                surface_budget=5, verbose=False,
+            )
+            # run_summary.md 应在项目目录生成
+            _rs = _proj / "run_summary.md"
+            assert _rs.exists(), f"run_summary.md 未生成: {_rs}"
+            # run_scope.json 应存在
+            assert (_proj / "run_scope.json").exists(), "run_scope.json 未生成"
+            # business_graph.json 应存在
+            assert (_proj / "business_graph.json").exists(), "business_graph.json 未生成"
+            # blackboard.json 应存在（_conclude 写回）
+            assert (_proj / "blackboard.json").exists(), "blackboard.json 未生成"
+            # 验证 run_scope.json 全 canonical
+            scope = json.loads((_proj / "run_scope.json").read_text(encoding="utf-8"))
+            from engine.surface_key import is_canonical
+            for k in scope.get("must_test", []):
+                assert is_canonical(k), f"run_scope must_test 含非 canonical key: {k!r}"
+            print("  断言29 ✅ run_summary.md + run_scope.json + business_graph.json + "
+                  "blackboard.json 四权威产物生成且 must_test 全 canonical")
+        finally:
+            import shutil
+            shutil.rmtree(_fdir, ignore_errors=True)
 
     for name, fn in (("断言1", _assert1), ("断言2", _assert2), ("断言3", _assert3),
                      ("断言4", _assert4), ("断言5", _assert5), ("断言6", _assert6),
@@ -1188,7 +1436,8 @@ def _run_self_check() -> int:
                      ("断言20", _assert20), ("断言21", _assert21),
                      ("断言22", _assert22), ("断言23", _assert23),
                      ("断言24", _assert24), ("断言25", _assert25),
-                     ("断言26", _assert26)):
+                     ("断言26", _assert26), ("断言27", _assert27),
+                     ("断言28", _assert28), ("断言29", _assert29)):
         try:
             fn()
         except AssertionError as exc:
@@ -1290,8 +1539,9 @@ def main():
     # 会话目录与落盘（runs/ 已被 .gitignore）
     sid = args.sid or time.strftime("sess-%Y%m%d-%H%M%S")
     # v8.6: project-level state layout
-    _project_slug = args.project or (
+    _project_slug = safe_project_slug(args.project or (
         host_of(args.target).replace(".", "_") if args.target else "")
+    )
     if _project_slug:
         project_dir = ROOT / "runs" / "targets" / _project_slug
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -1300,6 +1550,19 @@ def main():
         project_dir = None
         wd = ROOT / "runs" / sid
     wd.mkdir(parents=True, exist_ok=True)
+    # Backward compatibility: migrate an existing runs/<sid> session into the
+    # project layout on first resume.  The legacy source remains untouched.
+    if args.resume and not args.project:
+        legacy_wd = ROOT / "runs" / sid
+        if legacy_wd != wd and (legacy_wd / "state.json").exists():
+            for name in (
+                "state.json", "candidate-ledger.json", "fact_intent_graph.json",
+                "inventory.json", "coverage-ledger.json", "events.jsonl",
+            ):
+                source = legacy_wd / name
+                destination = wd / name
+                if source.exists() and not destination.exists():
+                    shutil.copy2(source, destination)
     # v8.6: parse target-domains
     _target_domains = [d.strip() for d in args.target_domains.split(",") if d.strip()] if args.target_domains else None
     authz = (pathlib.Path(args.authz).read_text(encoding="utf-8")
@@ -1312,7 +1575,7 @@ def main():
     if cred:
         (wd / "cookies.txt").write_text(cred_line, encoding="utf-8")
 
-    skill = (ROOT / "skill" / "核心技能文件.v2.md").read_text(encoding="utf-8")
+    skill = (ROOT / "skill" / "核心技能文件.v3.md").read_text(encoding="utf-8")
     hosts = [host_of(args.target)] + args.allow
 
     # 覆盖矩阵的攻击面来源（支柱 2）：
@@ -1495,6 +1758,8 @@ def main():
         summary["graph_stats"] = res.get("graph_stats", {})
         summary["scheduler_stats"] = res.get("scheduler_stats", {})
         summary["domains_covered"] = res.get("domains_covered", {})
+        summary["business_graph_open_high_value"] = res.get("business_graph_open_high_value", [])
+        summary["persistence_errors"] = res.get("persistence_errors", [])
         (wd / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as _e:                       # 落盘失败不阻断收尾打印
