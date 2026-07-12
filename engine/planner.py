@@ -21,7 +21,8 @@ MERCHANT_PAIR = ["merchant_a", "merchant_b"]
 USER_PAIR = ["owner:user", "attacker:user"]
 
 PARAM_RISK_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (("amount", "refund_amount", "use_points", "price", "fee", "balance", "stock"),
+    (("amount", "refund_amount", "use_points", "price", "fee", "balance", "stock",
+      "quantity", "count"),
      ("amount-tamper", "accounting")),
     (("order_time", "timestamp", "create_time"), ("time-tamper",)),
     (("order_no", "product_no", "user_id", "user_hash", "id"), ("object-ownership", "idor")),

@@ -330,15 +330,31 @@ class CoverageLedger:
     def stats(self) -> dict[str, int]:
         counts = {status: 0 for status in sorted(VALID_STATUSES)}
         high_value_open = 0
+        in_scope_total = 0
+        in_scope_closed = 0
+        in_scope_open = 0
+        out_of_run = 0
         for surface in self.surfaces:
             status = normalize_status(surface.get("status", STATUS_NOT_TESTED))
             counts[status] = counts.get(status, 0) + 1
             if is_high_value(surface) and status in {STATUS_NOT_TESTED, STATUS_BLOCKED}:
                 high_value_open += 1
+            if surface.get("in_run_scope") is False:
+                out_of_run += 1
+            else:
+                in_scope_total += 1
+                if status in {STATUS_CONFIRMED, STATUS_NOT_VULNERABLE, STATUS_NOT_APPLICABLE}:
+                    in_scope_closed += 1
+                elif status in {STATUS_NOT_TESTED, STATUS_BLOCKED}:
+                    in_scope_open += 1
         counts["total"] = len(self.surfaces)
         counts["closed"] = counts.get(STATUS_CONFIRMED, 0) + counts.get(STATUS_NOT_VULNERABLE, 0) + counts.get(STATUS_NOT_APPLICABLE, 0)
         counts["open"] = counts.get(STATUS_NOT_TESTED, 0) + counts.get(STATUS_BLOCKED, 0)
         counts["high_value_open"] = high_value_open
+        counts["in_scope_total"] = in_scope_total
+        counts["in_scope_closed"] = in_scope_closed
+        counts["in_scope_open"] = in_scope_open
+        counts["out_of_run"] = out_of_run
         return counts
 
     def next_surfaces(self, n: int = 10, *, high_value_first: bool = True) -> list[dict[str, Any]]:
@@ -383,6 +399,7 @@ def normalize_surface(surface: dict[str, Any]) -> dict[str, Any]:
         "blocker": surface.get("blocker"),
         "next_actions": _dedupe(surface.get("next_actions") or []),
         "source": str(surface.get("source") or "manual"),
+        "vuln_class": str(surface.get("vuln_class") or surface.get("legacy_vuln") or ""),
         # v6.1 §4.2: candidate-aware columns (backward compatible)
         "candidate_count": int(surface.get("candidate_count", 0) or 0),
         "deepest_status": str(surface.get("deepest_status", "") or ""),
@@ -419,8 +436,25 @@ def merge_surface(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
         STATUS_NOT_VULNERABLE: 3,
         STATUS_CONFIRMED: 4,
     }
-    if status_order.get(src.get("status"), 0) > status_order.get(dst.get("status"), 0):
+    status_advanced = status_order.get(src.get("status"), 0) > status_order.get(dst.get("status"), 0)
+    if status_advanced:
         dst["status"] = src["status"]
+        dst["evidence_ref"] = src.get("evidence_ref")
+        # A stronger terminal state supersedes stale open/negative metadata.
+        if src["status"] == STATUS_CONFIRMED:
+            dst["blocker"] = None
+            dst["next_actions"] = []
+            dst.pop("negative", None)
+            dst.pop("negative_depth", None)
+            dst["negative_depth_checked"] = False
+        elif src["status"] in {STATUS_NOT_VULNERABLE, STATUS_NOT_APPLICABLE}:
+            dst["blocker"] = None
+            dst["next_actions"] = []
+            if src["status"] == STATUS_NOT_VULNERABLE and isinstance(src.get("negative"), dict):
+                dst["negative"] = dict(src["negative"])
+            elif src["status"] == STATUS_NOT_APPLICABLE:
+                dst.pop("negative", None)
+                dst["negative_depth_checked"] = False
     # v6.1 §4.2: merge candidate-aware columns (max counts/scores, OR checked)
     dst["candidate_count"] = max(
         int(dst.get("candidate_count", 0) or 0), int(src.get("candidate_count", 0) or 0))
@@ -465,8 +499,12 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
     surfaces: list[dict[str, Any]] = []
     for param in _params_from_cell(cell):
         risk_tags = _risk_from_vuln(str(cell.get("vuln") or ""), endpoint, param, feature)
+        vuln_class = str(cell.get("vuln") or "").strip()
+        base_surface_id = make_surface_id(endpoint, method, param, roles, risk_tags)
         surfaces.append({
-            "surface_id": make_surface_id(endpoint, method, param, roles, risk_tags),
+            # Coverage identity is a cell, not merely a request surface.  Two
+            # vuln classes on the same METHOD/path must never merge.
+            "surface_id": f"{base_surface_id} × {vuln_class or 'general-review'}",
             "endpoint": endpoint,
             "method": method,
             "param": param,
@@ -479,8 +517,12 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
             "next_actions": next_actions,
             "source": source,
             "legacy_vuln": cell.get("vuln", ""),
+            "vuln_class": vuln_class,
             "legacy_reason": cell.get("reason", ""),
             "negative_depth": negative_depth,
+            "negative_depth_checked": bool(cell.get("negative_depth_checked", False)),
+            "negative": cell.get("negative") if isinstance(cell.get("negative"), dict) else None,
+            "inherited_from_blackboard": bool(cell.get("inherited_from_blackboard", False)),
         })
     return surfaces
 

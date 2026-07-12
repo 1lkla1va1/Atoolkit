@@ -67,9 +67,27 @@ def _infer_roles(endpoint: str) -> list[str]:
     return roles or ["anonymous"]
 
 def _infer_object(endpoint: str) -> str:
-    """Extract the last meaningful path segment as the object name."""
-    parts = [p for p in endpoint.strip("/").split("/") if p and not p.startswith("api")]
-    return parts[-1] if parts else "unknown"
+    """Extract a resource noun, never a generic ``{id}`` placeholder."""
+    raw_parts = [p for p in endpoint.strip("/").split("/") if p]
+    parts: list[str] = []
+    for raw in raw_parts:
+        part = re.sub(r"\.(?:php|asp|aspx|jsp|json)$", "", raw.lower())
+        if (part in {"api", "v1", "v2", "v3"} or part.isdigit()
+                or (part.startswith("{") and part.endswith("}"))):
+            continue
+        parts.append(part)
+    if not parts:
+        return "unknown"
+    action_segments = {
+        "detail", "list", "create", "add", "update", "edit", "delete",
+        "remove", "toggle", "approve", "reject", "cancel", "confirm",
+    }
+    noun = parts[-2] if parts[-1] in action_segments and len(parts) > 1 else parts[-1]
+    if len(noun) > 3 and noun.endswith("ies"):
+        noun = noun[:-3] + "y"
+    elif len(noun) > 3 and noun.endswith("s") and not noun.endswith("ss"):
+        noun = noun[:-1]
+    return noun
 
 def _infer_state_effect(method: str, endpoint: str) -> str:
     m = _ACTION_VERBS.search(endpoint.lower())
@@ -180,6 +198,13 @@ class BusinessGraph:
                 "value": _infer_value(method, endpoint),
             }
             self.endpoint_map[key] = entry
+
+        for role in entry.get("roles", []):
+            if role not in self.roles:
+                self.roles.append(role)
+        for obj in entry.get("objects", []):
+            if obj not in self.objects:
+                self.objects.append(obj)
 
         extra_domains = _infer_domains(endpoint, fact_data.get("params"))
         for d in extra_domains:

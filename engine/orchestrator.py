@@ -222,11 +222,46 @@ def _is_auth_endpoint(ep: str, feature: str = "") -> bool:
 
 
 def _classes_for_endpoint(base_classes: list[str], ep: str, feature: str,
-                          enable_auth: bool) -> list[str]:
+                          enable_auth: bool, surface: dict | None = None) -> list[str]:
     cols = list(base_classes)
     if enable_auth and _is_auth_endpoint(ep, feature) and AUTH_FLOW_CLASS not in cols:
         cols.append(AUTH_FLOW_CLASS)
-    return cols
+    surface = surface if isinstance(surface, dict) else {}
+    tags = {str(x).lower() for x in _listify(surface.get("risk_tags"))}
+    param = str(surface.get("param") or next(
+        iter(_listify(surface.get("params"))), "") or "").lower()
+    method = str(surface.get("method") or "GET").upper()
+    hay = f"{ep} {feature} {param}".lower()
+
+    groups: set[str] = set()
+    if _is_auth_endpoint(ep, feature) or tags & {"auth-flow", "auth-flow-abuse"}:
+        groups.update({"auth", "info-leak", "sqli", "xss", "csrf"})
+    if tags & {"object-ownership", "idor", "privilege"}:
+        groups.update({"idor", "info-leak"})
+    if tags & {"input-validation", "injection"} or param:
+        groups.update({"sqli", "xss"})
+    if tags & {"ssrf", "callback", "redirect-chain"}:
+        groups.add("ssrf")
+    if tags & {"file-upload", "path-traversal"}:
+        groups.update({"file", "rce"})
+    if tags & {"amount-tamper", "accounting", "payment", "time-tamper", "enum-tamper"}:
+        groups.add("business")
+    if any(word in hay for word in (
+            "order", "refund", "recharge", "payment", "pay", "balance",
+            "points", "coupon", "lottery", "交易", "退款", "充值", "支付")):
+        groups.add("business")
+    if method in {"POST", "PUT", "PATCH", "DELETE"}:
+        groups.add("csrf")
+    if any(word in hay for word in ("exec", "command", "shell", "template", "task", "job")):
+        groups.add("rce")
+
+    # With no semantic signal, preserve open exploration instead of silently
+    # deleting classes.  When planner metadata exists, avoid the endpoint×all
+    # classes Cartesian product and admit only applicable risk families.
+    if not groups:
+        return cols
+    filtered = [vc for vc in cols if norm_vc(vc) in groups]
+    return filtered or cols
 
 
 def _endpoint_parts(item: str | dict) -> tuple[str, str, dict]:
@@ -278,7 +313,10 @@ def _merge_surface(old: dict | None, new: dict | None) -> dict:
         vals = _listify(value)
         if not vals:
             continue
-        if key in {"method", "params", "source"}:
+        if key == "method":
+            merged.setdefault(key, str(vals[0]).upper())
+        elif key in {"param", "params", "source", "roles", "needed_roles",
+                     "risk_tags", "tasks"} or isinstance(value, (list, tuple, set)):
             cur = _listify(merged.get(key))
             for x in vals:
                 if x not in cur:
@@ -305,13 +343,29 @@ def _cell_surface_key(cell: dict) -> str:
     })
 
 
+def _cell_param(cell: dict) -> str:
+    surface = cell.get("surface") if isinstance(cell.get("surface"), dict) else {}
+    value = cell.get("param") or surface.get("param")
+    if not value:
+        params = _listify(surface.get("params"))
+        value = params[0] if params else ""
+    return str(value or "").strip()
+
+
+def _cell_budget_key(cell: dict) -> str:
+    return canonical_cell_key(_cell_surface_key(cell), cell.get("vuln", ""), _cell_param(cell))
+
+
 def _cell_schema(ep: str, vc: str, feature: str, surface: dict | None = None,
-                 method: str = "GET") -> dict:
+                 method: str = "GET", param: str = "") -> dict:
     surface = dict(surface or {})
     surface["method"] = method
+    surface["param"] = param
+    surface["params"] = [param] if param else []
     return {
         "endpoint": ep,
         "method": method,
+        "param": param,
         "vuln": vc,
         "feature": feature or _feature_of(ep),
         "state": UNTESTED,
@@ -364,23 +418,34 @@ class CognitiveState:
                 continue
             method = _surface_method(ep, surface)
             surface["method"] = method
-            for vc in _classes_for_endpoint(self.vuln_classes, ep, feat, enable_auth_flow_column):
-                k = self._key(ep, vc, method)
-                if k not in self.matrix:
-                    self.matrix[k] = _cell_schema(ep, vc, feat, surface, method)
-                else:
-                    cell = self.matrix[k]
-                    if not cell.get("feature"):
-                        cell["feature"] = feat
-                    cell["surface"] = _merge_surface(cell.get("surface"), surface)
+            params = [str(x).strip() for x in _listify(
+                surface.get("params") or surface.get("param")) if str(x).strip()] or [""]
+            for param in params:
+                param_surface = dict(surface)
+                param_surface["param"] = param
+                param_surface["params"] = [param] if param else []
+                for vc in _classes_for_endpoint(
+                        self.vuln_classes, ep, feat, enable_auth_flow_column,
+                        param_surface):
+                    k = self._key(ep, vc, method, param)
+                    if k not in self.matrix:
+                        self.matrix[k] = _cell_schema(
+                            ep, vc, feat, param_surface, method, param)
+                    else:
+                        cell = self.matrix[k]
+                        if not cell.get("feature"):
+                            cell["feature"] = feat
+                        cell["surface"] = _merge_surface(cell.get("surface"), param_surface)
 
     @staticmethod
-    def _key(ep: str, vc: str, method: str = "") -> str:
+    def _key(ep: str, vc: str, method: str = "", param: str = "") -> str:
         key = canonical_surface_key(
             {"endpoint": ep.strip(), "method": method} if method else ep.strip())
-        return f"{key}::{vc.strip()}"
+        param_part = f"::{str(param).strip()}" if str(param or "").strip() else ""
+        return f"{key}{param_part}::{vc.strip()}"
 
-    def _find_cell(self, ep: str, vc: str, *, allow_sibling: bool = False) -> dict | None:
+    def _find_cell(self, ep: str, vc: str, *, param: str = "",
+                   allow_sibling: bool = False) -> dict | None:
         """按 endpoint+漏洞类定位格。匹配收紧（防 S2 子串互含误闭）：
           1) 精确 key 命中（保留）。
           2) 回退：endpoint **归一化后段级相等**（/api/orders/1001 ↔ /api/orders/{id}），
@@ -392,7 +457,7 @@ class CognitiveState:
         _has_method = (len(_parts) == 2 and _parts[0].upper() in
                        {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
         if _has_method:
-            k = self._key(ep, vc)
+            k = self._key(ep, vc, param=param)
             if k in self.matrix:
                 return self.matrix[k]
         nep = _norm_path(ep)
@@ -409,9 +474,11 @@ class CognitiveState:
             cell_cands = {_squash_ws(c).lower() for c in norm_vc_candidates(cell["vuln"])}
             cell_cands.add(cvl)
             vc_ok = bool(vc_cands & cell_cands)           # 候选列名集合相交即配
-            if ep_ok and vc_ok:
+            param_ok = not param or _cell_param(cell).lower() == str(param).strip().lower()
+            if ep_ok and vc_ok and param_ok:
                 exact_path_candidates.append(cell)
-            if allow_sibling and vc_ok and _same_or_list_detail_path(cell["endpoint"], ep):
+            if (allow_sibling and vc_ok and param_ok
+                    and _same_or_list_detail_path(cell["endpoint"], ep)):
                 sibling_candidates.append(cell)
         if exact_path_candidates:
             methods = {_cell_surface_key(c).partition(" ")[0]
@@ -438,6 +505,7 @@ class CognitiveState:
         needed_roles: list[str] | None = None,
         require_evidence: bool | None = None,
         budget_exempt: bool = False,
+        param: str = "",
     ) -> tuple[bool, str]:
         """推进单格。物理证据 > 声明；无充分证据的 NEG 只能落 shallow_negative。
 
@@ -450,7 +518,9 @@ class CognitiveState:
         """
         if new_state == LEGACY_NEGATIVE:
             raise ValueError("legacy negative is read-only; use resolve_negative_state")
-        cell = self._find_cell(ep, vc, allow_sibling=(new_state == POSITIVE and bool(evidence)))
+        cell = self._find_cell(
+            ep, vc, param=param,
+            allow_sibling=(new_state == POSITIVE and bool(evidence)))
         if cell is None:                            # 映射不到已 seed 的格 → 丢弃，绝不新增幽灵格(S1)
             return (False, f"{ep} × {vc} 无对应已 seed 格 → 丢弃(不扩大分母)")
         if cell.get("state") in (POSITIVE, NEGATIVE_WITH_EVIDENCE) and new_state == SHALLOW_NEGATIVE:
@@ -472,7 +542,7 @@ class CognitiveState:
         if (self._budget_active and not budget_exempt
                 and new_state in (POSITIVE, NEGATIVE_WITH_EVIDENCE, SKIPPED, SHALLOW_NEGATIVE)
                 and _was_untested):
-            _ck = canonical_cell_key(_cell_surface_key(cell), cell.get("vuln", ""))
+            _ck = _cell_budget_key(cell)
             if _ck not in self.allowed_cells:
                 self.ignored_by_budget += 1
                 return (False, f"{cell.get('endpoint','')} × {cell.get('vuln','')} "
@@ -597,8 +667,10 @@ class CognitiveState:
         # 报告正文常只含具体 id 形态(/api/orders/1001)，靠 CELL 声明的矩阵行端点定位真格。
         cell_decl = [(ep.strip(), vc.strip(), verdict.upper())
                      for ep, vc, verdict, _ in CELL_RE.findall(text)]
-        # 1) 报告(positive)：endpoint 权威优先级 ① CELL 声明 ② frontmatter ③ 正文猜测(兜底)
-        for rep in evidence.get("report_objs", []):
+        # 1) 旧 Markdown 报告不再是 authoritative positive。harvest 仍解析
+        # report_*.md 供迁移/人工复核，但只有显式 trusted_report_objs（当前生产路径
+        # 不会生成）才允许走旧映射。正式闭格一律由 1b 的 proof-confirmed finding 包完成。
+        for rep in evidence.get("trusted_report_objs", []):
             ep, vc = _report_cell(rep, cell_decls=cell_decl)
             if ep and vc:
                 ok, msg = self.set_cell(ep, vc, POSITIVE, reason="已出报告",
@@ -611,26 +683,48 @@ class CognitiveState:
             ep = nf.get("endpoint", "")
             vc = nf.get("vuln_class") or nf.get("class") or nf.get("root_cause", "")
             if ep and vc:
-                ok, msg = self.set_cell(ep, vc, POSITIVE, reason="已出 structured finding",
-                                        evidence=nf.get("evidence_file", "finding.json"))
-                if ok:
-                    notes.append(f"[PASS] {msg}")
+                method = (nf.get("method")
+                          or next(iter(nf.get("methods") or []), "GET"))
+                lookup = canonical_surface_key({"endpoint": ep, "method": method})
+                params = [str(x).strip() for x in (nf.get("params") or []) if str(x).strip()] or [""]
+                for param in params:
+                    ok, msg = self.set_cell(
+                        lookup, vc, POSITIVE, reason="已出 structured finding",
+                        evidence=nf.get("evidence_file", "finding.json"), param=param)
+                    if ok:
+                        notes.append(f"[PASS] {msg}")
         # 2) 负向留证(negative_*.md / 覆盖日志)：吃负向通道，让「已测无注入」也能闭格
         for neg in evidence.get("negatives", []):
             ep, vc = neg.get("endpoint", ""), neg.get("vuln", "")
             if ep and vc:
-                cell = self._find_cell(ep, vc)
+                lookup = canonical_surface_key({
+                    "endpoint": ep, "method": neg.get("method", "GET")})
+                param = str(neg.get("param") or "").strip()
+                cell = self._find_cell(lookup, vc, param=param)
                 if not cell:
                     continue
                 new_state, missing = resolve_negative_state(cell, neg, cards=cards or [])
                 ok, msg = self.set_cell(
-                    ep, vc, new_state,
+                    lookup, vc, new_state,
                     reason=neg.get("reason", "已测，无利用"),
                     evidence=neg.get("file", "") if new_state == NEGATIVE_WITH_EVIDENCE else "",
                     next_actions=neg.get("next_actions") or missing,
                     require_evidence=None,
+                    param=param,
                 )
                 if ok:
+                    cell = self._find_cell(lookup, vc, param=param)
+                    neg["depth_sufficient"] = new_state == NEGATIVE_WITH_EVIDENCE
+                    if cell is not None:
+                        cell["negative_depth_checked"] = (
+                            new_state == NEGATIVE_WITH_EVIDENCE)
+                        cell["negative"] = {
+                            "vectors": list(neg.get("vectors") or []),
+                            "response_count": int(neg.get("response_count", 0) or 0),
+                            "evidence_types": list(neg.get("evidence_types") or []),
+                            "identities": list(neg.get("identities") or []),
+                            "roles": list(neg.get("roles") or []),
+                        }
                     notes.append(f"[NEG] {msg}")
         # 3) 模型对单格的显式声明（PASS/NEG/SKIP）：SKIP 直接闭格；PASS/NEG 仍需证据撑腰
         for ep, vc, verdict, reason in CELL_RE.findall(text):
@@ -754,7 +848,12 @@ class CognitiveState:
                     cell["state"] = SHALLOW_NEGATIVE
                     if not cell.get("next_actions"):
                         cell["next_actions"] = ["补充独立探测向量与响应证据"]
-            reindexed[cls._key(ep, cell.get("vuln", ""), method)] = cell
+            param = _cell_param(cell)
+            cell["param"] = param
+            cell["surface"]["param"] = param
+            cell["surface"]["params"] = [param] if param else []
+            reindexed[cls._key(
+                ep, cell.get("vuln", ""), method, param)] = cell
         data["matrix"] = reindexed
         data["allowed_cells"] = set(data.get("allowed_cells") or [])
         known = {f.name for f in fields(cls)}
@@ -814,6 +913,7 @@ _SETUP_FILES = {
     "state.json", "authz.md", "cookies.txt", "events.jsonl", "summary.json",
     "final_report.md", "coverage-ledger.json", "inventory.json",
     "candidate-ledger.json", "coverage_gaps.md",
+    "fact_intent_graph.json", "last_response.md",
 }  # 会话输入/状态/日志/汇总，非证据进展
 
 
@@ -833,7 +933,7 @@ def count_evidence_files(workdir: pathlib.Path) -> int:
 
 
 def harvest_evidence(workdir: pathlib.Path, authorized_hosts: list[str] | None = None) -> dict:
-    """采集三类：report_*.md(阳性) / negative_*.md(阴性留证) / 其它原始证据文件。
+    """采集三类：report_*.md(legacy candidate) / negative_*.md / 其它原始证据文件。
     负向通道是支柱 2 的核心修复：让「已测无注入」也留档、能进矩阵，不再蒸发。
     F1：只对 .md 候选读全文；其它文件（大 JS bundle / .http 原始包等）只记名不读，
     避免每轮把整目录全量读盘——读盘成本不再随 recon 文件大小×轮数线性膨胀。"""
@@ -857,15 +957,43 @@ def harvest_evidence(workdir: pathlib.Path, authorized_hosts: list[str] | None =
                 if f.is_file() and f.name not in _SETUP_FILES:
                     files.append(str(f))
     structured = collect_structured_findings(workdir, authorized_hosts=authorized_hosts)
-    return {"reports": [r["text"] for r in reports],   # 兼容旧 triage 入参（list[str]）
-            "report_objs": reports,                    # 带解析的报告对象（供矩阵映射）
+    # A schema-valid file is not yet authoritative coverage.  Run Guardian
+    # before state.update so garbage/conditional reports cannot close a cell
+    # and linger in the ledger after final rejection.
+    guardian_items = []
+    guardian_rejected = list(structured["rejected"])
+    accepted_paths: set[str] = set()
+    for item in structured["accepted"]:
+        finding_path = pathlib.Path(item.get("path") or "")
+        verdict = guardian_check_finding(
+            item.get("finding") or {}, finding_path.parent,
+            authorized_hosts=authorized_hosts)
+        if verdict.result == ACCEPTED:
+            guardian_items.append(item)
+            accepted_paths.add(str(finding_path.resolve()))
+        else:
+            guardian_rejected.append({
+                "id": item.get("id") or finding_path.parent.name,
+                "path": str(finding_path),
+                "reasons": [f"guardian:{verdict.result}:L{verdict.level}:{verdict.reason}"],
+            })
+    proof_confirmed = []
+    for normalized in structured["normalized"]:
+        ref = normalized.get("raw_finding_path") or normalized.get("evidence_file") or ""
+        resolved = str((pathlib.Path(workdir) / str(ref)).resolve())
+        if resolved in accepted_paths:
+            proof_confirmed.append(normalized)
+    return {"reports": [r["text"] for r in reports],   # 仅供 legacy triage/迁移诊断
+            "report_objs": reports,                    # legacy candidate；不得闭格
+            "trusted_report_objs": [],                 # 保留键，生产路径不信任 Markdown
             "negatives": negatives, "files": files,
-            "finding_objs": structured["finding_objs"],
+            "finding_objs": guardian_items,
             "finding_validation": {
-                "accepted": structured["accepted"],
-                "rejected": structured["rejected"],
+                "accepted": guardian_items,
+                "proof_confirmed": guardian_items,
+                "rejected": guardian_rejected,
             },
-            "normalized_findings": structured["normalized"]}
+            "normalized_findings": proof_confirmed}
 
 
 def _fm(txt: str) -> dict:
@@ -930,19 +1058,22 @@ def _parse_negative(txt: str, path: str) -> dict:
     if isinstance(roles, str):
         roles = [x.strip() for x in re.split(r"[,，;；]", roles) if x.strip()]
     body = _body(txt)
-    fallback_hits = re.findall(r"\b(?:curl|HTTP/1\.1|HTTP/2|status)\b|响应", body, re.I)
-    response_count = len(fallback_hits)
+    vector_hits = re.findall(r"\b(?:curl|probe|payload|vector)\b", body, re.I)
+    response_hits = re.findall(r"\b(?:HTTP/1\.1|HTTP/2|status)\b|响应", body, re.I)
+    response_count = len(response_hits)
     if not vectors:
-        vectors = [x.lower() for x in fallback_hits[:3]]
+        vectors = [x.lower() for x in vector_hits[:3]]
     return {
         "endpoint": fm.get("endpoint", ""),
         "method": str(fm.get("method", "GET") or "GET").upper(),
+        "param": str(fm.get("param", "") or "").strip(),
         "vuln": fm.get("vuln", "") or fm.get("type", ""),
         "reason": fm.get("reason", "已测，无可利用结果"),
         "file": path,
         "vectors": vectors,
         "vectors_tried": len(vectors),
-        "depth_sufficient": len(vectors) >= 3 or response_count >= 2,
+        # Conservative hint only.  Knowledge cards may raise this floor.
+        "depth_sufficient": len(vectors) >= 3 and response_count >= 1,
         "next_actions": next_actions,
         "evidence_types": evidence_types,
         "identities": identities,
@@ -953,6 +1084,40 @@ def _parse_negative(txt: str, path: str) -> dict:
 
 def made_progress(prev_files: int, evidence: dict) -> bool:
     return len(evidence.get("files", [])) > prev_files
+
+
+def _evidence_ref_keys(ref: str, workdir: pathlib.Path) -> set[str]:
+    text = str(ref or "").strip()
+    if not text:
+        return set()
+    path = pathlib.Path(text)
+    resolved = path.resolve() if path.is_absolute() else (workdir / path).resolve()
+    return {text, path.as_posix(), str(resolved), resolved.as_posix()}
+
+
+def _reopen_unaccepted_positives(
+    state: "CognitiveState", workdir: pathlib.Path, accepted_refs: list[str],
+) -> list[str]:
+    """Rollback provisional positive cells whose evidence failed the final gate."""
+    accepted_keys: set[str] = set()
+    for ref in accepted_refs:
+        accepted_keys.update(_evidence_ref_keys(ref, workdir))
+    reopened: list[str] = []
+    for cell in state.matrix.values():
+        if cell.get("state") != POSITIVE or cell.get("inherited_from_blackboard"):
+            continue
+        evidence_keys = _evidence_ref_keys(str(cell.get("evidence") or ""), workdir)
+        if evidence_keys & accepted_keys:
+            continue
+        reopened.append(_cell_budget_key(cell))
+        cell["state"] = UNTESTED
+        cell["reason"] = "finding 未通过最终 proof/Guardian/verify 门，已回滚"
+        cell["evidence"] = ""
+        cell["next_actions"] = ["补齐机器可验证的 root finding 证据合同"]
+        cell["needs"] = []
+        if state._budget_active and state.accepted_updates > 0:
+            state.accepted_updates -= 1
+    return reopened
 
 
 def _log_event(wd: pathlib.Path, event: dict) -> None:
@@ -988,6 +1153,9 @@ def _sync_coverage_ledger(state: CognitiveState, wd: pathlib.Path,
     ledger = CoverageLedger(metadata=metadata)
     for cell in state.matrix.values():
         for surface in surfaces_from_legacy_cell(cell):
+            surface["in_run_scope"] = (
+                not state._budget_active or _cell_budget_key(cell) in state.allowed_cells
+            )
             legacy_vuln = str(surface.get("legacy_vuln") or "").strip()
             if legacy_vuln and surface.get("source") == "legacy-matrix":
                 tag = "legacy-" + (re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "-", legacy_vuln.lower()).strip("-") or "vuln")
@@ -1099,12 +1267,35 @@ def _apply_blackboard_skips(state: "CognitiveState", skip_surfaces: list[dict]) 
         method = item.get("method", "")
         lookup = canonical_surface_key(
             {"endpoint": endpoint, "method": method}) if method else endpoint
-        ok, _ = state.set_cell(
-            lookup, item.get("vuln_class", ""), SKIPPED,
-            reason=item.get("reason", "blackboard inherited"),
-            require_evidence=False, budget_exempt=True,
-        )
-        if ok:
+        vuln_class = item.get("vuln_class", "")
+        candidates = [vuln_class] if vuln_class else [
+            cell.get("vuln", "") for cell in state.matrix.values()
+            if _cell_surface_key(cell) == canonical_surface_key(lookup)
+        ]
+        for vc in dict.fromkeys(candidates):
+            # Historical callers supplied only deep-negative records; preserve
+            # that default.  Dead ends now carry status=not_applicable.
+            inherited_status = item.get("status", "not_vulnerable")
+            new_state = (NEGATIVE_WITH_EVIDENCE
+                         if inherited_status == "not_vulnerable" else SKIPPED)
+            ok, _ = state.set_cell(
+                lookup, vc, new_state,
+                reason=item.get("reason", "blackboard inherited"),
+                evidence=item.get("evidence_ref", ""),
+                require_evidence=False, budget_exempt=True,
+                param=str(item.get("param") or "").strip(),
+            )
+            if not ok:
+                continue
+            cell = state._find_cell(
+                lookup, vc, param=str(item.get("param") or "").strip())
+            if cell is not None:
+                cell["inherited_from_blackboard"] = True
+                if new_state == NEGATIVE_WITH_EVIDENCE:
+                    cell["negative_depth_checked"] = bool(
+                        item.get("negative_depth_checked", True))
+                    if isinstance(item.get("negative"), dict):
+                        cell["negative"] = dict(item["negative"])
             applied += 1
     return applied
 
@@ -1150,7 +1341,8 @@ def _surface_neg_obj(surface: dict) -> dict | None:
 
 
 def _build_candidate_block(state: "CognitiveState", candidate_ledger: "CandidateLedger | None",
-                           cards: list[dict] | None, *, candidate_top_n: int = 8) -> str:
+                           cards: list[dict] | None, *, candidate_top_n: int = 8,
+                           must_test: list[str] | None = None) -> str:
     """v6.1 §10.2: 构造 candidate_block 注入 assemble_prompt。
 
     - recall 相：注入 Top surface 的风险维应答表（§3.1）
@@ -1161,7 +1353,7 @@ def _build_candidate_block(state: "CognitiveState", candidate_ledger: "Candidate
         # 无候选时：对 Top surface 注入风险维应答表（recall 相）
         if state.matrix and cards:
             blocks: list[str] = []
-            for cell in state.next_untested(3):
+            for cell in state.next_untested(3, must_test=must_test):
                 surface = {
                     "endpoint": cell.get("endpoint", ""),
                     "risk_tags": _cell_risk_tags(cell),
@@ -1265,6 +1457,7 @@ def _build_loop_control_block(
     lens: list[str] | None,
     adversarial_pass: bool,
     no_flow_surfaces: bool,
+    must_test: list[str] | None = None,
 ) -> str:
     counts = _candidate_status_counts(candidate_ledger)
     pressure = _open_surface_pressure(state)
@@ -1277,7 +1470,7 @@ def _build_loop_control_block(
             f"{cand.get('hypothesis','')[:80]}"
         )
     if not q_lines:
-        for cell in state.next_untested(3):
+        for cell in state.next_untested(3, must_test=must_test):
             q_lines.append(
                 f"  - surface {cell.get('endpoint','')} × {cell.get('vuln','')} "
                 f"state={cell.get('state','')}"
@@ -1297,23 +1490,22 @@ def _build_loop_control_block(
     )
 
 
-def _current_surface_ctx(state: "CognitiveState", cards: list[dict] | None) -> dict | None:
+def _current_surface_ctx(state: "CognitiveState", cards: list[dict] | None,
+                         must_test: list[str] | None = None) -> dict | None:
     """v6.1: 构造当前正在测的 surface 的绑定上下文（供 DIM 行解析）。
 
     取 next_untested 的第一个格，构建 surface_id/endpoint/method/param/depth_floor。
     depth_floor 从 knowledge 卡派生（§6.1）。
     """
-    nxt = state.next_untested(1)
+    nxt = state.next_untested(1, must_test=must_test)
     if not nxt:
         return None
     cell = nxt[0]
     surface = cell.get("surface") if isinstance(cell.get("surface"), dict) else {}
     endpoint = cell.get("endpoint", "")
     method = str(surface.get("method") or cell.get("method") or "GET").upper()
-    param = ""
-    params = _listify(surface.get("params")) or _listify(surface.get("param"))
-    if params:
-        param = str(params[0])
+    param = _cell_param(cell)
+    params = [param] if param else []
     roles = surface.get("roles") or cell.get("needed_roles") or ["unknown"]
     risk_tags = _cell_risk_tags(cell)
     # build surface_id (reuse ledger.make_surface_id via import-free local form)
@@ -1323,7 +1515,7 @@ def _current_surface_ctx(state: "CognitiveState", cards: list[dict] | None) -> d
     sid_parts.append(f"[{','.join(roles) if isinstance(roles, list) else roles}]")
     if risk_tags:
         sid_parts.append("{" + ",".join(risk_tags) + "}")
-    surface_id = " ".join(sid_parts)
+    surface_id = " ".join(sid_parts) + f" × {cell.get('vuln', '') or 'general-review'}"
     # depth_floor from cards
     depth_floor = 1
     if cards:
@@ -1332,6 +1524,139 @@ def _current_surface_ctx(state: "CognitiveState", cards: list[dict] | None) -> d
              "params": params}, cards)
     return {"surface_id": surface_id, "endpoint": endpoint, "method": method,
             "param": param, "depth_floor": depth_floor}
+
+
+def _sync_candidate_facts(candidate_ledger: "CandidateLedger", graph: FactIntentGraph,
+                          biz_graph: BusinessGraph,
+                          active_intent: dict | None = None) -> int:
+    """Persist candidate state transitions without freezing a prior refutation."""
+    added = 0
+    for cand in candidate_ledger.candidates:
+        cid = cand.get("candidate_id", "")
+        if not cid:
+            continue
+        existing = [f for f in graph.facts if f.get("source_candidate_id") == cid]
+        c_status = cand.get("status", "")
+        if (c_status in (CONFIRMED, ROOT_CAUSE_SPREAD)
+                and cand.get("proof_status") == "confirmed"):
+            if any(f.get("source_type") == "confirmed" for f in existing):
+                continue
+            fact_data = graph.fact_from_candidate(cand, fact_type="confirmed")
+            if active_intent is not None:
+                fact_data["source_intent_id"] = active_intent.get("intent_id", "")
+            fact, _ = graph.add_fact(fact_data)
+            for old in existing:
+                if old.get("source_type") == "negative":
+                    old["superseded_by_fact_id"] = fact.get("fact_id", "")
+            biz_graph.update_from_fact(fact_data)
+            added += 1
+        elif c_status == REFUTED:
+            if any(f.get("source_type") in {"negative", "confirmed"} for f in existing):
+                continue
+            hypothesis = cand.get("hypothesis", "")
+            evidence_text = " ".join(str(e) for e in cand.get("evidence_refs", []))
+            summary_text = f"{hypothesis} {evidence_text}".strip()
+            if summary_text:
+                neg_data = graph.fact_from_candidate(cand, fact_type="negative")
+                neg_data["summary"] = summary_text
+                graph.add_fact(neg_data)
+                added += 1
+    return added
+
+
+def _bind_proof_confirmed_findings(
+    candidate_ledger: "CandidateLedger | None", normalized_findings: list[dict] | None,
+) -> set[str]:
+    """Atomically bind accepted root findings to candidates and upgrade truth state."""
+    if candidate_ledger is None:
+        return set()
+    bound: set[str] = set()
+    for finding in normalized_findings or []:
+        if (finding.get("acceptance_status") != "accepted"
+                or finding.get("proof_status") != "confirmed"
+                or finding.get("claim_kind") != "root_finding"):
+            continue
+        explicit = str(finding.get("source_candidate_id") or "").strip()
+        candidates = []
+        if explicit:
+            candidate = candidate_ledger.get(explicit)
+            candidates = [candidate] if candidate else []
+        else:
+            finding_key = canonical_surface_key({
+                "endpoint": finding.get("endpoint", ""),
+                "method": finding.get("method") or next(
+                    iter(finding.get("methods") or []), "GET"),
+            })
+            wanted_vc = {
+                str(value).lower()
+                for value in norm_vc_candidates(
+                    finding.get("vuln_class") or finding.get("class") or "")
+            }
+            wanted_params = {str(value).lower() for value in finding.get("params") or []}
+            for candidate in candidate_ledger.candidates:
+                candidate_key = canonical_surface_key({
+                    "endpoint": candidate.get("endpoint", ""),
+                    "method": candidate.get("method", "GET"),
+                })
+                candidate_vc = {
+                    str(value).lower()
+                    for value in norm_vc_candidates(candidate.get("vuln_class", ""))
+                }
+                candidate_param = str(candidate.get("param") or "").lower()
+                if (candidate_key == finding_key
+                        and (not wanted_vc or bool(wanted_vc & candidate_vc))
+                        and (not candidate_param or candidate_param in wanted_params)):
+                    candidates.append(candidate)
+        if len(candidates) != 1:
+            continue
+        candidate = candidates[0]
+        candidate["status"] = CONFIRMED
+        candidate["proof_status"] = "confirmed"
+        candidate["finding_id"] = finding.get("id", "")
+        evidence_ref = finding.get("evidence_file") or finding.get("raw_finding_path")
+        if evidence_ref:
+            refs = _listify(candidate.get("evidence_refs"))
+            if evidence_ref not in refs:
+                refs.append(evidence_ref)
+            candidate["evidence_refs"] = refs
+        bound.add(str(candidate.get("candidate_id") or ""))
+    return bound
+
+
+def _reconcile_candidate_proof(
+    candidate_ledger: "CandidateLedger | None", graph: FactIntentGraph | None,
+    normalized_findings: list[dict] | None,
+) -> set[str]:
+    accepted_finding_ids = {
+        str(item.get("id") or "") for item in normalized_findings or []
+        if item.get("acceptance_status") == "accepted"
+        and item.get("proof_status") == "confirmed"
+    }
+    revoked: set[str] = set()
+    if candidate_ledger is None:
+        return revoked
+    for candidate in candidate_ledger.candidates:
+        if candidate.get("proof_status") != "confirmed":
+            continue
+        if str(candidate.get("finding_id") or "") in accepted_finding_ids:
+            continue
+        cid = str(candidate.get("candidate_id") or "")
+        revoked.add(cid)
+        candidate["proof_status"] = "pending"
+        candidate["status"] = PROOF_READY
+        candidate["finding_id"] = ""
+    if graph is not None and revoked:
+        revoked_fact_ids = set()
+        for fact in graph.facts:
+            if str(fact.get("source_candidate_id") or "") in revoked:
+                fact["source_type"] = "proof_pending"
+                fact["proof_status"] = "pending"
+                revoked_fact_ids.add(str(fact.get("fact_id") or ""))
+        for intent in graph.intents:
+            if str(intent.get("source_fact_id") or "") in revoked_fact_ids:
+                intent["status"] = "superseded"
+                intent["outcome_summary"] = "source finding failed final proof gate"
+    return revoked
 
 
 # ── 主循环（§3 + 支柱 1：不首洞即停，覆盖闭合/预算/危险闸三选一终止）──────
@@ -1480,7 +1805,17 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
     # the authoritative set of surface_cells that set_cell() may close this run.
     # Only active when must_test_cells is non-empty (i.e. surface_budget>0
     # produced a bounded authorized set).  budget=0 → no constraint (legacy).
-    _mt_cells = run_scope.get("must_test_cells") or []
+    admitted_surfaces = {canonical_surface_key(item) for item in run_scope.get("must_test") or []}
+    _mt_cells = [
+        _cell_budget_key(cell) for cell in state.matrix.values()
+        if _cell_surface_key(cell) in admitted_surfaces
+    ]
+    run_scope["must_test_cells"] = list(dict.fromkeys(_mt_cells))
+    run_scope["surface_cell_total"] = len(run_scope["must_test_cells"])
+    try:
+        save_run_scope(bb_dir, run_scope)
+    except Exception:
+        pass
     if surface_budget and surface_budget > 0 and _mt_cells:
         state.set_budget(set(_mt_cells), policy="defer")
         if verbose:
@@ -1490,6 +1825,9 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         state.set_budget(None)  # explicit: no budget active
     # v8.5.2: Intent lifecycle tracking (resolve_intent pipeline)
     _active_intent = None          # currently claimed intent for next turn
+    _active_intent_baseline = None
+    _claimed_intent_ids_this_run: set[str] = set()
+    run_scope["claimed_intents_this_run"] = 0
 
     last_progress = time.time()
     last_marker = None
@@ -1507,8 +1845,10 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         dynamic_hint = _knowledge_hint_for_state(state, knowledge_cards)
         combined_hint = "\n\n".join(x for x in (skill_hint, dynamic_hint) if x)
         # v6.1 §10.2: 构造 candidate_block（风险维应答表/工作队列/proof保底）
-        candidate_block = _build_candidate_block(state, candidate_ledger, knowledge_cards,
-                                                  candidate_top_n=candidate_top_n)
+        _must_test = run_scope.get("must_test") if run_scope else None
+        candidate_block = _build_candidate_block(
+            state, candidate_ledger, knowledge_cards,
+            candidate_top_n=candidate_top_n, must_test=_must_test)
         loop_phase = loop_reason = ""
         if has_matrix:
             loop_phase, loop_reason = _select_loop_phase(
@@ -1530,6 +1870,7 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                 lens=lens,
                 adversarial_pass=adversarial_pass,
                 no_flow_surfaces=no_flow_surfaces,
+                must_test=_must_test,
             )
             candidate_block = "\n\n".join(x for x in (loop_control, candidate_block) if x)
         # v8.5.2/v8.6: Intent lifecycle — resolve previous, claim next
@@ -1547,37 +1888,82 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                     and f.get("source_intent_id") == aid)
             ]
             if _new_facts:
+                attempts += 1
                 graph.resolve_intent(aid, "completed",
                                      summary=f"产出 {len(_new_facts)} 个新发现",
                                      spawned_facts=_new_facts,
                                      attempts=attempts)
                 if verbose:
                     print(f"  [turn {turn}] ✅ Intent {aid} resolved (completed)")
-            elif attempts >= 3:
+            else:
+                baseline = _active_intent_baseline or (0, 0)
+                evidence_progress = (
+                    count_evidence_files(wd) > baseline[0]
+                    or sum(len(c.get("evidence_refs") or [])
+                           for c in (candidate_ledger.candidates if candidate_ledger else [])) > baseline[1]
+                )
+                if evidence_progress:
+                    attempts += 1
+                    _active_intent["attempts"] = attempts
+            dispatches = int(_active_intent.get("dispatches", 0) or 0)
+            speculative_intent = _active_intent.get("source") in {
+                "chain", "escalation", "recon", "cross"
+            }
+            if (not _new_facts
+                    and (attempts >= 3 or (speculative_intent and dispatches >= 2))):
                 # v8.6: require structured reason for deferral
                 graph.resolve_intent(aid, "deferred",
-                                     summary=f"展示{attempts}次无新发现，推迟",
+                                     summary=f"调度{dispatches}次、证据尝试{attempts}次无新发现，推迟",
                                      reason="no_observable_signal",
                                      attempts=attempts)
                 if verbose:
                     print(f"  [turn {turn}] ⏭ Intent {aid} deferred "
                           f"(reason=no_observable_signal, attempts={attempts})")
-            else:
+            elif not _new_facts:
                 graph.release_intent(
-                    aid, summary=f"第 {attempts} 次尝试无可观测新 Fact，继续追踪")
+                    aid, summary=(
+                        f"第 {attempts} 次有证据尝试尚无新 Fact，继续追踪"
+                        if evidence_progress else "本轮无新增物理证据，不计 attempt"))
             _active_intent = None
+            _active_intent_baseline = None
 
         # Claim next intent and build graph context
         # v8.6 rc3: intent_budget hard-limits how many intents enter the prompt.
         # get_pending_intents already filters out completed/abandoned/superseded
         # (only status=="pending" returns), so the "no reappear" contract holds.
         _intent_limit = intent_budget if intent_budget and intent_budget > 0 else 5
-        pending_intents = graph.get_pending_intents(limit=_intent_limit)
+        pending_intents = graph.get_pending_intents(limit=max(_intent_limit, 30))
+        high_value_open = any(
+            cell.get("state") in (UNTESTED, SHALLOW_NEGATIVE)
+            and _cell_high_value(cell)
+            for cell in state.matrix.values()
+        )
+        # Reserve at least three of every four turns for new root-cause
+        # coverage while high-value cells remain.  Chain/spread are depth
+        # follow-ups, not a reason to starve undiscovered roots.
+        if high_value_open and turn % 4 != 0:
+            pending_intents = [
+                intent for intent in pending_intents
+                if intent.get("source") not in {"chain", "escalation", "recon", "cross"}
+            ]
+        pending_intents = [
+            intent for intent in pending_intents
+            if (intent.get("intent_id") in _claimed_intent_ids_this_run
+                or not intent_budget or intent_budget <= 0
+                or len(_claimed_intent_ids_this_run) < intent_budget)
+        ][:_intent_limit]
         if pending_intents or graph_stats["total_facts"] > 0:
             # Claim top intent for this turn
             if pending_intents:
                 _active_intent = pending_intents[0]
-                graph.claim_intent(_active_intent["intent_id"])
+                _claimed_intent_ids_this_run.add(_active_intent["intent_id"])
+                run_scope["claimed_intents_this_run"] = len(_claimed_intent_ids_this_run)
+                graph.claim_intent(_active_intent["intent_id"], increment_attempt=False)
+                _active_intent_baseline = (
+                    count_evidence_files(wd),
+                    sum(len(c.get("evidence_refs") or [])
+                        for c in (candidate_ledger.candidates if candidate_ledger else [])),
+                )
                 # rc3: backup intents capped by intent_budget (not hardcoded 4)
                 backup_intents = pending_intents[1:_intent_limit]
 
@@ -1612,30 +1998,42 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         for _f in graph.facts:
             _f.setdefault("_pre_turn", True)
         text_parts = []
+        command_scan_buffer = ""
+        seen_executed_commands: set[str] = set()
+        stream = adapter.run(prompt, session_id=sid)
         try:                                                  # 流式中断（网络波动/适配器异常）→ 抢救本轮
-            for chunk in adapter.run(prompt, session_id=sid): # 流式
-                for cmd in extract_executed_cmds(chunk):      # ⚙ 只判「已执行命令」，不判数据/叙述
-                    verdict, why = classify_action(cmd, owned_ids)
-                    if verdict == BLOCK:                      # ⛔ 灾难必杀（整表/整库/宿主级）→ 终止②(危险闸)
-                        if verbose: print(f"  [turn {turn}] ⛔ 灾难命令必杀: {why} → 终止\n      命令: {cmd[:200]}")
-                        state.save(state_path)
-                        coverage_ledger = _sync_coverage_ledger(state, wd)
-                        _log_event(wd, {"ev": "halt", "kind": "block", "turn": turn,
-                                        "why": why, "cmd": cmd[:200],
-                                        "coverage_ledger": derive_coverage(coverage_ledger)})
-                        return {"status": "error", "reason": f"danger:{why}", "cmd": cmd[:200],
-                                "turn": turn, "state": _state_asdict_jsonsafe(state)}
-                    if verdict == CONFIRM and confirm_policy != "allow":   # ⏸ 改删他人/未知 → 熔断交人工(终止②)
-                        if verbose: print(f"  [turn {turn}] ⏸ 需人工确认: {why} → 暂停\n      命令: {cmd[:200]}")
-                        state.inject_directive(f"在改删类操作处暂停待确认：{why}")
-                        state.save(state_path)
-                        coverage_ledger = _sync_coverage_ledger(state, wd)
-                        _log_event(wd, {"ev": "halt", "kind": "confirm", "turn": turn,
-                                        "why": why, "cmd": cmd[:200],
-                                        "coverage_ledger": derive_coverage(coverage_ledger)})
-                        return {"status": "needs_confirm", "reason": why, "cmd": cmd[:200],
-                                "turn": turn, "state": _state_asdict_jsonsafe(state)}
-                text_parts.append(chunk)
+            try:
+                for chunk in stream:                          # 流式
+                    command_scan_buffer = (command_scan_buffer + chunk)[-16000:]
+                    for cmd in extract_executed_cmds(command_scan_buffer):
+                        if cmd in seen_executed_commands:
+                            continue
+                        seen_executed_commands.add(cmd)
+                        verdict, why = classify_action(cmd, owned_ids)
+                        if verdict == BLOCK:                  # ⛔ 灾难必杀（整表/整库/宿主级）→ 终止②(危险闸)
+                            if verbose: print(f"  [turn {turn}] ⛔ 灾难命令必杀: {why} → 终止\n      命令: {cmd[:200]}")
+                            state.save(state_path)
+                            coverage_ledger = _sync_coverage_ledger(state, wd)
+                            _log_event(wd, {"ev": "halt", "kind": "block", "turn": turn,
+                                            "why": why, "cmd": cmd[:200],
+                                            "coverage_ledger": derive_coverage(coverage_ledger)})
+                            return {"status": "error", "reason": f"danger:{why}", "cmd": cmd[:200],
+                                    "turn": turn, "state": _state_asdict_jsonsafe(state)}
+                        if verdict == CONFIRM and confirm_policy != "allow":  # ⏸ 改删他人/未知 → 熔断交人工
+                            if verbose: print(f"  [turn {turn}] ⏸ 需人工确认: {why} → 暂停\n      命令: {cmd[:200]}")
+                            state.inject_directive(f"在改删类操作处暂停待确认：{why}")
+                            state.save(state_path)
+                            coverage_ledger = _sync_coverage_ledger(state, wd)
+                            _log_event(wd, {"ev": "halt", "kind": "confirm", "turn": turn,
+                                            "why": why, "cmd": cmd[:200],
+                                            "coverage_ledger": derive_coverage(coverage_ledger)})
+                            return {"status": "needs_confirm", "reason": why, "cmd": cmd[:200],
+                                    "turn": turn, "state": _state_asdict_jsonsafe(state)}
+                    text_parts.append(chunk)
+            finally:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
         except Exception as e:
             # 中途断流：抢救本轮——已落盘证据本就独立于流(模型自己写的)，这里把已抓文本并进状态、
             # 采证、存盘、记日志，再走 _conclude 把已证报告过一遍 Guardian，标 interrupted（可 --resume 续）。
@@ -1643,6 +2041,10 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
             evidence = harvest_evidence(wd, authorized_hosts=authorized_hosts)
             state.update(text, evidence, maintain_matrix=has_matrix, cards=knowledge_cards,
                          candidate_ledger=candidate_ledger)
+            _bind_proof_confirmed_findings(
+                candidate_ledger, evidence.get("normalized_findings", []))
+            if candidate_ledger is not None:
+                _sync_candidate_facts(candidate_ledger, graph, biz_graph, _active_intent)
             state.save(state_path)
             if candidate_ledger is not None:
                 candidate_ledger.save(candidate_ledger_path)
@@ -1676,43 +2078,20 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                     {"endpoint": ep, "method": "GET"} for ep in _new_endpoints
                 ], target_domains=target_domains)
         # v6.1: 构造当前 surface_ctx（DIM 行的 surface 绑定上下文）
-        _surface_ctx = _current_surface_ctx(state, knowledge_cards) if has_matrix else None
+        _surface_ctx = (_current_surface_ctx(state, knowledge_cards, must_test=_must_test)
+                        if has_matrix else None)
         notes = state.update(text, evidence, maintain_matrix=has_matrix,
                              cards=knowledge_cards,
                              candidate_ledger=candidate_ledger,
                              surface_ctx=_surface_ctx)  # 并进状态 + 回填矩阵 → 闭格说明
+        _bind_proof_confirmed_findings(
+            candidate_ledger, evidence.get("normalized_findings", []))
         # v8.5: 从候选台账生成结构化 Fact + Intent（替代 v8.4 的 state.verified 空字段循环）
         # 使用 fact_from_candidate 填充 endpoint/vuln_class/params/chain 等字段，
         # 使 IntentRuleEngine 8 条规则能被真正触发。
         # v8.5.1: _chainable_vuln replaced by is_chainable() from vuln_classes.py
         if candidate_ledger is not None:
-            for cand in candidate_ledger.candidates:
-                cid = cand.get("candidate_id", "")
-                if not cid:
-                    continue
-                existing = [f for f in graph.facts if f.get("source_candidate_id") == cid]
-                if existing:
-                    continue
-                c_status = cand.get("status", "")
-                if c_status in (CONFIRMED, ROOT_CAUSE_SPREAD):
-                    fact_data = graph.fact_from_candidate(cand, fact_type="confirmed")
-                    if _active_intent is not None:
-                        fact_data["source_intent_id"] = _active_intent.get("intent_id", "")
-                    # Infer chain_feasible when vuln_class is in chainable set
-                    if (not fact_data.get("chain_feasible")
-                            and is_chainable(fact_data.get("vuln_class", ""))):
-                        fact_data["chain_feasible"] = True
-                    graph.add_fact(fact_data)
-                    biz_graph.update_from_fact(fact_data)
-                elif c_status == REFUTED:
-                    # Negative fact: enables WAF bypass Rule 5 if WAF keywords present
-                    hypothesis = cand.get("hypothesis", "")
-                    evidence_text = " ".join(str(e) for e in cand.get("evidence_refs", []))
-                    summary_text = f"{hypothesis} {evidence_text}".strip()
-                    if summary_text:
-                        neg_data = graph.fact_from_candidate(cand, fact_type="negative")
-                        neg_data["summary"] = summary_text
-                        graph.add_fact(neg_data)
+            _sync_candidate_facts(candidate_ledger, graph, biz_graph, _active_intent)
         else:
             # Fallback: no candidate ledger (no matrix mode) — use state.verified
             for finding_id in (state.verified or []):
@@ -1780,15 +2159,20 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
             return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
                              candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph, run_scope=run_scope)
 
-        # v8.6: surface_budget enforcement — stop when tested endpoints >= budget
+        # v8.6: a surface budget authorizes complete METHOD/path surfaces, not
+        # just the first cell on each path.  Stop only after every authorized
+        # vuln-class cell has reached a terminal state.
         if surface_budget and surface_budget > 0 and has_matrix:
-            _tested_eps = set()
+            _open_authorized = []
             for _c in state.matrix.values():
-                if _c["state"] not in (UNTESTED,):
-                    _tested_eps.add(_c.get("endpoint", ""))
-            if len(_tested_eps) >= surface_budget:
-                if verbose: print(f"  [turn {turn}] ✅ surface_budget={surface_budget} reached "
-                                  f"({len(_tested_eps)} endpoints tested) → 收口")
+                _cell_key = _cell_budget_key(_c)
+                if (_cell_key in state.allowed_cells
+                        and (_c.get("state") in (UNTESTED, SHALLOW_NEGATIVE)
+                             or _c.get("needs"))):
+                    _open_authorized.append(_cell_key)
+            if state.allowed_cells and not _open_authorized:
+                if verbose: print(f"  [turn {turn}] ✅ surface_budget={surface_budget} "
+                                  f"授权的 {len(state.allowed_cells)} 个 cells 全部闭合 → 收口")
                 return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
                                  candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph, run_scope=run_scope)
 
@@ -1839,15 +2223,17 @@ def _build_project_coverage(biz_graph: BusinessGraph, ledger_surfaces: list[dict
     """Build cumulative domain coverage using canonical METHOD/path keys."""
     prior_index = prior_index or {}
     closed_statuses = {"confirmed", "not_vulnerable", "not_applicable"}
-    current_tested: dict[str, bool] = {}
+    current_cells: dict[str, dict[str, int]] = {}
     for surface in ledger_surfaces or []:
         key = canonical_surface_key({
             "endpoint": surface.get("endpoint", ""),
             "method": surface.get("method", "GET"),
         })
         if key:
-            current_tested[key] = current_tested.get(key, False) or (
-                surface.get("status") in closed_statuses)
+            counts = current_cells.setdefault(key, {"total": 0, "closed": 0})
+            counts["total"] += 1
+            if surface.get("status") in closed_statuses:
+                counts["closed"] += 1
 
     surface_index: dict[str, dict] = {}
     all_keys = set(prior_index) | set(biz_graph.endpoint_map)
@@ -1858,12 +2244,22 @@ def _build_project_coverage(biz_graph: BusinessGraph, ledger_surfaces: list[dict
         value = meta.get("value") or prior.get("value") or "medium"
         if value not in {"high", "medium", "low"}:
             value = "medium"
-        tested = bool(prior.get("tested", False) or current_tested.get(key, False))
+        counts = current_cells.get(key)
+        if counts is not None:
+            tested = bool(counts["total"] and counts["closed"] == counts["total"])
+            cells_total = counts["total"]
+            cells_closed = counts["closed"]
+        else:
+            tested = bool(prior.get("tested", False))
+            cells_total = int(prior.get("cells_total", 0) or 0)
+            cells_closed = int(prior.get("cells_closed", cells_total if tested else 0) or 0)
         surface_index[key] = {
             "domains": domains,
             "value": value,
             "tested": tested,
             "status": "tested" if tested else "not_tested",
+            "cells_total": cells_total,
+            "cells_closed": cells_closed,
         }
 
     domains_covered: dict[str, dict[str, Any]] = {}
@@ -1890,26 +2286,37 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
     v6.1: 候选台账闭环 —— 阴性 depth floor 闭环校验（§6.2）、四类缺口渲染（§8.2）、
     proof_ready 无 finding → 终态强制 incomplete（§D6）。
     """
-    # A run boundary is a durable lifecycle boundary.  Never persist a
-    # transient claimed state: an unfinished attempt becomes a structured
-    # deferred Intent so the next run can reason about it explicitly.
+    # A run boundary is a durable lifecycle boundary.  Never persist claimed;
+    # attempts below the evidence-backed deferral threshold return to pending.
     if graph is not None:
         for intent in list(graph.intents):
             if intent.get("status") == "claimed":
                 attempts = int(intent.get("attempts", 0) or 0)
-                reason = (
-                    "human_verification_needed" if marker == "NEED_INPUT"
-                    else "no_observable_signal" if attempts >= 3
-                    else "insufficient_traffic"
-                )
-                graph.resolve_intent(
-                    intent.get("intent_id", ""), "deferred",
-                    summary="run ended before the Intent produced a confirmed Fact",
-                    reason=reason,
-                    attempts=attempts,
-                )
-    triage_ledger = triage(evidence["reports"], evidence_dir=str(wd),
+                if marker == "NEED_INPUT":
+                    graph.resolve_intent(
+                        intent.get("intent_id", ""), "blocked",
+                        summary="run ended at a human-input boundary",
+                        reason="human_verification_needed", attempts=attempts)
+                elif attempts >= 3:
+                    graph.resolve_intent(
+                        intent.get("intent_id", ""), "deferred",
+                        summary="three evidence-backed attempts produced no confirmed Fact",
+                        reason="no_observable_signal", attempts=attempts)
+                else:
+                    graph.release_intent(
+                        intent.get("intent_id", ""),
+                        summary="run ended before the evidence-backed attempt threshold")
+    # Legacy Markdown can still be linted and shown as a migration candidate,
+    # but it is never an accepted/scored finding and can never keep a cell
+    # closed.  This removes the last metadata/self-narration compatibility path.
+    legacy_triage = triage(evidence.get("reports", []), evidence_dir=str(wd),
                            authorized_hosts=authorized_hosts)
+    triage_ledger = {
+        ACCEPTED: [],
+        "demoted": list(legacy_triage.get("demoted", []))
+                   + list(legacy_triage.get(ACCEPTED, [])),
+        "rejected": list(legacy_triage.get("rejected", [])),
+    }
     structured_guardian_accepted = []
     structured_guardian_rejected = []
     normalized_by_path = {
@@ -1936,8 +2343,78 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
                 "path": str(finding_path),
                 "reasons": [f"guardian:{verdict.result}:L{verdict.level}:{verdict.reason}"],
             })
-    has_valid = (len(triage_ledger[ACCEPTED]) + len(structured_guardian_accepted)) > 0
+    # Deterministic replay is a verdict gate, not an informational annotation.
+    verified = []
+    verification_rejected: list[dict] = []
+    verification_pending: list[dict] = []
+    if verify_fn:
+        for verdict, report in legacy_triage[ACCEPTED]:
+            try:
+                result = verify_fn(report)
+                replay_result = result.result
+                replay_reason = result.reason
+            except Exception as exc:
+                replay_result = "inconclusive"
+                replay_reason = f"verify_error:{type(exc).__name__}:{exc}"
+            verified.append((verdict.severity, replay_result))
+            if replay_result == "refuted":
+                verification_rejected.append({
+                    "kind": "legacy", "severity": verdict.severity,
+                    "reason": replay_reason,
+                })
+            elif replay_result not in {"confirmed", "not_applicable"}:
+                verification_pending.append({
+                    "kind": "legacy", "severity": verdict.severity,
+                    "reason": replay_reason,
+                })
+
+        finding_verifier = getattr(verify_fn, "verify_finding", None)
+        if callable(finding_verifier):
+            kept_structured = []
+            kept_paths: set[str] = set()
+            for item in structured_guardian_accepted:
+                finding_path = pathlib.Path(item.get("path") or "")
+                try:
+                    result = finding_verifier(
+                        item.get("finding") or {}, finding_path.parent)
+                    replay_result = result.result
+                    replay_reason = result.reason
+                except Exception as exc:
+                    replay_result = "inconclusive"
+                    replay_reason = f"verify_error:{type(exc).__name__}:{exc}"
+                verified.append((item["verdict"].severity, replay_result))
+                if replay_result in {"confirmed", "not_applicable"}:
+                    kept_structured.append(item)
+                    kept_paths.add(str(finding_path.resolve()))
+                elif replay_result == "refuted":
+                    verification_rejected.append({
+                        "kind": "structured", "id": item.get("id"),
+                        "path": str(finding_path), "reason": replay_reason,
+                    })
+                else:
+                    verification_pending.append({
+                        "kind": "structured", "id": item.get("id"),
+                        "path": str(finding_path), "reason": replay_reason,
+                    })
+            structured_guardian_accepted = kept_structured
+            normalized_structured = [
+                nf for nf in normalized_structured
+                if str((pathlib.Path(wd) / str(
+                    nf.get("raw_finding_path") or nf.get("evidence_file") or "")).resolve())
+                in kept_paths
+            ]
+    revoked_candidates = _reconcile_candidate_proof(
+        candidate_ledger, graph, normalized_structured)
+    accepted_refs = [str(item.get("path") or "") for item in structured_guardian_accepted]
+    reopened_positives = _reopen_unaccepted_positives(state, pathlib.Path(wd), accepted_refs)
+    has_valid = len(structured_guardian_accepted) > 0
     status = finalize(marker, has_valid)
+    if (verification_rejected or verification_pending) and status in {
+        "vuln_found", "low_roi", "complete"
+    }:
+        status = "incomplete"
+    if reopened_positives and status in {"vuln_found", "low_roi", "complete"}:
+        status = "incomplete"
     cand_list = candidate_ledger.candidates if candidate_ledger else []
     coverage_ledger = _sync_coverage_ledger(state, wd, candidates=cand_list)
     # v6.1 §6.2: 阴性 depth floor 闭环校验 —— 对每个 not_vulnerable surface 复核
@@ -1949,10 +2426,31 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
                 neg_obj = _surface_neg_obj(surface)
                 if neg_obj is not None:
                     sufficient, _missing = negative_sufficient(surface, neg_obj, cards)
-                    if not sufficient:
+                    lookup = canonical_surface_key({
+                        "endpoint": surface.get("endpoint", ""),
+                        "method": surface.get("method", "GET"),
+                    })
+                    vuln_class = (surface.get("vuln_class")
+                                  or surface.get("legacy_vuln") or "")
+                    cell = state._find_cell(
+                        lookup, vuln_class,
+                        param=str(surface.get("param") or "").strip())
+                    if sufficient:
+                        surface["negative_depth_checked"] = True
+                        if cell is not None:
+                            cell["negative_depth_checked"] = True
+                    else:
                         surface["status"] = "not_tested"
                         surface.setdefault("next_actions", []).append(
                             "阴性证据不达 depth floor，补向量")
+                        surface["negative_depth"] = "shallow"
+                        if cell is not None:
+                            cell["state"] = SHALLOW_NEGATIVE
+                            cell["negative_depth_checked"] = False
+                            cell.setdefault("next_actions", []).append(
+                                "阴性证据不达 depth floor，补向量")
+        coverage_ledger.save(pathlib.Path(wd) / "coverage-ledger.json")
+        state.save(pathlib.Path(wd) / "state.json")
     # P1-3：discovery 饱和标志（来自 inventory.json，重算以权威；无 inventory → None）
     saturation_reached = None
     inv_path = pathlib.Path(wd) / "inventory.json"
@@ -1966,7 +2464,8 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
     # v6.1: finding_candidate_ids = 有 confirmed/root_cause_spread 候选（已出 finding）
     finding_cand_ids = {str(c.get("candidate_id", ""))
                         for c in cand_list
-                        if c.get("status") in (CONFIRMED, "root_cause_spread")}
+                        if c.get("status") in (CONFIRMED, "root_cause_spread")
+                        and c.get("proof_status") == "confirmed"}
     session_gate = evaluate_session_gate(
         coverage_ledger,
         evidence_dir=str(wd),
@@ -2021,19 +2520,20 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
             "needs_input": "needs_input",
             "error": "error",
         }.get(gate_result, "incomplete")
-    verified = []
-    if verify_fn:                                             # 可选：对 accepted 做确定性重放
-        for v, rep in triage_ledger[ACCEPTED]:
-            try: verified.append((v.severity, verify_fn(rep).result))
-            except Exception as e: verified.append((v.severity, f"verify_error:{e}"))
+    ledger_stats = coverage_ledger.stats()
+    if (ledger_stats.get("out_of_run", 0) > 0
+            and status in {"complete", "vuln_found", "low_roi"}):
+        status = "incomplete"
     state.save(wd / "state.json")
     # P1-2：覆盖完成度指标 —— ledger 中 next_actions 非空的 surface 数。
     open_next_actions_count = sum(
         1 for s in coverage_ledger.surfaces if s.get("next_actions"))
     # P2-3：accepted 报告按根因聚合（同 endpoint+root_cause+affected_role 不重复计）。
     findings = aggregate_findings([rep for _, rep in triage_ledger[ACCEPTED]])
+    legacy_candidates = aggregate_findings(
+        [rep for _, rep in legacy_triage.get(ACCEPTED, [])])
     # v6.1 §8.2: 四类缺口清单（发现但没测/测了没深入/阻塞未恢复/漏进报告）
-    demoted_count = len(triage_ledger["demoted"])
+    demoted_count = len(triage_ledger["demoted"]) + len(verification_pending)
     verify_uncertain_count = sum(1 for _sev, v in verified if v == "inconclusive") if verify_fn else 0
     coverage_gaps = compute_coverage_gaps(
         cand_list,
@@ -2072,6 +2572,12 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
             + [item["verdict"].severity for item in structured_guardian_accepted]
         ),
         "findings": findings,                       # 聚合后（accepted 原样保留，不丢信息）
+        "legacy_candidates": legacy_candidates,     # 仅迁移/人工复核，不计分、不闭格
+        "legacy_guardian": {
+            "candidate": len(legacy_triage.get(ACCEPTED, [])),
+            "demoted": len(legacy_triage.get("demoted", [])),
+            "rejected": len(legacy_triage.get("rejected", [])),
+        },
         "normalized_findings": normalized_structured,
         "structured_findings": {
             "accepted": len(structured_guardian_accepted),
@@ -2086,8 +2592,14 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
         "final_report_path": final_report_path,
         "final_report_status": final_report_status,
         "verified": verified,
-        "demoted": len(triage_ledger["demoted"]),
-        "rejected": len(triage_ledger["rejected"]) + len(structured_guardian_rejected),
+        "reopened_unaccepted_positives": reopened_positives,
+        "revoked_unaccepted_candidates": sorted(revoked_candidates),
+        "verification_pending": verification_pending,
+        "verification_rejected": verification_rejected,
+        "demoted": len(triage_ledger["demoted"]) + len(verification_pending),
+        "rejected": (len(triage_ledger["rejected"])
+                     + len(structured_guardian_rejected)
+                     + len(verification_rejected)),
         "negatives": len(evidence.get("negatives", [])),
         "coverage": state.matrix_stats() if state.matrix else None,
         "coverage_ledger": derive_coverage(coverage_ledger),
@@ -2117,6 +2629,8 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
             "scheduled_count": len(run_scope.get("must_test", [])) if run_scope else 0,
             "accepted_updates": state.accepted_updates,
             "ignored_by_budget": state.ignored_by_budget,
+            "claimed_intents_this_run": int(
+                run_scope.get("claimed_intents_this_run", 0)) if run_scope else 0,
         },
         # rc3: allowed_cells is a runtime set — convert to list for JSON safety
         "state": {**asdict(state), "allowed_cells": list(state.allowed_cells)},
@@ -2134,6 +2648,15 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
             for neg in evidence.get("negatives", []):
                 _ep = neg.get("endpoint", "")
                 _vc = neg.get("vuln", neg.get("vuln_class", ""))
+                _negative_cell = {
+                    "endpoint": _ep,
+                    "method": neg.get("method", "GET"),
+                    "param": neg.get("param", ""),
+                    "vuln": _vc,
+                    "risk_tags": [],
+                }
+                _depth_sufficient, _ = negative_sufficient(
+                    _negative_cell, neg, cards or [])
                 _run_negatives.append({
                     "surface_key": (
                         f"{canonical_surface_key({'endpoint': _ep, 'method': neg.get('method', 'GET')})}"
@@ -2144,8 +2667,13 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
                     "param": neg.get("param", ""),
                     "vuln_class": _vc,
                     "vectors_tried": neg.get("vectors_tried", 1),
-                    "depth_sufficient": neg.get("depth_sufficient", False),
+                    "depth_sufficient": _depth_sufficient,
                     "file": neg.get("file", ""),
+                    "vectors": neg.get("vectors", []),
+                    "response_count": neg.get("response_count", 0),
+                    "evidence_types": neg.get("evidence_types", []),
+                    "identities": neg.get("identities", []),
+                    "roles": neg.get("roles", []),
                 })
             merge_run_to_blackboard(str(_bb_path), graph, run_id, _run_negatives)
             # v8.6: persist business graph alongside blackboard

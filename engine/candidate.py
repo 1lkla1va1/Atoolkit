@@ -337,15 +337,20 @@ def compute_depth_score(candidate: dict[str, Any], all_candidates: list[dict] | 
     if has_response and (len(roles) >= 2 or len(objects) >= 2):
         score += 1
     rc = candidate.get("root_cause")
-    if rc and all_candidates:
+    if rc and all_candidates and has_response:
         siblings = [c for c in all_candidates
                     if _norm(c.get("root_cause")) == _norm(rc)
                     and c.get("candidate_id") != candidate.get("candidate_id")
-                    and c.get("status") in (CONFIRMED, ROOT_CAUSE_SPREAD)]
+                    and c.get("status") in (CONFIRMED, ROOT_CAUSE_SPREAD)
+                    and c.get("evidence_refs")
+                    and (
+                        _norm_endpoint(c.get("endpoint", "")) != _norm_endpoint(candidate.get("endpoint", ""))
+                        or _norm(c.get("param")) != _norm(candidate.get("param"))
+                        or _norm(c.get("role")) != _norm(candidate.get("role"))
+                    )]
         if siblings:
             score += 1
-    if candidate.get("root_cause_spread_done"):
-        score = max(score, 4)  # 扩散已做至少 4
+            candidate["root_cause_spread_done"] = True
     return score
 
 
@@ -389,15 +394,15 @@ def work_queue_priority(cand: dict[str, Any]) -> tuple:
     depth_floor = int(cand.get("depth_floor", 1) or 1)
     depth_score = int(cand.get("depth_score", 0) or 0)
     if status == PROOF_READY:
-        return (0, -_value_tier(cand), -depth_score)
+        return (0, _value_tier(cand), -depth_score)
     if status == TRIAGING and depth_score < depth_floor:
-        return (1, -_value_tier(cand))
+        return (1, _value_tier(cand))
     if status == PROPOSED and is_high_value(cand):
-        return (2, -_value_tier(cand))
-    if status == PROPOSED:
-        return (3, -_value_tier(cand))
+        return (2, _value_tier(cand))
     if status == CONFIRMED and not cand.get("root_cause_spread_done"):
-        return (1, -_value_tier(cand), -depth_score)  # confirmed 但未扩散 → 优先扩散
+        return (3, _value_tier(cand), -depth_score)
+    if status == PROPOSED:
+        return (4, _value_tier(cand))
     if status == REFUTED and cand.get("reprobe_triggers"):
         return (4,)  # §6.3 再探测
     if status == BLOCKED and cand.get("blocker", {}).get("recoverable"):
@@ -753,7 +758,14 @@ class CandidateLedger:
                     notes.append(f"[TRIAGE] {tri['candidate_id']} proof_ready 被拒："
                                  f"depth_score {cand['depth_score']} < floor {cand['depth_floor']} → 退回 triaging")
                     continue
-            cand["status"] = verdict if verdict != "needs_more" else TRIAGING
+            if verdict == "confirmed":
+                # Model text can declare readiness, not truth.  A candidate is
+                # upgraded to CONFIRMED only when a proof-confirmed structured
+                # root finding is bound by the orchestrator.
+                cand["reported_verdict"] = "confirmed"
+                cand["status"] = PROOF_READY
+            else:
+                cand["status"] = verdict if verdict != "needs_more" else TRIAGING
             if tri["evidence_ref"]:
                 refs = _as_list(cand.get("evidence_refs"))
                 if tri["evidence_ref"] not in refs:
@@ -784,10 +796,12 @@ class CandidateLedger:
             if not cand:
                 continue
             cand["root_cause"] = spr["root_cause"]
-            cand["root_cause_spread_done"] = True
-            cand["status"] = ROOT_CAUSE_SPREAD if cand["status"] == CONFIRMED else cand["status"]
+            # A SPREAD line is a plan, not proof.  Completion/depth credit is
+            # derived only after a distinct sibling candidate has raw evidence.
+            cand["spread_requested"] = True
+            cand.setdefault("spread_targets", []).append(spr["targets"])
             cand["updated_turn"] = turn
-            notes.append(f"[SPREAD] {spr['candidate_id']} root_cause={spr['root_cause']} targets={spr['targets']}")
+            notes.append(f"[SPREAD] {spr['candidate_id']} 已登记扩散计划；等待独立兄弟证据")
             if link_callback and cand.get("surface_id"):
                 link_callback(cand["surface_id"], status=cand["status"],
                               depth_score=int(cand.get("depth_score", 0) or 0))

@@ -69,9 +69,22 @@ class TestD1_FlowCompletion:
         if not all_eps:
             pytest.skip("D1: no flow endpoints returned")
         tested_ep = all_eps[0]
-        bb_tested = {"facts": [{"endpoint": tested_ep}], "intents": [],
+        bb_tested = {"facts": [{"endpoint": tested_ep, "source_type": "confirmed"}], "intents": [],
                      "negatives": [], "dead_ends": [], "discovered_endpoints": []}
         filtered = scheduler._flow_completion_endpoints(bg.export_dict(), bb_tested)
         assert tested_ep not in filtered, (
             f"D1: tested endpoint {tested_ep!r} still in flow completion list"
         )
+
+    def test_discovered_endpoint_is_not_treated_as_tested(self):
+        bg = {"flows": [{"steps": [
+            {"endpoint": "GET /api/order"},
+            {"endpoint": "POST /api/refund"},
+        ]}]}
+        bb = {
+            "facts": [{"endpoint": "/api/order", "method": "GET",
+                       "source_type": "confirmed"}],
+            "negatives": [], "dead_ends": [],
+            "discovered_endpoints": ["POST /api/refund"],
+        }
+        assert scheduler._flow_completion_endpoints(bg, bb) == ["POST /api/refund"]

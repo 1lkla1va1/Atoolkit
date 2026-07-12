@@ -110,10 +110,24 @@ def normalize_finding(
     if isinstance(crypto, dict):
         for ref in crypto.get("helper_files") or []:
             add_ref(ref)
+    verification = finding.get("verification") or {}
+    access_expectation = (verification.get("access_expectation")
+                          if isinstance(verification, dict) else {}) or {}
+    if isinstance(access_expectation, dict):
+        for ref in access_expectation.get("proof_refs") or []:
+            add_ref(ref)
 
     role_values = finding.get("affected_roles") or finding.get("roles") or ["unknown"]
     if isinstance(role_values, str):
         role_values = [role_values]
+
+    claim = finding.get("claim") if isinstance(finding.get("claim"), dict) else {}
+    chain = (finding.get("chain_assessment")
+             if isinstance(finding.get("chain_assessment"), dict) else {})
+    proven_impacts = [
+        item for item in (finding.get("impact_claims") or [])
+        if isinstance(item, dict) and item.get("status") == "proven"
+    ]
 
     return {
         "id": finding.get("id") or finding_file.parent.name,
@@ -133,5 +147,17 @@ def normalize_finding(
         "root_cause": finding.get("vuln_type", ""),
         "affected_role": (_dedupe([str(x) for x in role_values]) or ["unknown"])[0],
         "primary_impact": (finding.get("risk") or {}).get("proven_impact", ""),
+        "acceptance_status": "accepted",
+        "proof_status": "confirmed",
+        "claim_kind": claim.get("kind", ""),
+        "claim_profile": claim.get("profile", ""),
+        "claim_invariant": claim.get("invariant", ""),
+        "source_candidate_id": claim.get("source_candidate_id", ""),
+        "authorization_context": access_expectation,
+        "proven_impact_claims": proven_impacts,
+        "chain_status": chain.get("status", "not_tested"),
+        "chain_hypothesis": (
+            chain if chain.get("status") in {"hypothesis", "partial"} else None
+        ),
         "raw_finding_path": _rel_to_run(finding_file, run_base),
     }

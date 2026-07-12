@@ -234,7 +234,7 @@ def _method_match(expected: str, observed: list[str] | str) -> bool:
         return True
     methods = [observed] if isinstance(observed, str) else observed
     observed_set = {str(x).upper() for x in methods if x}
-    return not observed_set or expected.upper() in observed_set
+    return bool(observed_set) and expected.upper() in observed_set
 
 
 def _params_match(expected: list[str], observed: list[str]) -> bool:
@@ -250,7 +250,7 @@ def _roles_match(expected: list[str], observed: list[str]) -> bool:
     if not exp:
         return True
     obs = _lower_set(observed)
-    return not obs or bool(exp & obs)
+    return bool(obs) and bool(exp & obs)
 
 
 class _PhpArrayParser:
@@ -518,12 +518,21 @@ def _finding_rows(summary: Any) -> list[dict[str, Any]]:
     return []
 
 
-def load_findings(summary_path: pathlib.Path) -> list[Finding]:
+def load_findings(summary_path: pathlib.Path, *, trust_legacy: bool = False) -> list[Finding]:
     data = load_structured(summary_path)
     findings: list[Finding] = []
     for index, row in enumerate(_finding_rows(data), start=1):
+        if not trust_legacy:
+            if row.get("acceptance_status") != "accepted":
+                continue
+            if row.get("proof_status") != "confirmed":
+                continue
+            if row.get("claim_kind") != "root_finding":
+                continue
         evidence_file = str(_first(row, "evidence_file", "evidence", "evidence_path") or "")
         evidence_path = _resolve_evidence(summary_path, evidence_file)
+        if not trust_legacy and evidence_path is None:
+            continue
         evidence_data: Any = {}
         if evidence_path:
             try:
@@ -531,9 +540,11 @@ def load_findings(summary_path: pathlib.Path) -> list[Finding]:
             except Exception:
                 evidence_data = {}
 
-        endpoints = []
-        methods = []
-        params = []
+        endpoints = _as_list(row.get("endpoints"))
+        methods = _as_list(row.get("methods"))
+        params = _as_list(row.get("params"))
+        if row.get("method"):
+            methods.append(row.get("method"))
         for key in ("endpoint", "url", "path", "target", "access_path"):
             endpoints.extend(_extract_endpoint_fragments(str(row.get(key) or "")))
         for req in _walk_requests(evidence_data):
@@ -559,7 +570,7 @@ def load_findings(summary_path: pathlib.Path) -> list[Finding]:
                 methods=_dedupe(methods),
                 params=_dedupe(params),
                 vuln_class=str(_first(row, "class", "vuln_class", "type", "vuln_type", "category") or title),
-                roles=_dedupe(_as_list(_first(row, "roles", "role"))),
+                roles=_dedupe(_as_list(row.get("roles") or row.get("role"))),
                 evidence_file=evidence_file,
                 raw=row,
             )
@@ -745,7 +756,10 @@ def evaluate(oracle: list[OracleCase], findings: list[Finding], coverage: list[C
     total_score = 0.0
 
     for case in oracle:
-        matches = [finding for finding in findings if _finding_matches(case, finding)]
+        matches = [
+            finding for finding in findings
+            if finding.id not in matched_finding_ids and _finding_matches(case, finding)
+        ]
         if matches:
             primary = matches[0]
             matched_finding_ids.add(primary.id)
@@ -781,10 +795,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--summary", required=True, type=pathlib.Path, help="Run summary.json or equivalent.")
     parser.add_argument("--coverage", required=True, type=pathlib.Path, help="coverage-ledger.json or legacy coverage.json.")
     parser.add_argument("--compact", action="store_true", help="Emit compact JSON.")
+    parser.add_argument("--trust-legacy", action="store_true",
+                        help="Allow pre-proof-contract summaries (unsafe compatibility mode).")
     args = parser.parse_args(argv)
 
     oracle = load_oracle(args.oracle)
-    findings = load_findings(args.summary)
+    findings = load_findings(args.summary, trust_legacy=args.trust_legacy)
     coverage = load_coverage(args.coverage)
     result = evaluate(oracle, findings, coverage)
     result["meta"] = {

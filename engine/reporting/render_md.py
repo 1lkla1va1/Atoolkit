@@ -149,6 +149,52 @@ def render_final_report(
             "",
             str((finding.get("recommendation") or {}).get("summary", "")).strip(),
         ])
+        claim = finding.get("claim") if isinstance(finding.get("claim"), dict) else {}
+        if claim:
+            lines.extend([
+                "### 根漏洞声明",
+                "",
+                f"- kind：{claim.get('kind', '')}",
+                f"- profile：{claim.get('profile', '')}",
+                f"- 被破坏的安全不变量：{claim.get('invariant', '')}",
+                "",
+            ])
+        verification = (finding.get("verification")
+                        if isinstance(finding.get("verification"), dict) else {})
+        access = (verification.get("access_expectation")
+                  if isinstance(verification.get("access_expectation"), dict) else {})
+        if access:
+            lines.extend([
+                "### 权限预期证明",
+                "",
+                f"- 预期访问边界：{access.get('expected_access', '')}",
+                f"- 判定依据：{access.get('basis', '')}",
+                f"- 证据标记：{access.get('marker', '')}",
+                "",
+            ])
+        impacts = finding.get("impact_claims") or []
+        if impacts:
+            lines.extend(["### 影响声明", ""])
+            for impact in impacts:
+                if not isinstance(impact, dict):
+                    continue
+                label = "已证明" if impact.get("status") == "proven" else "待验证假设（不计严重度）"
+                lines.append(f"- [{label}] {impact.get('statement', '')}")
+            lines.append("")
+        chain = (finding.get("chain_assessment")
+                 if isinstance(finding.get("chain_assessment"), dict) else {})
+        if chain:
+            chain_status = str(chain.get("status") or "not_tested")
+            chain_label = ("已由独立证据证明" if chain_status == "proven"
+                           else "内部待验证假设，不属于本 finding 的已证明影响")
+            lines.extend([
+                "### 利用链评估",
+                "",
+                f"- 状态：{chain_status}（{chain_label}）",
+                f"- 路径：{chain.get('chain_path', '')}",
+                f"- 假设最终影响：{chain.get('final_impact', '')}",
+                "",
+            ])
         details = (finding.get("recommendation") or {}).get("details") or []
         for detail in details:
             lines.append(f"- {detail}")

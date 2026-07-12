@@ -16,7 +16,7 @@
 换模型：改 --model 即可；换运行时：把 CodexAdapter 换成别的 ModelAdapter（本文件 1 处）。
 """
 from __future__ import annotations
-import argparse, inspect, sys, time, re, pathlib, json, shutil
+import argparse, inspect, sys, time, re, pathlib, json, shutil, os, secrets
 from fnmatch import fnmatch
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -24,13 +24,15 @@ sys.path.insert(0, str(ROOT))
 
 from engine.orchestrator import run_session, MockAdapter          # noqa: E402
 from engine.verify import (verify_idor, extract_poc, urllib_transport,  # noqa: E402
-                           VerifyResult, INCONCLUSIVE,
+                           VerifyResult, INCONCLUSIVE, NOT_APPLICABLE,
                            extract_poc_from_finding)
+from engine.host_policy import (authorization_scope_from_url, hostname_from_url,
+                                normalize_authorized_scopes,
+                                parse_authorized_scope)  # noqa: E402
 
 
 def host_of(url: str) -> str:
-    m = re.match(r"https?://([^/:]+)", url)
-    return m.group(1) if m else url
+    return hostname_from_url(url) or url
 
 
 def safe_project_slug(value: str) -> str:
@@ -39,47 +41,117 @@ def safe_project_slug(value: str) -> str:
     return slug or "target"
 
 
-def build_verify_fn(identities: dict, victim_marker: str, hosts: list[str]):
+_SAFE_SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def safe_session_id(value: str) -> str:
+    """Validate, rather than sanitize, a session ID used as a path component."""
+    sid = str(value or "").strip()
+    if not _SAFE_SID_RE.fullmatch(sid) or sid in {".", ".."}:
+        raise ValueError(
+            "session ID 仅允许 1-128 位字母、数字、点、下划线和连字符，且不能是路径"
+        )
+    return sid
+
+
+def safe_session_dir(base: pathlib.Path, sid: str) -> pathlib.Path:
+    """Resolve a session child path and reject traversal or existing symlinks."""
+    clean_sid = safe_session_id(sid)
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        base.chmod(0o700)
+    except OSError:
+        pass
+    candidate = base / clean_sid
+    if candidate.is_symlink():
+        raise ValueError(f"session 目录不能是符号链接: {candidate}")
+    resolved_base = base.resolve()
+    resolved_candidate = candidate.resolve(strict=False)
+    try:
+        resolved_candidate.relative_to(resolved_base)
+    except ValueError as exc:
+        raise ValueError(f"session 目录逃逸: {candidate}") from exc
+    return candidate
+
+
+def _secure_mkdir(path: pathlib.Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+
+
+def _secure_write_text(path: pathlib.Path, value: str) -> None:
+    """Write a private file without following a final-component symlink."""
+    _secure_mkdir(path.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(value)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def build_verify_fn(identities: dict, victim_marker: str, hosts: list[str],
+                    owner_label: str = "owner"):
     """对 Guardian accepted 的报告做确定性重放复验。无身份/无标记则不复验。"""
     if not identities or not victim_marker:
         return None
     def verify_fn(report_md: str) -> VerifyResult:
+        if not re.search(r"(?:idor|越权)", report_md, re.I):
+            return VerifyResult(NOT_APPLICABLE, "非 IDOR finding，不适用 IDOR 重放器")
         req = extract_poc(report_md)
         if req is None:
             return VerifyResult(INCONCLUSIVE, "报告无可解析 PoC")
-        return verify_idor(req, identities, victim_marker, urllib_transport, hosts)
+        return verify_idor(req, identities, victim_marker, urllib_transport, hosts,
+                           owner_label=owner_label)
+
+    def verify_finding(finding: dict, finding_dir: pathlib.Path) -> VerifyResult:
+        vuln_type = str(finding.get("vuln_type") or "")
+        if not re.search(r"(?:idor|越权)", vuln_type, re.I):
+            return VerifyResult(NOT_APPLICABLE, "非 IDOR finding，不适用 IDOR 重放器")
+        req = extract_poc_from_finding(finding, finding_dir)
+        if req is None:
+            return VerifyResult(INCONCLUSIVE, "finding 无可解析 PoC")
+        return verify_idor(req, identities, victim_marker, urllib_transport, hosts,
+                           owner_label=owner_label)
+
+    verify_fn.verify_finding = verify_finding
     return verify_fn
 
 
 def _oracle_hit_str(oracle_path: str, res: dict) -> str:
-    """用 engine.benchmark_eval 算 oracle 命中：hit = 有 confirmed surface 命中的 oracle case 数。
-
-    finding 从 coverage-ledger 的 confirmed surface 构造（endpoint 用 seed 行写法，与 oracle 同形），
-    而非从 report .md 的具体 id 形态构造——避免 {id} 占位符与 1001 对不上的失配。
-    无 ledger / 无 oracle / 解析失败 → 'N/A'。"""
+    """Post-run oracle hint from accepted, proof-confirmed root findings only."""
     ledger_path = res.get("coverage_ledger_path")
     if not ledger_path:
         return "N/A"
     try:
         from engine import benchmark_eval as be
-        from engine.ledger import CoverageLedger, STATUS_CONFIRMED, normalize_status
+        from engine.ledger import CoverageLedger
         oracle = be.load_oracle(pathlib.Path(oracle_path))
-        ledger = CoverageLedger.load(pathlib.Path(ledger_path))
         findings = []
-        for s in ledger.surfaces:
-            if normalize_status(s.get("status")) != STATUS_CONFIRMED:
+        for row in res.get("normalized_findings") or []:
+            if (row.get("acceptance_status") != "accepted"
+                    or row.get("proof_status") != "confirmed"
+                    or row.get("claim_kind") != "root_finding"):
                 continue
-            params = [s["param"]] if s.get("param") else []
             findings.append(be.Finding(
-                id=s.get("surface_id") or "",
-                title=str(s.get("legacy_vuln") or ""),
-                endpoints=[s.get("endpoint", "")] if s.get("endpoint") else [],
-                methods=[s.get("method", "")] if s.get("method") else [],
-                params=be._dedupe(params),
-                vuln_class=str(s.get("legacy_vuln") or ""),
-                roles=be._dedupe(s.get("roles") or []),
-                evidence_file=s.get("evidence_ref") or "",
-                raw=s,
+                id=str(row.get("id") or ""),
+                title=str(row.get("title") or ""),
+                endpoints=be._dedupe(row.get("endpoints") or [row.get("endpoint", "")]),
+                methods=be._dedupe(row.get("methods") or [row.get("method", "")]),
+                params=be._dedupe(row.get("params") or []),
+                vuln_class=str(row.get("vuln_class") or row.get("class") or ""),
+                roles=be._dedupe(row.get("roles") or []),
+                evidence_file=str(row.get("evidence_file") or ""),
+                raw=row,
             ))
         coverage = be.load_coverage(pathlib.Path(ledger_path))
         ev = be.evaluate(oracle, findings, coverage)
@@ -247,6 +319,9 @@ def _map_finding_for_summary(f: dict, idx: int) -> dict:
         "primary_impact": f.get("primary_impact", ""),
         "report_count": f.get("report_count", 0),
         "finding_key": f.get("finding_key", ""),
+        "acceptance_status": "untrusted_legacy",
+        "proof_status": "pending",
+        "claim_kind": "legacy_report",
     }
 
 
@@ -282,8 +357,15 @@ def _dedupe_keep(values: list) -> list[str]:
 
 
 def _summary_findings(res: dict) -> list[dict]:
-    rows = [_map_finding_for_summary(f, i) for i, f in enumerate(res.get("findings") or [])]
-    rows.extend(dict(f) for f in (res.get("normalized_findings") or []))
+    # Public/scored findings are proof-confirmed structured root findings only.
+    # Legacy Markdown candidates remain available under summary.legacy_candidates
+    # but cannot inflate accepted counts or oracle hits.
+    rows = [
+        dict(f) for f in (res.get("normalized_findings") or [])
+        if f.get("acceptance_status") == "accepted"
+        and f.get("proof_status") == "confirmed"
+        and f.get("claim_kind") == "root_finding"
+    ]
     ledger_path = res.get("coverage_ledger_path")
     if not ledger_path:
         return rows
@@ -300,6 +382,30 @@ def _summary_findings(res: dict) -> list[dict]:
                    if row_norm and _norm_summary_endpoint(s.get("endpoint", "")) == row_norm]
         if not matches:
             continue
+        row_methods = {str(x).upper() for x in (
+            list(row.get("methods") or []) + [row.get("method", "")]
+        ) if str(x).strip()}
+        if row_methods:
+            matches = [s for s in matches
+                       if str(s.get("method", "GET")).upper() in row_methods]
+        row_class = str(row.get("vuln_class") or row.get("class") or row.get("root_cause") or "")
+        if row_class:
+            from engine.vuln_classes import norm_vc_candidates
+            wanted = {str(x).lower() for x in norm_vc_candidates(row_class)} | {row_class.lower()}
+            class_matches = []
+            for surface in matches:
+                actual = str(surface.get("vuln_class") or surface.get("legacy_vuln") or "")
+                actual_set = {str(x).lower() for x in norm_vc_candidates(actual)} | {actual.lower()}
+                if wanted & actual_set:
+                    class_matches.append(surface)
+            matches = class_matches
+        if not matches:
+            continue
+        matched_methods = {str(s.get("method", "GET")).upper() for s in matches}
+        if not row_methods and len(matched_methods) > 1:
+            row.setdefault("consistency_errors", []).append(
+                "ambiguous confirmed ledger join: same endpoint has multiple methods")
+            continue
         endpoints = _dedupe_keep(row.get("endpoints", []) + [s.get("endpoint", "") for s in matches])
         methods = _dedupe_keep([s.get("method", "") for s in matches])
         params = _dedupe_keep([s.get("param", "") for s in matches])
@@ -310,7 +416,11 @@ def _summary_findings(res: dict) -> list[dict]:
         row["methods"] = methods
         row["method"] = methods[0] if methods else ""
         row["params"] = params
-        row["evidence_file"] = evidence_files[0] if evidence_files else ""
+        if len(set(evidence_files)) > 1:
+            row.setdefault("consistency_errors", []).append(
+                "ambiguous confirmed ledger join: multiple evidence files")
+        elif evidence_files:
+            row["evidence_file"] = evidence_files[0]
     return rows
 
 
@@ -328,6 +438,13 @@ def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list, list[dict]]:
     p = pathlib.Path(arg)
     endpoints: list = []
     records: list[dict] = []
+
+    def normalized(endpoint: str, method: str = "GET") -> tuple[str, str, str]:
+        key = canonical_surface_key({"endpoint": endpoint, "method": method})
+        normalized_method, _, path = key.partition(" ")
+        return key, normalized_method or "GET", path
+
+    from engine.surface_key import canonical_surface_key
     if p.exists():
         if p.suffix.lower() == ".json":
             data = json.loads(p.read_text(encoding="utf-8"))
@@ -337,9 +454,11 @@ def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list, list[dict]]:
                     endpoint = str(item.get("endpoint") or item.get("path") or item.get("url") or "").strip()
                     if not endpoint:
                         continue
+                    endpoint_key, endpoint_method, endpoint_path = normalized(
+                        endpoint, str(item.get("method") or "GET"))
                     rec = {
-                        "endpoint": endpoint,
-                        "method": str(item.get("method") or "GET").upper(),
+                        "endpoint": endpoint_path,
+                        "method": endpoint_method,
                         "params": item.get("params") or item.get("parameters") or [],
                         "source": item.get("source") or "endpoints",
                         "source_file": str(p.resolve()),
@@ -348,15 +467,16 @@ def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list, list[dict]]:
                         "last_seen": item.get("last_seen") or "",
                         "discovered_during_testing": bool(item.get("discovered_during_testing", False)),
                     }
-                    endpoints.append(rec)
+                    endpoints.append({**rec})
                     records.append(rec)
                     continue
                 endpoint = str(item or "").strip()
                 if endpoint:
-                    endpoints.append(endpoint)
+                    endpoint_key, endpoint_method, endpoint_path = normalized(endpoint)
+                    endpoints.append(endpoint_key)
                     records.append({
-                        "endpoint": endpoint,
-                        "method": "GET",
+                        "endpoint": endpoint_path,
+                        "method": endpoint_method,
                         "source": "endpoints",
                         "source_file": str(p.resolve()),
                         "source_line": index,
@@ -370,10 +490,11 @@ def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list, list[dict]]:
             endpoint = line.strip()
             if not endpoint or endpoint.lstrip().startswith("#"):
                 continue
-            endpoints.append(endpoint)
+            endpoint_key, endpoint_method, endpoint_path = normalized(endpoint)
+            endpoints.append(endpoint_key)
             records.append({
-                "endpoint": endpoint,
-                "method": "GET",
+                "endpoint": endpoint_path,
+                "method": endpoint_method,
                 "source": "endpoints",
                 "source_file": str(p.resolve()),
                 "source_line": line_no,
@@ -385,10 +506,11 @@ def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list, list[dict]]:
         for index, endpoint in enumerate([x.strip() for x in arg.replace(",", "\n").splitlines()], start=1):
             if not endpoint or endpoint.lstrip().startswith("#"):
                 continue
-            endpoints.append(endpoint)
+            endpoint_key, endpoint_method, endpoint_path = normalized(endpoint)
+            endpoints.append(endpoint_key)
             records.append({
-                "endpoint": endpoint,
-                "method": "GET",
+                "endpoint": endpoint_path,
+                "method": endpoint_method,
                 "source": "endpoints",
                 "source_file": "",
                 "source_line": index,
@@ -464,12 +586,9 @@ def _filter_inventory(items: list, patterns: list[str]) -> list:
 def _run_self_check() -> int:
     """--self-check 自检门：临时生成 fixture 跑断言，不接真实模型/网络。
 
-    三条断言（全过 exit 0，任一失败 exit 1 并打印哪条失败）：
-      1. surface.bootstrap(recon_sample) 覆盖 oracle_sample 全部端点。
-      2. 浅阴性 ledger（非高价值、无 next_actions 的 shallow_negative 格）→
-         session_gate.evaluate_session_gate 返回 incomplete（演示 P0-2）。
-      3. 合格报告（target/curl/响应证据）→ enforce.guardian_check accepted。
-    纯代码自检，用于抓住 bootstrap→oracle 端点覆盖、浅阴性门、Guardian 质检的回归。
+    三十条断言覆盖 bootstrap、Coverage/预算、Blackboard/Intent、结构化
+    proof contract、Guardian、复验、评分和多参数 Cell。全过 exit 0，任一失败
+    exit 1 并打印具体合同。
     """
     from engine.surface import bootstrap
     from engine import benchmark_eval as be
@@ -559,11 +678,71 @@ def _run_self_check() -> int:
                 "params": [{"name": "order_id", "location": "query", "risk": "服务端未校验订单归属"}],
             }],
             "proof_packets": [{
+                "name": "owner_control",
+                "phase": "owner_control",
+                "request_file": "request_0.http",
+                "response_file": "response_0.http",
+                "evidence_summary": "A 账号读取自身订单，建立对象归属与正常响应基线。",
+            }, {
                 "name": "attacker_read_victim_order",
+                "phase": "unauthorized_actor",
                 "request_file": "request_1.http",
                 "response_file": "response_1.http",
                 "evidence_summary": "响应中返回受害者订单地址与金额。",
+            }, {
+                "name": "denied_control",
+                "phase": "access_denied_control",
+                "request_file": "request_denied.http",
+                "response_file": "response_denied.http",
+                "evidence_summary": "同一接口对另一非属主订单返回 403，证明资源存在属主边界。",
             }],
+            "verification": {
+                "status": "confirmed",
+                "evidence_type": "authorization_differential",
+                "observed_effect": "B 账号读取到明确归属于 A 账号的同一订单。",
+                "identities": ["owner_a", "attacker_b"],
+                "objects": ["order_1001 owned_by_owner_a"],
+                "object_marker": "\"order_id\":\"1001\"",
+                "access_expectation": {
+                    "expected_access": "owner_only",
+                    "basis": "same_endpoint_denial",
+                    "proof_packet_ids": ["denied_control"],
+                    "proof_refs": [],
+                    "marker": "order owner required",
+                },
+                "evidence_files": ["request_0.http", "response_0.http",
+                                   "request_1.http", "response_1.http",
+                                   "request_denied.http", "response_denied.http"],
+                "impact_proof_refs": [],
+                "assertions": [
+                    {"file": "response_0.http", "relation": "contains",
+                     "value": "\"owner\":\"owner_a\""},
+                    {"file": "response_1.http", "relation": "contains",
+                     "value": "\"owner\":\"victim_a\""},
+                ],
+            },
+            "claim": {
+                "kind": "root_finding",
+                "profile": "idor_read",
+                "invariant": "订单详情只能由订单所有者或获授权角色读取",
+                "proof_packet_ids": ["owner_control", "attacker_read_victim_order",
+                                     "denied_control"],
+            },
+            "impact_claims": [{
+                "id": "impact_001",
+                "status": "proven",
+                "statement": "实测 B 账号读取到 A 账号订单收货地址与金额。",
+                "proof_refs": ["response_1.http"],
+                "marker": "\"owner\":\"victim_a\"",
+            }],
+            "chain_assessment": {
+                "status": "not_tested",
+                "chain_feasible": False,
+                "chain_path": "",
+                "final_impact": "",
+                "blockers": [],
+                "proof_refs": [],
+            },
             "manual_burp_replay": [
                 "登录攻击者账号并进入订单详情页面。",
                 "使用 Burp Suite 捕获 GET /api/order/detail 请求。",
@@ -583,6 +762,14 @@ def _run_self_check() -> int:
             "  -H 'Cookie: session=attacker_b' \\\n"
             "  -H 'Accept: application/json'\n"
         ))
+        _write_text(reporting / "request_0.http", (
+            "GET /api/order/detail?order_id=1001 HTTP/1.1\n"
+            "Host: t.example\nCookie: session=owner_a\nAccept: application/json\n\n"
+        ))
+        _write_text(reporting / "response_0.http", (
+            "HTTP/1.1 200 OK\nContent-Type: application/json\n\n"
+            "{\"order_id\":\"1001\",\"owner\":\"owner_a\",\"address\":\"北京市海淀区示例路 1 号\",\"amount\":\"1299.00\"}\n"
+        ))
         _write_text(reporting / "request_1.http", (
             "GET /api/order/detail?order_id=1001 HTTP/1.1\n"
             "Host: t.example\nCookie: session=attacker_b\nAccept: application/json\n\n"
@@ -590,6 +777,14 @@ def _run_self_check() -> int:
         _write_text(reporting / "response_1.http", (
             "HTTP/1.1 200 OK\nContent-Type: application/json\n\n"
             "{\"order_id\":\"1001\",\"owner\":\"victim_a\",\"address\":\"北京市海淀区示例路 1 号\",\"amount\":\"1299.00\"}\n"
+        ))
+        _write_text(reporting / "request_denied.http", (
+            "GET /api/order/detail?order_id=2002 HTTP/1.1\n"
+            "Host: t.example\nCookie: session=attacker_b\nAccept: application/json\n\n"
+        ))
+        _write_text(reporting / "response_denied.http", (
+            "HTTP/1.1 403 Forbidden\nContent-Type: application/json\n\n"
+            "{\"error\":\"order owner required\"}\n"
         ))
         return recon, oracle, reporting
 
@@ -695,6 +890,9 @@ def _run_self_check() -> int:
                 "id": "f-1",
                 "class": "交易篡改",
                 "evidence_file": "evidence.json",
+                "acceptance_status": "accepted",
+                "proof_status": "confirmed",
+                "claim_kind": "root_finding",
             }]
         }, ensure_ascii=False), encoding="utf-8")
         findings = be.load_findings(tmp / "summary.json")
@@ -981,6 +1179,9 @@ def _run_self_check() -> int:
                 "endpoint": "/api/order/detail",
                 "class": "越权/IDOR",
                 "evidence_file": "evidence.json",
+                "acceptance_status": "accepted",
+                "proof_status": "confirmed",
+                "claim_kind": "root_finding",
             }]
         }, ensure_ascii=False), encoding="utf-8")
         (tmp / "coverage-ledger.json").write_text(json.dumps({
@@ -1426,6 +1627,34 @@ def _run_self_check() -> int:
             import shutil
             shutil.rmtree(_fdir, ignore_errors=True)
 
+    def _assert30():
+        """Root/impact/chain proof contract + parameter-cell independence."""
+        from engine.orchestrator import CognitiveState, POSITIVE, UNTESTED
+        from engine.reporting.schema import load_finding
+        from engine.reporting.validate import validate_finding
+        finding = load_finding(reporting_fixture / "finding.json")
+        finding["risk"]["proven_impact"] = "管理员账户接管"
+        finding["verification"]["impact_proof_refs"] = ["response_1.http"]
+        result = validate_finding(
+            finding, reporting_fixture / "finding.json", reporting_fixture,
+            authorized_hosts=["t.example"])
+        assert not result.ok, "链式影响推断不得替代 root finding 的已证明影响"
+        assert any("proven_impact must exactly match" in reason for reason in result.reasons), result.reasons
+
+        state = CognitiveState("param-check", "https://t.example", vuln_classes=["业务逻辑"])
+        state.seed_matrix([{
+            "endpoint": "/api/create-order", "method": "POST",
+            "params": ["quantity", "use_points", "order_time"],
+        }])
+        assert len(state.matrix) == 3, f"多参数被错误合并: {list(state.matrix)}"
+        ok, reason = state.set_cell(
+            "POST /api/create-order", "业务逻辑", POSITIVE,
+            evidence="finding.json", param="use_points")
+        assert ok, reason
+        assert state._find_cell(
+            "POST /api/create-order", "业务逻辑", param="quantity")["state"] == UNTESTED
+        print("  断言30 ✅ chain 假设不冒充 proven impact + 多参数独立闭格")
+
     for name, fn in (("断言1", _assert1), ("断言2", _assert2), ("断言3", _assert3),
                      ("断言4", _assert4), ("断言5", _assert5), ("断言6", _assert6),
                      ("断言7", _assert7), ("断言8", _assert8), ("断言9", _assert9),
@@ -1437,7 +1666,8 @@ def _run_self_check() -> int:
                      ("断言22", _assert22), ("断言23", _assert23),
                      ("断言24", _assert24), ("断言25", _assert25),
                      ("断言26", _assert26), ("断言27", _assert27),
-                     ("断言28", _assert28), ("断言29", _assert29)):
+                     ("断言28", _assert28), ("断言29", _assert29),
+                     ("断言30", _assert30)):
         try:
             fn()
         except AssertionError as exc:
@@ -1473,6 +1703,8 @@ def main():
     ap.add_argument("--identity", action="append", default=[],
                     help="复验身份 label:cred（cookie 模式如 owner:session=A；bearer 模式如 owner:eyJ...；可多次）")
     ap.add_argument("--victim-marker", default="", help="证明越权的受害者数据特征串")
+    ap.add_argument("--owner-label", default="owner",
+                    help="确定性 IDOR 复验中的属主 identity 标签（默认 owner）")
     ap.add_argument("--owned-id", action="append", default=[],
                     help="本会话自有对象 id（可多次）；改删类命中其中即自动放行，否则熔断交人工")
     ap.add_argument("--confirm-policy", choices=["halt", "allow"], default="halt",
@@ -1515,7 +1747,7 @@ def main():
                     help="v6.1 §9：关闭 flow surface 识别（退化兼容）")
     ap.add_argument("--oracle", default="",
                     help="可选 oracle 文件(JSON/YAML/CSV/PHP array)；存在则用 engine.benchmark_eval "
-                         "算 hit/total（oracle 命中 confirmed surface 数）并打印")
+                         "算 hit/total（仅 accepted + proof-confirmed root finding）并打印")
     # v8.6: project-level state layout
     ap.add_argument("--project", default="",
                     help="v8.6：项目名（目录 slug）。指定后状态落盘到 runs/targets/<slug>/sessions/<sid>/；"
@@ -1537,19 +1769,31 @@ def main():
         ap.error("--target 与 --authz 为必填（自检门用 --self-check，可不带这两参数）")
 
     # 会话目录与落盘（runs/ 已被 .gitignore）
-    sid = args.sid or time.strftime("sess-%Y%m%d-%H%M%S")
+    os.umask(0o077)
+    try:
+        sid = safe_session_id(
+            args.sid or f"{time.strftime('sess-%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+        )
+    except ValueError as exc:
+        ap.error(str(exc))
     # v8.6: project-level state layout
     _project_slug = safe_project_slug(args.project or (
         host_of(args.target).replace(".", "_") if args.target else "")
     )
     if _project_slug:
         project_dir = ROOT / "runs" / "targets" / _project_slug
-        project_dir.mkdir(parents=True, exist_ok=True)
-        wd = project_dir / "sessions" / sid
+        _secure_mkdir(project_dir)
+        try:
+            wd = safe_session_dir(project_dir / "sessions", sid)
+        except ValueError as exc:
+            ap.error(str(exc))
     else:
         project_dir = None
-        wd = ROOT / "runs" / sid
-    wd.mkdir(parents=True, exist_ok=True)
+        try:
+            wd = safe_session_dir(ROOT / "runs", sid)
+        except ValueError as exc:
+            ap.error(str(exc))
+    _secure_mkdir(wd)
     # Backward compatibility: migrate an existing runs/<sid> session into the
     # project layout on first resume.  The legacy source remains untouched.
     if args.resume and not args.project:
@@ -1563,20 +1807,30 @@ def main():
                 destination = wd / name
                 if source.exists() and not destination.exists():
                     shutil.copy2(source, destination)
+                    try:
+                        destination.chmod(0o600)
+                    except OSError:
+                        pass
     # v8.6: parse target-domains
     _target_domains = [d.strip() for d in args.target_domains.split(",") if d.strip()] if args.target_domains else None
     authz = (pathlib.Path(args.authz).read_text(encoding="utf-8")
              if pathlib.Path(args.authz).exists() else args.authz)
-    (wd / "authz.md").write_text(authz, encoding="utf-8")
+    _secure_write_text(wd / "authz.md", authz)
     # 会话凭据：cookie 或 bearer（落盘到 cookies.txt 供模型读取，runs/ 已 gitignore）
     cred = args.bearer or args.cookie
     cred_line = (f"Authorization: Bearer {args.bearer}" if args.bearer
                  else (f"Cookie: {args.cookie}" if args.cookie else ""))
     if cred:
-        (wd / "cookies.txt").write_text(cred_line, encoding="utf-8")
+        _secure_write_text(wd / "cookies.txt", cred_line)
 
     skill = (ROOT / "skill" / "核心技能文件.v3.md").read_text(encoding="utf-8")
-    hosts = [host_of(args.target)] + args.allow
+    target_scope = authorization_scope_from_url(args.target)
+    if not target_scope:
+        ap.error("--target 必须是合法的 http(s) 绝对 URL")
+    raw_scopes = [target_scope] + args.allow
+    if any(parse_authorized_scope(scope) is None for scope in raw_scopes):
+        ap.error("--allow 必须是合法的 host、host:port、*.domain 或 http(s) URL")
+    hosts = normalize_authorized_scopes(raw_scopes)
 
     # 覆盖矩阵的攻击面来源（支柱 2）：
     #   ① --endpoints：文件(每行一个，# 注释) 或逗号分隔
@@ -1588,10 +1842,12 @@ def main():
         endpoints, endpoint_inv_records = _inventory_records_from_endpoint_arg(args.endpoints)
         endpoints = _filter_inventory(endpoints, args.exclude_endpoint)
         endpoint_inv_records = _filter_endpoint_records(endpoint_inv_records, args.exclude_endpoint)
-    inventory: list = list(endpoints)  # str（--endpoints）+ dict（recon bootstrap 展开）
+    from engine.planner import plan_surfaces
+    inventory: list = (
+        plan_surfaces(endpoint_inv_records) if endpoint_inv_records else list(endpoints)
+    )  # parameter-aware dict surfaces for --endpoints + recon expansion below
     inventory_records: list[dict] = list(endpoint_inv_records)
     from engine.surface import is_saturated
-    from engine.planner import plan_surfaces
     if args.recon_dir:
         from engine.surface import bootstrap
         recon_surfaces = bootstrap(pathlib.Path(args.recon_dir))
@@ -1660,13 +1916,17 @@ def main():
                 else {"Cookie": val})
         identities[label.strip()] = auth
 
+    if identities and args.victim_marker and args.owner_label not in identities:
+        ap.error(f"--owner-label {args.owner_label!r} 不在 --identity 标签中")
+
     # 适配器：唯一与模型耦合处（换运行时改这里）
     if args.dry_run:
         adapter, verify_fn = MockAdapter(wd), None      # dry-run 不联网复验
     else:
         from codex.codex_adapter import CodexAdapter
         adapter = CodexAdapter(model=args.model, workdir=str(wd), allow_hosts=hosts)
-        verify_fn = build_verify_fn(identities, args.victim_marker, hosts)
+        verify_fn = build_verify_fn(
+            identities, args.victim_marker, hosts, owner_label=args.owner_label)
 
     target = args.target + (f"\n（本会话凭据见 {wd/'cookies.txt'}，按其中的 header 行原样带上）" if cred else "")
 
@@ -1737,8 +1997,22 @@ def main():
     # aggregate_findings 用 root_cause/affected_role 命名，benchmark_eval 读 class/roles，故在此产物里补字段映射
     # （不改 aggregate_findings 本身）。落盘失败不阻断收尾打印。
     try:
+        summary_findings = _summary_findings(res)
+        summary_consistency_errors = [
+            err for finding in summary_findings
+            for err in finding.get("consistency_errors", [])
+        ]
+        if summary_consistency_errors:
+            res.setdefault("persistence_errors", []).extend(
+                f"summary_consistency:{err}" for err in summary_consistency_errors)
+            if res.get("status") in {"complete", "vuln_found", "low_roi"}:
+                res["status"] = "incomplete"
         summary = {
-            "findings": _summary_findings(res),
+            "findings": summary_findings,
+            "legacy_candidates": [
+                _map_finding_for_summary(f, i)
+                for i, f in enumerate(res.get("legacy_candidates") or [])
+            ],
             "status": _summary_status(res),
             "accepted": res.get("accepted", []),
             "coverage_ledger_path": res.get("coverage_ledger_path"),
@@ -1748,6 +2022,7 @@ def main():
             "final_report_path": res.get("final_report_path"),
             "final_report_status": res.get("final_report_status", "not_generated"),
             "structured_findings": res.get("structured_findings", {"accepted": 0, "rejected": 0}),
+            "consistency_errors": summary_consistency_errors,
         }
         # v8.6: project-level state paths and stats
         if project_dir:
@@ -1788,6 +2063,10 @@ def main():
                   f"not_tested={led.get('not_tested', 0)} "
                   f"blocked={led.get('blocked', 0)} "
                   f"high_value_open={led.get('high_value_open', 0)})")
+            print(f"本轮准入范围: 闭合 {led.get('in_scope_closed', 0)}/"
+                  f"{led.get('in_scope_total', 0)} "
+                  f"(open={led.get('in_scope_open', 0)}; "
+                  f"project_backlog_out_of_run={led.get('out_of_run', 0)})")
             if res.get("coverage_ledger_path"):
                 print(f"coverage-ledger 文件: {res['coverage_ledger_path']}")
         gate = res.get("session_gate")

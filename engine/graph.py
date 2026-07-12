@@ -129,6 +129,12 @@ class FactIntentGraph:
 
     def fact_from_candidate(self, candidate: dict, fact_type: str = "confirmed") -> dict:
         chain = candidate.get("chain_assessment") or {}
+        chain_status = str(chain.get("status") or "not_tested").lower()
+        chain_proven = (
+            chain_status == "proven"
+            and bool(chain.get("proof_refs"))
+            and not bool(chain.get("blockers"))
+        )
         return {
             "source_type": fact_type,
             "source_candidate_id": candidate.get("candidate_id", ""),
@@ -138,9 +144,12 @@ class FactIntentGraph:
             "vuln_class": norm_vc(candidate.get("vuln_class", "")),  # v8.5.2: normalize at creation
             "summary": candidate.get("hypothesis", ""),
             "evidence_refs": candidate.get("evidence_refs", []),
-            "chain_feasible": chain.get("chain_feasible", False),
+            "proof_status": candidate.get("proof_status", "pending"),
+            "chain_status": chain_status,
+            "chain_feasible": chain_proven,
             "chain_path": chain.get("chain_path", ""),
-            "chain_final_impact": chain.get("final_impact", ""),
+            "chain_final_impact": chain.get("final_impact", "") if chain_proven else "",
+            "chain_hypothesis": chain.get("chain_path", "") if not chain_proven else "",
         }
 
     def get_pending_intents(self, *, agent: str = "", phase: int = 0,
@@ -153,7 +162,12 @@ class FactIntentGraph:
             and (not priority or i.get("priority") == priority)
         ]
         priority_order = {"high": 0, "medium": 1, "low": 2}
-        pending.sort(key=lambda x: priority_order.get(x.get("priority", "low"), 9))
+        pending.sort(key=lambda x: (
+            priority_order.get(x.get("priority", "low"), 9),
+            int(x.get("dispatches", 0) or 0),
+            str(x.get("created_at", "")),
+            str(x.get("intent_id", "")),
+        ))
         return pending[:limit]
 
     def resolve_intent(self, intent_id, status, summary="", spawned_facts=None,
@@ -177,13 +191,15 @@ class FactIntentGraph:
                 return intent
         return None
 
-    def claim_intent(self, intent_id):
+    def claim_intent(self, intent_id, *, increment_attempt: bool = True):
         """Mark an Intent as claimed (actively being worked on)."""
         for intent in self.intents:
             if intent.get("intent_id") == intent_id:
                 intent["status"] = "claimed"
                 intent.setdefault("attempts", 0)
-                intent["attempts"] += 1
+                intent["dispatches"] = int(intent.get("dispatches", 0) or 0) + 1
+                if increment_attempt:
+                    intent["attempts"] += 1
                 return intent
         return None
 
@@ -225,7 +241,14 @@ class FactIntentGraph:
             "total_facts": len(self.facts),
             "total_intents": len(self.intents),
             "intents_by_status": intent_by_status,
-            "chain_links": sum(1 for f in self.facts if f.get("chain_feasible")),
+            "chain_links": sum(
+                1 for f in self.facts if f.get("chain_status") == "proven"
+            ),
+            "chain_hypotheses": sum(
+                1 for f in self.facts
+                if f.get("chain_status") in {"hypothesis", "partial"}
+                or f.get("chain_hypothesis")
+            ),
             "high_priority_pending": sum(
                 1 for i in self.intents
                 if i.get("status") == "pending" and i.get("priority") == "high"
@@ -240,7 +263,8 @@ class FactIntentGraph:
             "new_facts": [
                 {**f, "source_run": run_id}
                 for f in self.facts
-                if f.get("source_type") == "confirmed"
+                if (f.get("source_type") == "confirmed"
+                    and f.get("proof_status") == "confirmed")
             ],
             "new_intents": self.intents,
             "run_id": run_id,
@@ -254,6 +278,7 @@ class FactIntentGraph:
         - pending intents are added to the work queue
         - dead_ends and depth-sufficient negatives are returned as a skip list
         """
+        blackboard = normalize_blackboard_schema(blackboard)
         # Import historical facts (no domain filter -- facts are cross-domain
         # knowledge that every domain should inherit).
         # e.g. a token leak found in the auth domain may be exploited by a txn
@@ -282,13 +307,22 @@ class FactIntentGraph:
                     "vuln_class": neg.get("vuln_class", ""),
                     "status": "not_vulnerable",
                     "reason": f"excluded in {neg.get('deepest_run', '?')}",
+                    "evidence_ref": neg.get("file", ""),
+                    "negative_depth_checked": True,
+                    "negative": {
+                        "vectors": neg.get("vectors", []),
+                        "response_count": neg.get("response_count", 0),
+                        "evidence_types": neg.get("evidence_types", []),
+                        "identities": neg.get("identities", []),
+                    },
                 })
         for de in blackboard.get("dead_ends", []):
             skip_surfaces.append({
                 "endpoint": de["endpoint"],
                 "method": de.get("method", ""),
                 "param": de.get("param", ""),
-                "status": "not_vulnerable",
+                "vuln_class": de.get("vuln_class", ""),
+                "status": "not_applicable",
                 "reason": f"dead end: {de.get('refutation', '')}",
             })
         return skip_surfaces
@@ -551,15 +585,123 @@ def intent_work_queue(graph, remaining_surfaces, phase=2):
     return queue
 
 
+def _method_and_path(value: str, fallback_method: str = "GET") -> tuple[str, str]:
+    canonical = canonical_surface_key(value, default_method=fallback_method)
+    method, _, path = canonical.partition(" ")
+    return (method or fallback_method).upper(), path or str(value or "")
+
+
+def normalize_blackboard_schema(data: dict | None) -> dict:
+    """Normalize Engine v2 and the historical Skill-Mode v1 artifact to v2.
+
+    Legacy ``depth_negatives`` lack vectors/response proof, so migration keeps
+    them open (depth_sufficient=False) rather than silently trusting the label.
+    """
+    src = dict(data or {})
+    if (str(src.get("schema_version")) == "2.0"
+            and all(key in src for key in ("facts", "intents", "negatives", "dead_ends"))):
+        src.setdefault("domains_covered", {})
+        src.setdefault("surface_index", {})
+        src.setdefault("merged_run_ids", [])
+        return src
+
+    facts = list(src.get("facts") or [])
+    intents = list(src.get("intents") or [])
+    for index, old in enumerate(src.get("confirmed_facts") or [], start=1):
+        method, endpoint = _method_and_path(
+            old.get("endpoint", ""), old.get("method", "GET"))
+        finding_id = str(old.get("id") or f"legacy_fact_{index:03d}")
+        facts.append({
+            "fact_id": finding_id,
+            "source_type": "legacy_unvalidated",
+            "source_candidate_id": "",
+            "source_run": str(old.get("run") or "legacy"),
+            "endpoint": endpoint,
+            "method": method,
+            "params": list(old.get("params") or []),
+            "vuln_class": old.get("type", ""),
+            "summary": old.get("title") or finding_id,
+            "evidence_refs": [f"findings/{finding_id}/finding.json"],
+            "affected_role": old.get("affected_role", ""),
+            "legacy_domain": old.get("domain", ""),
+            "proof_status": "untrusted_legacy",
+        })
+        legacy_intent_id = f"legacy_revalidate_{finding_id}"
+        if not any(str(item.get("intent_id")) == legacy_intent_id for item in intents):
+            intents.append({
+                "intent_id": legacy_intent_id,
+                "source_fact_id": finding_id,
+                "source": "revalidation",
+                "description": f"复验历史 Skill Mode 根结论：{old.get('title') or finding_id}",
+                "vuln_class": old.get("type", ""),
+                "target_endpoint": endpoint,
+                "target_params": list(old.get("params") or []),
+                "priority": "high",
+                "status": "pending",
+                "assigned_phase": 1,
+                "assigned_agent": "input_precision",
+            })
+
+    for index, old in enumerate(src.get("pending_intents") or [], start=1):
+        if isinstance(old, dict):
+            item = dict(old)
+        else:
+            item = {"description": str(old)}
+        item.setdefault("intent_id", f"legacy_intent_{index:03d}")
+        item.setdefault("status", "pending")
+        item.setdefault("priority", "medium")
+        intents.append(item)
+
+    negatives = list(src.get("negatives") or [])
+    for index, old in enumerate(src.get("depth_negatives") or [], start=1):
+        method, endpoint = _method_and_path(
+            old.get("surface", old.get("endpoint", "")), old.get("method", "GET"))
+        vuln_class = old.get("vuln_class", "")
+        negatives.append({
+            "surface_key": f"{method} {endpoint}::{old.get('param', '')}::{vuln_class}",
+            "endpoint": endpoint,
+            "method": method,
+            "param": old.get("param", ""),
+            "vuln_class": vuln_class,
+            "vectors_tried": 0,
+            "depth_sufficient": False,
+            "file": old.get("file", ""),
+            "deepest_run": str(old.get("run") or "legacy"),
+            "legacy_id": old.get("id", f"legacy_negative_{index:03d}"),
+            "migration_note": "legacy record lacked vectors/response evidence; revalidate",
+        })
+
+    migrated = {
+        "schema_version": "2.0",
+        "facts": facts,
+        "intents": intents,
+        "negatives": negatives,
+        "dead_ends": list(src.get("dead_ends") or []),
+        "discovered_endpoints": list(src.get("discovered_endpoints") or []),
+        "domains_covered": dict(src.get("domains_covered") or {}),
+        "surface_index": dict(src.get("surface_index") or {}),
+        "total_runs": int(src.get("total_runs", src.get("runs_completed", 0)) or 0),
+        "last_run": src.get("last_run", ""),
+        "last_updated": src.get("last_updated", ""),
+        "merged_run_ids": list(src.get("merged_run_ids") or []),
+    }
+    if src:
+        migrated["migrated_from_schema"] = str(src.get("schema_version") or "legacy")
+    return migrated
+
+
 def merge_run_to_blackboard(blackboard_path: str, run_graph: FactIntentGraph,
                             run_id: str, run_negatives: list[dict] = None):
     """Merge a run's output into the project-level blackboard at run end."""
     bb_path = pathlib.Path(blackboard_path)
-    bb = json.loads(bb_path.read_text(encoding="utf-8")) if bb_path.exists() else {
+    raw_bb = json.loads(bb_path.read_text(encoding="utf-8")) if bb_path.exists() else {
         "schema_version": "2.0", "facts": [], "intents": [],
         "negatives": [], "dead_ends": [], "discovered_endpoints": [],
         "domains_covered": {}, "surface_index": {},
     }
+    bb = normalize_blackboard_schema(raw_bb)
+    merged_run_ids = list(bb.get("merged_run_ids") or [])
+    is_new_run = run_id not in merged_run_ids
 
     # -- merge facts --------------------------------------------------------
     def _fact_key(f):
@@ -576,7 +718,8 @@ def merge_run_to_blackboard(blackboard_path: str, run_graph: FactIntentGraph,
     fact_id_map = {str(f.get("fact_id", "")): str(f.get("fact_id", ""))
                    for f in bb.get("facts", []) if f.get("fact_id")}
     for fact in run_graph.facts:
-        if fact.get("source_type") != "confirmed":
+        if (fact.get("source_type") != "confirmed"
+                or fact.get("proof_status") != "confirmed"):
             continue
         key = _fact_key(fact)
         old_id = str(fact.get("fact_id", ""))
@@ -648,24 +791,28 @@ def merge_run_to_blackboard(blackboard_path: str, run_graph: FactIntentGraph,
     DECAY_FACTOR = 0.9
     ABANDON_THRESHOLD = 0.5  # priority_score < this -> abandoned
     PRIO_BASE = {"high": 3.0, "medium": 2.0, "low": 1.0}
-    for intent in bb.get("intents", []):
-        if intent.get("status") != "pending":
-            continue
-        if intent.get("created_in_run", "") == run_id:
-            intent["runs_without_execution"] = 0
-            continue  # intents created this run are not decayed
-        runs_since = int(intent.get("runs_without_execution", 0) or 0) + 1
-        intent["runs_without_execution"] = runs_since
-        base_score = PRIO_BASE.get(intent.get("priority", "low"), 1.0)
-        effective = base_score * (DECAY_FACTOR ** runs_since)
-        if effective < ABANDON_THRESHOLD:
-            intent["status"] = "abandoned"
-            intent["outcome_summary"] = (
-                f"\u8870\u51cf\u653e\u5f03: {runs_since} run \u672a\u6267\u884c, effective={effective:.2f}")
+    if is_new_run:
+        for intent in bb.get("intents", []):
+            if intent.get("status") != "pending":
+                continue
+            if intent.get("created_in_run", "") == run_id:
+                intent["runs_without_execution"] = 0
+                continue  # intents created this run are not decayed
+            runs_since = int(intent.get("runs_without_execution", 0) or 0) + 1
+            intent["runs_without_execution"] = runs_since
+            base_score = PRIO_BASE.get(intent.get("priority", "low"), 1.0)
+            effective = base_score * (DECAY_FACTOR ** runs_since)
+            if effective < ABANDON_THRESHOLD:
+                intent["status"] = "abandoned"
+                intent["outcome_summary"] = (
+                    f"\u8870\u51cf\u653e\u5f03: {runs_since} run \u672a\u6267\u884c, effective={effective:.2f}")
 
     # -- update metadata ----------------------------------------------------
     bb["schema_version"] = "2.0"
-    bb["total_runs"] = bb.get("total_runs", 0) + 1
+    bb["total_runs"] = bb.get("total_runs", 0) + (1 if is_new_run else 0)
+    if is_new_run:
+        merged_run_ids.append(run_id)
+    bb["merged_run_ids"] = merged_run_ids
     bb["last_run"] = run_id
     bb["last_updated"] = datetime.now(timezone.utc).isoformat()
     bb.setdefault("domains_covered", {})

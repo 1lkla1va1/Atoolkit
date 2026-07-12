@@ -4,9 +4,11 @@ All modules (scheduler, business_graph, orchestrator) must use these helpers
 to normalize surface identifiers to a single canonical form so that budget
 accounting, deduplication, and cross-run inheritance are consistent.
 
-Frozen contract (rc3):
-    surface_key      = "METHOD /path"            (e.g. "POST /api/refund")
-    surface_cell     = "METHOD /path × vuln_class"  (budget unit)
+Frozen contract:
+    surface_key      = "METHOD /path"                    (e.g. "POST /api/refund")
+    surface_cell     = "METHOD /path :: param × class"  (budget unit)
+
+The ``:: param`` segment is omitted when a surface has no known parameter.
 """
 from __future__ import annotations
 
@@ -72,15 +74,16 @@ def canonical_surface_key(item, default_method: str = "GET") -> str:
     return f"{method} {path}"
 
 
-def canonical_cell_key(surface_key: str, vuln_class: str) -> str:
-    """Build a surface_cell key: ``"METHOD /path × vuln_class"``.
+def canonical_cell_key(surface_key: str, vuln_class: str, param: str = "") -> str:
+    """Build a parameter-aware surface-cell key.
 
     ``surface_key`` may be a bare path (no method prefix); it is canonicalized
     first so callers do not need to pre-normalize.
     """
     sk = canonical_surface_key(surface_key)
     vc = (vuln_class or "").strip()
-    return f"{sk}{_CELL_SEP}{vc}"
+    param_part = f" :: {str(param).strip()}" if str(param or "").strip() else ""
+    return f"{sk}{param_part}{_CELL_SEP}{vc}"
 
 
 def is_canonical(key: str) -> bool:

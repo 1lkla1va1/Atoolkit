@@ -1,7 +1,7 @@
 ---
 name: Atoolkit
 description: Authorized AI-assisted SRC/bug-bounty vulnerability research toolkit. Use whenever the user wants to read, install, configure, or run this Atoolkit package; mentions SRC 漏洞挖掘, 授权靶场, bug bounty, Codex AGENTS.md, /src, Guardian 质检, PoC 复验, or model-independent security testing automation. Only proceed for clearly authorized defensive testing or educational lab contexts.
-version: 8.6.1
+version: 8.7.0
 ---
 
 # Atoolkit Skill
@@ -237,18 +237,19 @@ If deterministic IDOR replay is requested, require at least two authorized ident
 3. Execute Phase 0 per `skill/recon-checklist.md`.
 4. Run the per-surface loop with self-check.
 5. Write findings + negative records.
-6. Run termination self-check.
-7. Output `summary.json`.
+6. Run `python3 -m engine.reporting.cli <run_dir> --allow <host> --output finding_validation.json`.
+7. Only `proof_confirmed` root findings may enter `summary.json`; keep rejected items as candidates.
+8. Run termination self-check.
 
 ## Skill Mode Finding Schema
 
-Skill Mode uses a streamlined schema (8 required + 3 conditional fields). Engine mode continues to use the full `engine/reporting/schema.py`.
+Skill Mode and Engine Mode now use one proof contract. The former streamlined schema is accepted only as legacy input and cannot become an accepted finding until migrated and revalidated.
 
 ### Required fields
 
 | # | Field | Description |
 |---|---|---|
-| 1 | `schema_version` | Always `"1.0"` |
+| 1 | `schema_version` | Canonical value `1` (`"1.0"` is legacy-compatible input) |
 | 2 | `id` | Finding ID (e.g. `finding_auth_001`) |
 | 3 | `title` | One-sentence result description (not phenomenon) |
 | 4 | `severity` | `P1` / `P2` / `P3` |
@@ -256,7 +257,11 @@ Skill Mode uses a streamlined schema (8 required + 3 conditional fields). Engine
 | 6 | `target` | Endpoint + method (e.g. `POST /api/user/refund.php`) |
 | 7 | `risk.proven_impact` | Proven business impact (never "possible" / "suspected") |
 | 8 | `poc` | Object with `file` (e.g. `poc.sh`) and `steps` (list of curl commands) |
-| -- | `proof_packets` | List of `{request_file, response_file}` pairs |
+| -- | `proof_packets` | Named request/response pairs with a machine-meaningful `phase` |
+| -- | `verification` | Evidence profile, observed effect, raw assertions, and class-specific controls |
+| -- | `claim` | `kind=root_finding`, invariant/profile, and referenced proof packet IDs |
+| -- | `impact_claims` | Separate `proven` effects from `hypothesis`; `risk.proven_impact` must match a proven item |
+| -- | `chain_assessment` | `not_tested/hypothesis/partial/proven/refuted`; only `proven` may have proven final impact |
 
 ### Conditional fields
 
@@ -264,21 +269,38 @@ Skill Mode uses a streamlined schema (8 required + 3 conditional fields). Engine
 |---|---|
 | `source_proof` | Request was constructed from JS / frontend source code -- provide file and line number |
 | `crypto_chain` | Finding involves encryption / signing -- provide algorithm and key source |
-| `manual_burp_replay` | P1/P2 finding where human wants Burp reproduction steps (optional in Skill Mode; agent cannot run Burp Suite) |
-| `chain_assessment` | Every CANDIDATE/finding must include chain exploitation assessment -- fields: `chain_feasible` (bool), `chain_path` (string), `final_impact` (string), `blockers` (list) |
+| `manual_burp_replay` | Optional when `poc.steps` already contains at least two reproducible HTTP steps |
+| `chain_assessment.proof_refs` | Required only when chain status is `proven`; every referenced step needs raw proof |
 
 ### JSON example
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": 1,
   "id": "finding_auth_001",
   "title": "Refund amount has no upper-bound check, attacker can refund more than order total",
   "severity": "P1",
   "vuln_type": "amount-tamper",
   "target": "POST /api/user/refund.php",
-  "risk": {
-    "proven_impact": "Attacker refunded 99999 yuan on a 100 yuan order, balance credited successfully"
+  "risk": {"proven_impact": "Observed balance increased by 99899 after one over-refund"},
+  "claim": {
+    "kind": "root_finding",
+    "profile": "transaction_state_delta",
+    "invariant": "credited refund must not exceed paid order amount",
+    "proof_packet_ids": ["state_before", "exploit", "state_after"]
+  },
+  "impact_claims": [{
+    "status": "proven",
+    "statement": "Observed balance increased by 99899 after one over-refund",
+    "proof_refs": ["response_after.http"],
+    "marker": "100700"
+  }],
+  "verification": {
+    "status": "confirmed",
+    "evidence_type": "business_state_delta",
+    "observed_effect": "Balance changed from 801 to 100700",
+    "state_delta": "+99899",
+    "assertions": [{"file": "response_after.http", "relation": "contains", "value": "100700"}]
   },
   "poc": {
     "file": "poc.sh",
@@ -287,9 +309,11 @@ Skill Mode uses a streamlined schema (8 required + 3 conditional fields). Engine
     ]
   },
   "proof_packets": [
-    {"request_file": "request_1.http", "response_file": "response_1.http"},
-    {"request_file": "request_2.http", "response_file": "response_2.http"}
-  ]
+    {"name": "state_before", "phase": "state_before", "request_file": "request_before.http", "response_file": "response_before.http", "evidence_summary": "balance baseline"},
+    {"name": "exploit", "phase": "exploit", "request_file": "request_exploit.http", "response_file": "response_exploit.http", "evidence_summary": "over-refund accepted"},
+    {"name": "state_after", "phase": "state_after", "request_file": "request_after.http", "response_file": "response_after.http", "evidence_summary": "persistent balance delta"}
+  ],
+  "chain_assessment": {"status": "not_tested", "chain_feasible": false, "chain_path": "", "final_impact": "", "blockers": [], "proof_refs": []}
 }
 ```
 
@@ -299,6 +323,9 @@ When reviewing or writing findings, enforce the core rules from `skill/核心技
 
 - Garbage findings such as CORS alone, sourcemap, missing security headers, rate-limit absence, fingerprinting, Self-XSS, and unproven claims are not valid reports.
 - Valid reports need P1/P2/P3 severity, a concrete target, proven impact, reproducible curl/raw HTTP PoC, and response evidence.
+- Authorization findings need physical proof of the expected non-public boundary in `verification.access_expectation`; anonymous HTTP 200 or two accounts seeing the same public content is not a vulnerability.
+- RCE, account takeover/session compromise, bulk-data, and race claims require class-specific markers that can be recomputed from raw evidence; narrative impact text is never enough.
+- A root finding is counted once. Proven impact may raise severity but is not a second vulnerability; a chain hypothesis is never accepted or scored.
 - Stop at enough evidence to prove impact; do not escalate exploitation beyond what is necessary for proof.
 
 ## Maintenance workflow

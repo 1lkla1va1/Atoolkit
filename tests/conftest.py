@@ -37,6 +37,8 @@ def sample_confirmed_fact():
     return {
         "id": "F001",
         "status": "CONFIRMED",
+        "source_type": "confirmed",
+        "proof_status": "confirmed",
         "vuln_class": "idor",
         "endpoint": "POST /api/refund",
         "evidence": "order_id controllable",

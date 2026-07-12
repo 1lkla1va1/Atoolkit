@@ -15,10 +15,17 @@ from __future__ import annotations
 import re, shlex, time, urllib.request, urllib.error
 from dataclasses import dataclass, field
 from typing import Callable
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+
+try:
+    from .host_policy import host_header_matches_url, is_authorized_url
+except ImportError:  # pragma: no cover - direct script execution
+    from host_policy import host_header_matches_url, is_authorized_url
 
 CONFIRMED = "confirmed"
 REFUTED = "refuted"
 INCONCLUSIVE = "inconclusive"
+NOT_APPLICABLE = "not_applicable"
 IDEMPOTENT = {"GET", "HEAD", "OPTIONS"}
 
 
@@ -157,13 +164,21 @@ def extract_poc_from_finding(finding: dict, finding_dir: str | pathlib.Path) -> 
 
 
 # ── Transport：真实(urllib) 与 测试(mock)────────────────────────────────
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects implicitly; each hop needs a fresh scope check."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
 def urllib_transport(req: Request) -> Response:
     t0 = time.time()
     r = urllib.request.Request(req.url, method=req.method,
                                data=req.body.encode() if req.body else None,
                                headers=req.headers)
+    opener = urllib.request.build_opener(_NoRedirect())
     try:
-        with urllib.request.urlopen(r, timeout=15) as resp:
+        with opener.open(r, timeout=15) as resp:
             body = resp.read(65536).decode("utf-8", "ignore")
             return Response(resp.status, dict(resp.headers), body, int((time.time() - t0) * 1000))
     except urllib.error.HTTPError as e:
@@ -173,13 +188,14 @@ def urllib_transport(req: Request) -> Response:
         return Response(0, {}, f"<transport error: {e}>", int((time.time() - t0) * 1000))
 
 
-def _host(url: str) -> str:
-    m = re.match(r"https?://([^/:]+)", url); return m.group(1) if m else ""
-
-
 def _guard(req: Request, authorized_hosts: list[str], allow_mutating: bool):
-    if not any(h in _host(req.url) for h in authorized_hosts):
+    if not is_authorized_url(req.url, authorized_hosts):
         raise PermissionError(f"越权: {req.url} 不在授权白名单")
+    host_header = next(
+        (str(value) for key, value in req.headers.items() if key.lower() == "host"), ""
+    )
+    if host_header and not host_header_matches_url(host_header, req.url):
+        raise PermissionError(f"Host 头与请求 URL 不一致: {host_header}")
     if req.method.upper() not in IDEMPOTENT and not allow_mutating:
         raise PermissionError(f"非幂等方法 {req.method} 默认禁止自动重放（allow_mutating=True 才放行）")
 
@@ -193,21 +209,31 @@ def replay(req: Request, transport: Transport, authorized_hosts: list[str],
 
 def verify_idor(req: Request, identities: dict, victim_marker: str,
                 transport: Transport, authorized_hosts: list[str],
-                allow_mutating: bool = False) -> VerifyResult:
+                allow_mutating: bool = False,
+                owner_label: str = "owner") -> VerifyResult:
     """换多身份重放同一请求。非属主身份拿到了 victim_marker → 确认越权。
     identities: {label: {Header:Value}}（如 {'owner':{...},'attacker_B':{...},'guest':{}})"""
+    if owner_label not in identities:
+        return VerifyResult(INCONCLUSIVE, f"缺少显式属主身份: {owner_label}")
     ev, leaked = [], []
+    owner_ok = False
     for label, auth in identities.items():
         resp = replay(req.with_identity(auth), transport, authorized_hosts, allow_mutating)
         seen = victim_marker in resp.body
         ev.append((label, resp.status, ("命中受害者数据" if seen else resp.body[:60])))
-        if label != "owner" and resp.status == 200 and seen:
+        if resp.status == 0 or resp.status >= 500:
+            return VerifyResult(
+                INCONCLUSIVE, f"身份 {label} 的传输/服务端响应不可判定: HTTP {resp.status}", ev)
+        success = 200 <= resp.status < 300
+        if label == owner_label:
+            owner_ok = success and seen
+        elif success and seen:
             leaked.append(label)
+    if not owner_ok:
+        return VerifyResult(INCONCLUSIVE, "属主基线未成功命中 victim_marker，无法判定", ev)
     if leaked:
         return VerifyResult(CONFIRMED, f"非属主身份 {leaked} 读到受害者数据 → 越权成立", ev)
-    if any(s == 200 and "命中" in d for _, s, d in ev):
-        return VerifyResult(INCONCLUSIVE, "仅属主可读，未证明越权（符合预期）", ev)
-    return VerifyResult(REFUTED, "无身份读到受害者数据 → 未复现", ev)
+    return VerifyResult(REFUTED, "属主基线可读，所有非属主身份均未读到标记 → 未复现", ev)
 
 
 def verify_id_tamper(req: Request, id_param: str, id_values: list[str],
@@ -217,7 +243,13 @@ def verify_id_tamper(req: Request, id_param: str, id_values: list[str],
     """遍历对象ID(3-5个)。返回了非自己ID的有效数据 → 确认 IDOR。"""
     ev, hits = [], []
     for v in id_values:
-        url = re.sub(rf"({re.escape(id_param)}[=/])[^/&?]+", rf"\g<1>{v}", req.url)
+        url, replaced = _replace_id_value(req.url, id_param, v)
+        if not replaced:
+            return VerifyResult(
+                INCONCLUSIVE,
+                f"未在 PoC URL 中定位到可替换 ID 参数/路径: {id_param}",
+                ev,
+            )
         resp = replay(req.with_url(url), transport, authorized_hosts, allow_mutating)
         other = resp.status == 200 and owner_marker_fn(resp.body)
         ev.append((f"{id_param}={v}", resp.status, "返回他人数据" if other else resp.body[:50]))
@@ -227,6 +259,38 @@ def verify_id_tamper(req: Request, id_param: str, id_values: list[str],
     if hits:
         return VerifyResult(INCONCLUSIVE, f"仅 1 条命中，建议加测样本", ev)
     return VerifyResult(REFUTED, "遍历无他人数据返回 → 未复现", ev)
+
+
+def _replace_id_value(url: str, id_param: str, value: str) -> tuple[str, bool]:
+    """Replace a query parameter, path placeholder, or legacy path prefix."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return url, False
+    key = str(id_param or "").strip()
+    if not key:
+        return url, False
+
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    if any(k == key for k, _ in pairs):
+        changed = [(k, str(value) if k == key else old) for k, old in pairs]
+        return urlunsplit(parsed._replace(query=urlencode(changed, doseq=True))), True
+
+    encoded = quote(str(value), safe="")
+    placeholder = "{" + key.strip("{}") + "}"
+    if placeholder in parsed.path:
+        path = parsed.path.replace(placeholder, encoded, 1)
+        return urlunsplit(parsed._replace(path=path)), True
+
+    # Backward-compatible form used by the original API: ``orders/`` means
+    # replace the segment immediately following ``/orders/``.
+    prefix = key.strip("/") if "/" in key else ""
+    if prefix:
+        pattern = re.compile(rf"(/{re.escape(prefix)}/)[^/?#]+")
+        path, count = pattern.subn(lambda m: m.group(1) + encoded, parsed.path, count=1)
+        if count:
+            return urlunsplit(parsed._replace(path=path)), True
+    return url, False
 
 
 # ── 自检：mock transport 演示 confirmed vs refuted（无需联网）──────────────

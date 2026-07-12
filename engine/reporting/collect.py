@@ -42,6 +42,9 @@ def collect_structured_findings(
 
     return {
         "accepted": accepted,
+        "proof_confirmed": accepted,
+        "schema_valid": accepted,
+        "proof_pending": [],
         "rejected": rejected,
         "normalized": normalized,
         "finding_objs": finding_objs,

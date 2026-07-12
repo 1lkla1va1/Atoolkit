@@ -66,3 +66,21 @@ class TestD1_FlowsSchema:
                 assert "endpoint" in step, (
                     f"D1 FAIL: step {step!r} missing 'endpoint' key"
                 )
+
+
+def test_placeholder_ids_do_not_merge_unrelated_resources():
+    bg = BusinessGraph()
+    bg.build_from_inventory(["GET /api/orders/{id}", "GET /api/users/{id}"])
+    assert bg.endpoint_map["GET /api/orders/{id}"]["objects"] == ["order"]
+    assert bg.endpoint_map["GET /api/users/{id}"]["objects"] == ["user"]
+    assert all(len(flow["steps"]) == 1 for flow in bg.flows)
+
+
+def test_fact_added_endpoint_updates_top_level_roles_and_objects():
+    bg = BusinessGraph()
+    bg.update_from_fact({
+        "method": "GET", "endpoint": "/api/user/orders/{id}",
+        "vuln_class": "idor", "summary": "order IDOR",
+    })
+    assert "user" in bg.roles
+    assert "order" in bg.objects

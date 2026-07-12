@@ -214,6 +214,11 @@ def evaluate_session_gate(
                 inventory_eps = None
 
     for surface in obj.surfaces:
+        # Out-of-run backlog is reported separately by ledger.stats.  It keeps
+        # the project incomplete but must not explode one bounded run into
+        # hundreds of duplicate session-gate reasons.
+        if surface.get("in_run_scope") is False:
+            continue
         status = normalize_status(surface.get("status"))
         if is_high_value(surface) and status == STATUS_NOT_TESTED:
             reasons.append(_reason("high_value_not_tested", surface, "test_or_mark_not_applicable_with_reason"))

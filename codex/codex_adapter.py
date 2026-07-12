@@ -13,8 +13,11 @@ Codex 适配器 —— 把 `codex exec` 包成 orchestrator.py 需要的 ModelAd
 依赖：codex CLI 在 PATH（已确认 codex-cli 0.131.0 可用）。
 注意：实际 flag 名以 `codex exec --help` 为准，不同版本可能不同；下方按通用语义给出。
 """
+from __future__ import annotations
+
 import os
 import pathlib
+import signal
 import subprocess
 from typing import Iterator
 
@@ -46,6 +49,29 @@ class CodexAdapter:
         # 本地出站代理（如 mitmproxy/自写转发）只放行 allow_hosts，把"授权范围"硬约束落到网络层。
         self.allow_hosts = allow_hosts or []
 
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen) -> None:
+        """Stop Codex and its child tool processes when streaming is aborted."""
+        if proc.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                proc.terminate()
+            else:
+                os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=2)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            if os.name == "nt":
+                proc.kill()
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
     def run(self, prompt: str, *, session_id: str) -> Iterator[str]:
         wd_abs = os.path.abspath(self.workdir)
         cmd = [
@@ -67,20 +93,25 @@ class CodexAdapter:
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, bufsize=1,
+            start_new_session=(os.name != "nt"),
         )
-        assert proc.stdin and proc.stdout
-        proc.stdin.write(prompt)
-        proc.stdin.close()
         chunks: list[str] = []
-        for line in proc.stdout:          # 流式回吐，orchestrator 实时做危险命令拦截
-            chunks.append(line)
-            yield line
-        rc = proc.wait()
         try:
-            pathlib.Path(self.workdir, "last_response.md").write_text(
-                "".join(chunks), encoding="utf-8")
-        except OSError:
-            pass
+            assert proc.stdin and proc.stdout
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+            for line in proc.stdout:      # 流式回吐，orchestrator 实时做审计/事后熔断
+                chunks.append(line)
+                yield line
+            rc = proc.wait()
+        finally:
+            self._terminate_process(proc)
+            try:
+                response_path = pathlib.Path(self.workdir, "last_response.md")
+                response_path.write_text("".join(chunks), encoding="utf-8")
+                response_path.chmod(0o600)
+            except OSError:
+                pass
         if rc != 0:
             full = "".join(chunks)
             tail = full[-1000:]

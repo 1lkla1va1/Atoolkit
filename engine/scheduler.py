@@ -10,9 +10,9 @@ import json
 import pathlib
 
 try:
-    from .surface_key import canonical_surface_key, is_canonical
+    from .surface_key import canonical_cell_key, canonical_surface_key, is_canonical
 except ImportError:
-    from surface_key import canonical_surface_key, is_canonical
+    from surface_key import canonical_cell_key, canonical_surface_key, is_canonical
 
 _PRIORITY_SCORE = {"high": 0, "medium": 1, "low": 2}
 _DOMAIN_SEQUENCE = ["auth", "txn", "idor", "input", "admin", "file", "info"]
@@ -43,24 +43,37 @@ def _canonicalize_set(items) -> set[str]:
     return out
 
 
-def _endpoints_in_blackboard(bb: dict) -> set[str]:
-    """Return the set of canonical surface keys already recorded in the blackboard."""
+def _endpoints_in_blackboard(bb: dict, *, fully_covered: bool = False) -> set[str]:
+    """Return evidence-touched or fully covered canonical endpoint keys.
+
+    A single fact/negative is useful for flow completion, but must not make all
+    remaining params/roles/risk families on that endpoint look completed.
+    """
     eps: set[str] = set()
+    if fully_covered:
+        for key, meta in (bb.get("surface_index") or {}).items():
+            if isinstance(meta, dict) and meta.get("tested"):
+                ck = canonical_surface_key(key)
+                if ck:
+                    eps.add(ck)
+        return eps
     for fact in bb.get("facts", []):
+        if (fact.get("source_type") != "confirmed"
+                or fact.get("proof_status") in {"untrusted_legacy", "pending", "refuted"}):
+            continue
         ck = canonical_surface_key({"endpoint": fact.get("endpoint", ""),
                                      "method": fact.get("method", "GET")})
         if ck:
             eps.add(ck)
     for neg in bb.get("negatives", []):
+        if not neg.get("depth_sufficient"):
+            continue
         ck = canonical_surface_key({"endpoint": neg.get("endpoint", ""),
                                      "method": neg.get("method", "GET")})
         if ck:
             eps.add(ck)
-    for ep in bb.get("discovered_endpoints", []):
-        if isinstance(ep, dict):
-            ck = canonical_surface_key(ep)
-        else:
-            ck = canonical_surface_key(str(ep))
+    for dead_end in bb.get("dead_ends", []):
+        ck = canonical_surface_key(dead_end)
         if ck:
             eps.add(ck)
     return eps
@@ -156,14 +169,24 @@ def compute_run_scope(
     bb = blackboard or {}
     bg = business_graph or {}
     target_domains = select_target_domains(bb, target_domains)
-    known_eps = _endpoints_in_blackboard(bb)
+    known_eps = _endpoints_in_blackboard(bb, fully_covered=True)
 
     # Normalize inventory: accept both strings and dicts → canonical surface keys
     inv_eps: list[str] = []
+    inv_params: dict[str, list[str]] = {}
     for item in (inventory or []):
         ck = canonical_surface_key(item)
         if ck:
             inv_eps.append(ck)
+            raw_params = []
+            if isinstance(item, dict):
+                value = item.get("params") or item.get("param") or []
+                raw_params = value if isinstance(value, list) else [value]
+            params = inv_params.setdefault(ck, [])
+            for param in raw_params:
+                text = str(param or "").strip()
+                if text and text not in params:
+                    params.append(text)
     inv_set = set(inv_eps)
 
     # Tier 1: high-priority pending intents (carried over)
@@ -213,8 +236,9 @@ def compute_run_scope(
     vuln_classes = list(vuln_classes or _DEFAULT_VC)
     all_cells: list[str] = []
     for sk in must_test:
-        for vc in vuln_classes:
-            all_cells.append(f"{sk} × {vc}")
+        for param in (inv_params.get(sk) or [""]):
+            for vc in vuln_classes:
+                all_cells.append(canonical_cell_key(sk, vc, param))
     surface_cell_total = len(all_cells)
     must_test_cells = all_cells
 
