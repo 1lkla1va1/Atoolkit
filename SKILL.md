@@ -1,7 +1,7 @@
 ---
 name: Atoolkit
 description: Authorized AI-assisted SRC/bug-bounty vulnerability research toolkit. Use whenever the user wants to read, install, configure, or run this Atoolkit package; mentions SRC 漏洞挖掘, 授权靶场, bug bounty, Codex AGENTS.md, /src, Guardian 质检, PoC 复验, or model-independent security testing automation. Only proceed for clearly authorized defensive testing or educational lab contexts.
-version: 8.7.0
+version: 8.8.0
 ---
 
 # Atoolkit Skill
@@ -38,12 +38,12 @@ When not using `run.py` engine, run by this framework:
 
 ### Startup sequence
 
-1. Read `authz.md` to confirm authorization scope.
-2. Read `hint.md` to confirm testing strategy and priorities.
-3. Execute Phase 0 recon per `skill/recon-checklist.md`, output `attack_surface_list.md`.
-4. Initialize the coverage ledger from the attack surface list.
-4.5 If `state/` directory exists with prior session files, read all files to restore testing context.
-5. Sort the test queue by `hint.md` priority.
+1. Read `authz.md` and confirm the absolute primary target and every authorized scope.
+2. Before the first network action, create `run_manifest.json` with `python3 -m engine.runtime_manifest init-manifest --mode skill --run-dir <session> --primary-target <url> --allow <scope> --authz-file <authz.md> --instruction AGENTS.md --instruction SKILL.md`. A manifest failure is a hard stop.
+3. Load `<project>/project_state.json` when present. It is the cross-run authority; `blackboard.json`, `business_graph.json`, and summaries are derived views only.
+4. Read `hint.md`, then execute Phase 0 recon per `skill/recon-checklist.md` and initialize the coverage ledger from `attack_surface_list.md`.
+5. Merge new inventory into project inventory by asset + method + path. Unknown methods stay unresolved and must not default to GET.
+6. Restore coverage only for an exact asset + method/path + param + role + vuln-class cell, then schedule pending Intents and still-open cells.
 
 ### Per-surface loop
 
@@ -59,7 +59,7 @@ For each surface in the queue:
 
 ### Termination self-check
 
-At session end, run all checks in the Skill Mode self-check list (§9 of the core skill file) -- not duplicated here to avoid multi-source definitions.
+At session end, run all checks in the Skill Mode self-check list (§9 of the core skill file), then run `python3 -m engine.reporting.cli <session>`. Empty findings fail with exit 2 unless `--allow-empty` is explicitly supplied and inventory, coverage, and candidate gates are complete. Finally create `run_receipt.json` with `python3 -m engine.runtime_manifest receipt --run-dir <session>`.
 
 ## Fact-Intent Protocol
 
@@ -117,30 +117,33 @@ For targets requiring multiple runs (large SRC programs, 50+ endpoints):
 
 ### Before testing (run startup)
 
-1. Check if `runs/{target}/blackboard.json` exists
-2. If yes:
-   - Read all confirmed facts → mark as known, skip re-testing
-   - Read all depth-sufficient negatives → mark as not_vulnerable, skip
-   - Read all dead ends → mark as excluded, skip
-   - Read pending intents → add to work queue (high priority)
-   - Read domain scope from `run_scope.json` → filter test surfaces
-3. If no: first run, proceed normally
+1. Load or initialize `runs/targets/{target}/project_state.json` (schema 1).
+2. Merge project inventory into this session before recon; recon is incremental, not a reset.
+3. Restore only exact role-aware coverage cells. Unknown role is not a wildcard, and legacy facts without evidence remain pending revalidation.
+4. Add pending Intents to the work queue, followed by open/high-value cells. A fully closed matrix with no pending Intent is a valid no-work run and must not call a model.
 
 ### After testing (run shutdown)
 
-1. Export all new facts, intents, negatives to blackboard
-2. For each new confirmed fact: run Intent generation rules
-3. Unfinished intents → write as pending to blackboard
-4. Update domain coverage statistics
-5. Save `blackboard.json` and generate `run_summary.md`
+1. Run deterministic finding validation; only accepted + proof-confirmed + `claim.kind=root_finding` entries may enter the project finding registry.
+2. Commit inventory, exact coverage cells, root-finding fingerprints, negatives, Intents, and run history atomically to `project_state.json`.
+3. Regenerate `blackboard.json`, `business_graph.json`, `run_scope.json`, and summaries as compatibility views; never merge them back as equal authorities.
+4. Write `run_receipt.json`, binding the immutable start manifest to validation, coverage, summary, and project-state delta hashes.
 
 ### Directory structure
 
     runs/{target}/
-      blackboard.json          # persistent across runs
-      business_graph.json      # endpoint→domain mapping
+      project_state.json       # authoritative, revisioned cross-run truth
+      .atoolkit/manifests/     # authority copies outside session write scope
+      blackboard.json          # derived compatibility view
+      business_graph.json      # derived endpoint→domain view
       run_scope.json           # current run's domain focus
-      sessions/run_NNN/        # individual run data (unchanged)
+      run_history/             # per-run committed summaries
+      sessions/run_NNN/        # manifest, evidence, validation, receipt
+
+An optional `sessions/run_NNN/dead_ends.json` may close a cell across runs only
+when it carries the exact asset/method/path/param/role/vulnerability identity,
+an enumerated not-applicable reason code, a concrete refutation, and physical
+evidence references. Ordinary model/budget skips never enter project truth.
 
 ## Domain Scope Declaration
 
@@ -198,13 +201,14 @@ End-to-end workflow for real-world SRC / bug-bounty targets.
 
 ## Common workflows
 
-### 1. Install for Codex mode A
+### 1. Use as an independent Codex project
 
 ```bash
-cp codex/AGENTS.md ~/.codex/AGENTS.md
-mkdir -p ~/.codex/prompts
-cp codex/prompts/src.md ~/.codex/prompts/src.md
+cd /path/to/Atoolkit
+python3 run.py --doctor
 ```
+
+Codex loads the project-root `AGENTS.md`. Do not overwrite `~/.codex/AGENTS.md` or an existing `/src` alias. Installing a global alias is a separate, explicit user action and is never required for this project.
 
 ### 2. Run mode B dry-run
 
@@ -232,14 +236,13 @@ If deterministic IDOR replay is requested, require at least two authorized ident
 
 ### 4. Run Skill Mode session (QoderWork / any agent)
 
-1. Read `skill/核心技能文件.v3.md` (or `codex/AGENTS.md`).
-2. Read `authz.md` + `hint.md`.
-3. Execute Phase 0 per `skill/recon-checklist.md`.
-4. Run the per-surface loop with self-check.
-5. Write findings + negative records.
-6. Run `python3 -m engine.reporting.cli <run_dir> --allow <host> --output finding_validation.json`.
-7. Only `proof_confirmed` root findings may enter `summary.json`; keep rejected items as candidates.
-8. Run termination self-check.
+1. Read project-root `AGENTS.md`, `SKILL.md`, `authz.md`, and `hint.md`.
+2. Create the pre-network manifest with the full `engine.runtime_manifest init-manifest` command in Startup sequence.
+3. Restore `project_state.json`, then execute incremental Phase 0 per `skill/recon-checklist.md`.
+4. Run the per-surface loop with self-check and write canonical findings + negative records.
+5. Run `python3 -m engine.reporting.cli <run_dir> --output finding_validation.json`.
+6. Only validation `normalized_findings` may enter summary/project registry; rejected items remain candidates.
+7. Run `python3 -m engine.runtime_manifest receipt --run-dir <run_dir>` and the termination self-check.
 
 ## Skill Mode Finding Schema
 
@@ -331,5 +334,5 @@ When reviewing or writing findings, enforce the core rules from `skill/核心技
 ## Maintenance workflow
 
 - Edit only `skill/核心技能文件.v3.md` for core rule changes.
-- Regenerate `codex/AGENTS.md` with `bash codex/regen_agents.sh` after core rule changes.
+- Regenerate root `AGENTS.md` and `codex/AGENTS.md` with `bash codex/regen_agents.sh` after core rule changes.
 - Keep SKILL.md and AGENTS.md in sync.

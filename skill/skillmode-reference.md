@@ -237,7 +237,7 @@ findings/finding_<id>/
 - `risk.proven_impact` 只能写已证明结果，不能写"可能/疑似/理论上"
 - `proof_packets[].request_file`、`response_file`、`poc.file` 对应文件必须真实存在
 - root finding、已证明影响、利用链假设必须分层；链假设不进入标题、严重度、accepted 或评分
-- 终态执行：`python3 -m engine.reporting.cli <run_dir> --allow <host> --output finding_validation.json`
+- 终态执行：`python3 -m engine.reporting.cli <run_dir> --output finding_validation.json`；授权范围取自 pre-network manifest。空结果仅在完整 Session Gate 下显式加 `--allow-empty`，随后运行 `python3 -m engine.runtime_manifest receipt --run-dir <run_dir>`。
 
 若当前运行环境尚未接入 reporting 模块，可临时写 `report_*.md` 作为 legacy candidate，但它不能 accepted、计分或闭格；仍须迁移为 finding 包并通过离线校验。
 

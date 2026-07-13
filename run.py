@@ -29,6 +29,8 @@ from engine.verify import (verify_idor, extract_poc, urllib_transport,  # noqa: 
 from engine.host_policy import (authorization_scope_from_url, hostname_from_url,
                                 normalize_authorized_scopes,
                                 parse_authorized_scope)  # noqa: E402
+from engine.runtime_manifest import doctor, sha256_file, write_run_receipt  # noqa: E402
+from engine.version import __version__  # noqa: E402
 
 
 def host_of(url: str) -> str:
@@ -97,6 +99,27 @@ def _secure_write_text(path: pathlib.Path, value: str) -> None:
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _atomic_write_json(path: pathlib.Path, value: dict) -> None:
+    """Atomically replace a private JSON delivery artifact."""
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+    try:
+        _secure_write_text(
+            temporary, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+        os.replace(temporary, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def build_verify_fn(identities: dict, victim_marker: str, hosts: list[str],
@@ -215,6 +238,8 @@ def _score_run(argv: list[str]) -> int:
     ap.add_argument("--summary", default=None, type=pathlib.Path, help="默认 <run-dir>/summary.json")
     ap.add_argument("--coverage", default=None, type=pathlib.Path, help="默认 <run-dir>/coverage-ledger.json")
     ap.add_argument("--compact", action="store_true", help="stdout 输出 compact JSON")
+    ap.add_argument("--trust-legacy", action="store_true",
+                    help="显式兼容没有 finding_validation.json 的旧 summary（默认拒绝计分）")
     args = ap.parse_args(argv)
 
     if args.run_dir:
@@ -236,7 +261,7 @@ def _score_run(argv: list[str]) -> int:
 
     from engine import benchmark_eval as be
     oracle = be.load_oracle(args.oracle)
-    findings = be.load_findings(summary_path)
+    findings = be.load_findings(summary_path, trust_legacy=args.trust_legacy)
     coverage = be.load_coverage(coverage_path)
     result = be.evaluate(oracle, findings, coverage)
     result["meta"] = {
@@ -249,6 +274,7 @@ def _score_run(argv: list[str]) -> int:
         "coverage": str(coverage_path.resolve()),
         "oracle": str(args.oracle.resolve()),
         "oracle_used_post_run_only": True,
+        "trust_legacy": bool(args.trust_legacy),
     }
     run_dir.mkdir(parents=True, exist_ok=True)
     scorecard_json = run_dir / "scorecard.json"
@@ -357,71 +383,17 @@ def _dedupe_keep(values: list) -> list[str]:
 
 
 def _summary_findings(res: dict) -> list[dict]:
-    # Public/scored findings are proof-confirmed structured root findings only.
-    # Legacy Markdown candidates remain available under summary.legacy_candidates
-    # but cannot inflate accepted counts or oracle hits.
-    rows = [
+    """Project the validator's normalized roots without Coverage enrichment.
+
+    Coverage may detect a mismatch, but it must never invent a method, param,
+    role or evidence reference that was absent from the validated Finding.
+    """
+    return [
         dict(f) for f in (res.get("normalized_findings") or [])
         if f.get("acceptance_status") == "accepted"
         and f.get("proof_status") == "confirmed"
         and f.get("claim_kind") == "root_finding"
     ]
-    ledger_path = res.get("coverage_ledger_path")
-    if not ledger_path:
-        return rows
-    try:
-        from engine.ledger import CoverageLedger, STATUS_CONFIRMED, normalize_status
-        ledger = CoverageLedger.load(pathlib.Path(ledger_path))
-        confirmed = [s for s in ledger.surfaces
-                     if normalize_status(s.get("status")) == STATUS_CONFIRMED]
-    except Exception:
-        return rows
-    for row in rows:
-        row_norm = _norm_summary_endpoint(row.get("endpoint", ""))
-        matches = [s for s in confirmed
-                   if row_norm and _norm_summary_endpoint(s.get("endpoint", "")) == row_norm]
-        if not matches:
-            continue
-        row_methods = {str(x).upper() for x in (
-            list(row.get("methods") or []) + [row.get("method", "")]
-        ) if str(x).strip()}
-        if row_methods:
-            matches = [s for s in matches
-                       if str(s.get("method", "GET")).upper() in row_methods]
-        row_class = str(row.get("vuln_class") or row.get("class") or row.get("root_cause") or "")
-        if row_class:
-            from engine.vuln_classes import norm_vc_candidates
-            wanted = {str(x).lower() for x in norm_vc_candidates(row_class)} | {row_class.lower()}
-            class_matches = []
-            for surface in matches:
-                actual = str(surface.get("vuln_class") or surface.get("legacy_vuln") or "")
-                actual_set = {str(x).lower() for x in norm_vc_candidates(actual)} | {actual.lower()}
-                if wanted & actual_set:
-                    class_matches.append(surface)
-            matches = class_matches
-        if not matches:
-            continue
-        matched_methods = {str(s.get("method", "GET")).upper() for s in matches}
-        if not row_methods and len(matched_methods) > 1:
-            row.setdefault("consistency_errors", []).append(
-                "ambiguous confirmed ledger join: same endpoint has multiple methods")
-            continue
-        endpoints = _dedupe_keep(row.get("endpoints", []) + [s.get("endpoint", "") for s in matches])
-        methods = _dedupe_keep([s.get("method", "") for s in matches])
-        params = _dedupe_keep([s.get("param", "") for s in matches])
-        evidence_files = _dedupe_keep([s.get("evidence_ref", "") for s in matches])
-        row["endpoints"] = endpoints
-        if endpoints and not row.get("endpoint"):
-            row["endpoint"] = endpoints[0]
-        row["methods"] = methods
-        row["method"] = methods[0] if methods else ""
-        row["params"] = params
-        if len(set(evidence_files)) > 1:
-            row.setdefault("consistency_errors", []).append(
-                "ambiguous confirmed ledger join: multiple evidence files")
-        elif evidence_files:
-            row["evidence_file"] = evidence_files[0]
-    return rows
 
 
 def _summary_status(res: dict) -> str:
@@ -895,7 +867,7 @@ def _run_self_check() -> int:
                 "claim_kind": "root_finding",
             }]
         }, ensure_ascii=False), encoding="utf-8")
-        findings = be.load_findings(tmp / "summary.json")
+        findings = be.load_findings(tmp / "summary.json", trust_legacy=True)
         assert findings and findings[0].methods == ["POST"], f"method 提取失败: {findings}"
         assert {"order_no", "amount", "status"} <= set(findings[0].params), \
             f"params 提取失败: {findings[0].params}"
@@ -1199,7 +1171,8 @@ def _run_self_check() -> int:
         import contextlib
         import io
         with contextlib.redirect_stdout(io.StringIO()):
-            rc = _score_run(["--run-dir", str(tmp), "--oracle", str(oracle), "--compact"])
+            rc = _score_run(["--run-dir", str(tmp), "--oracle", str(oracle),
+                             "--compact", "--trust-legacy"])
         assert rc == 0
         scorecard = json.loads((tmp / "scorecard.json").read_text(encoding="utf-8"))
         assert scorecard["meta"]["oracle_used_post_run_only"] is True
@@ -1430,27 +1403,32 @@ def _run_self_check() -> int:
         print(f"  断言24 ✅ intent_budget=2 限制 carryover_intents={len(carryover)} ≤ 2")
 
     def _assert25():
-        """rc3 端到端: 深阴性 run2 继承 skip/not_vulnerable"""
+        """v8.8 端到端: 精确角色深阴性 run2 继承 not_vulnerable"""
         import tempfile, json
-        from engine.orchestrator import CognitiveState, SKIPPED, run_session, MockAdapter
+        from engine.orchestrator import NEGATIVE_WITH_EVIDENCE, run_session, MockAdapter
+        from engine.project_state import ProjectStateStore
         _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_deep_"))
         try:
             _proj = _fdir / "deep_proj"
             _proj.mkdir(parents=True, exist_ok=True)
-            # 写一个含深阴性 negative 的 blackboard
-            bb_data = {
-                "schema_version": "2.0",
-                "facts": [], "intents": [], "dead_ends": [],
-                "negatives": [{
-                    "endpoint": "/api/search", "method": "GET",
-                    "vuln_class": "SQLi", "surface_key": "/api/search::SQLi",
-                    "vectors_tried": 5, "depth_sufficient": True,
-                    "file": "neg.md",
+            _neg_dir = _proj / "sessions" / "run1"
+            _neg_dir.mkdir(parents=True, exist_ok=True)
+            (_neg_dir / "neg.md").write_text("depth evidence", encoding="utf-8")
+            ProjectStateStore(
+                _proj, project_scope=["https://t.example"]
+            ).commit_run(
+                "run1",
+                inventory=[{
+                    "asset": "https://t.example", "endpoint": "/api/search",
+                    "method": "GET", "roles": ["user"],
                 }],
-                "discovered_endpoints": [],
-            }
-            (_proj / "blackboard.json").write_text(
-                json.dumps(bb_data, ensure_ascii=False), encoding="utf-8")
+                negatives=[{
+                    "asset": "https://t.example", "endpoint": "/api/search",
+                    "method": "GET", "role_scope": "user",
+                    "vuln_class": "SQLi", "vectors_tried": 5,
+                    "depth_sufficient": True, "evidence_refs": ["neg.md"],
+                }],
+            )
             _wd = _proj / "sessions" / "run2"
             _wd.mkdir(parents=True, exist_ok=True)
             res = run_session(
@@ -1461,18 +1439,20 @@ def _run_self_check() -> int:
                 workdir=str(_wd),
                 authorized_hosts=["t.example"],
                 max_turns=3,
-                endpoints=["/api/search"],
+                endpoints=[{"endpoint": "/api/search", "method": "GET",
+                            "roles": ["user"]}],
+                vuln_classes=["SQLi"],
                 surface_budget=0,  # 不限预算，测继承
                 verbose=False,
             )
-            # 深阴性应在 run2 继承为 SKIPPED
+            # 精确角色深阴性应在 run2 继承为 negative_with_evidence。
             mtx = res.get("state", {}).get("matrix", {})
             _found_skip = any(
-                c.get("state") == SKIPPED for c in mtx.values()
+                c.get("state") == NEGATIVE_WITH_EVIDENCE for c in mtx.values()
                 if "search" in c.get("endpoint", ""))
             assert _found_skip, (
-                "深阴性 negative 在 run2 未继承为 SKIPPED")
-            print("  断言25 ✅ 深阴性 run2 继承 skip/not_vulnerable")
+                "精确角色深阴性 negative 在 run2 未继承为 not_vulnerable")
+            print("  断言25 ✅ 精确角色深阴性 run2 继承 not_vulnerable")
         finally:
             import shutil
             shutil.rmtree(_fdir, ignore_errors=True)
@@ -1692,6 +1672,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "score":
         return _score_run(sys.argv[2:])
     ap = argparse.ArgumentParser(description="起一次授权 SRC 会话（engine 三件套接线）")
+    ap.add_argument("--version", action="version", version=f"Atoolkit {__version__}")
     ap.add_argument("--target", default="", help="授权目标 URL")
     ap.add_argument("--authz", default="", help="授权说明文本，或授权文件路径")
     ap.add_argument("--cookie", default="", help="人已拿到的新鲜 Cookie/Session")
@@ -1731,6 +1712,8 @@ def main():
     ap.add_argument("--self-check", action="store_true",
                     help="自检门：临时生成 fixture 跑断言（不接模型/网络），全过 exit 0、失败 exit 1；"
                          "独立于 --target/--authz，可不带这两参数")
+    ap.add_argument("--doctor", action="store_true",
+                    help="只读检查版本、AGENTS/Skill Mode 指令解析与 /src 别名，不启动测试")
     # v6.1 §10.3 flags
     ap.add_argument("--loop-mode", default="recall-first",
                     choices=["recall-first", "coverage-first"],
@@ -1764,6 +1747,10 @@ def main():
     # --self-check：临时生成 fixture 跑断言，不接模型/网络，独立于 --target/--authz。
     if args.self_check:
         return _run_self_check()
+    if args.doctor:
+        result = doctor(ROOT)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result["ok"] else 1
     # 非 self-check：--target/--authz 仍为必填（argparse 层已放宽为非 required 以放行 --self-check）。
     if not args.target or not args.authz:
         ap.error("--target 与 --authz 为必填（自检门用 --self-check，可不带这两参数）")
@@ -1902,9 +1889,23 @@ def main():
                         "saturation_reached": is_saturated(inv_records)},
                        ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # 硬门：正式覆盖跑需 --endpoints 或 --recon-dir；单点验证显式 --ad-hoc
-    if not endpoints and not args.recon_dir and not args.ad_hoc:
-        print("✗ 拒绝空启动：正式覆盖跑需 --endpoints 或 --recon-dir；单点验证用 --ad-hoc",
+    # v8.8: subsequent runs may start from authoritative project inventory.
+    project_inventory_count = 0
+    if project_dir and (project_dir / "project_state.json").is_file():
+        try:
+            project_value = json.loads(
+                (project_dir / "project_state.json").read_text(encoding="utf-8"))
+            project_inventory_count = len(
+                project_value.get("inventory", {}).get("surfaces", {}) or {})
+            project_inventory_count += len(
+                project_value.get("inventory", {}).get("unresolved", {}) or {})
+        except (OSError, json.JSONDecodeError):
+            project_inventory_count = 0
+    # 硬门：首次正式覆盖跑需输入；后续允许从 project_state 恢复。
+    if (not endpoints and not args.recon_dir and not args.ad_hoc
+            and project_inventory_count == 0):
+        print("✗ 拒绝空启动：首次正式覆盖跑需 --endpoints/--recon-dir；"
+              "后续 Run 可复用 project_state.json；单点验证用 --ad-hoc",
               file=sys.stderr)
         sys.exit(2)
 
@@ -1939,6 +1940,8 @@ def main():
         src_note = "endpoints"
     elif args.ad_hoc:
         src_note = "ad-hoc 退化(首洞即结)"
+    elif project_inventory_count:
+        src_note = f"project-state({project_inventory_count})"
     else:
         src_note = ""
     print(f"  覆盖矩阵: {len(inventory)} surface × "
@@ -1996,8 +1999,15 @@ def main():
     # 落 summary.json：结构对齐 engine.benchmark_eval.load_findings（dict 含 findings 键，每条行有 endpoint）。
     # aggregate_findings 用 root_cause/affected_role 命名，benchmark_eval 读 class/roles，故在此产物里补字段映射
     # （不改 aggregate_findings 本身）。落盘失败不阻断收尾打印。
+    summary_path = wd / "summary.json"
+    delivery_status_path = wd / "delivery_status.json"
+    summary = None
     try:
         summary_findings = _summary_findings(res)
+        manifest_data = json.loads(
+            (wd / "run_manifest.json").read_text(encoding="utf-8"))
+        authority_manifest_path = pathlib.Path(
+            manifest_data.get("authority_path") or wd / "run_manifest.json")
         summary_consistency_errors = [
             err for finding in summary_findings
             for err in finding.get("consistency_errors", [])
@@ -2008,6 +2018,7 @@ def main():
             if res.get("status") in {"complete", "vuln_found", "low_roi"}:
                 res["status"] = "incomplete"
         summary = {
+            "atoolkit_version": __version__,
             "findings": summary_findings,
             "legacy_candidates": [
                 _map_finding_for_summary(f, i)
@@ -2022,6 +2033,19 @@ def main():
             "final_report_path": res.get("final_report_path"),
             "final_report_status": res.get("final_report_status", "not_generated"),
             "structured_findings": res.get("structured_findings", {"accepted": 0, "rejected": 0}),
+            "run_manifest_path": str((wd / "run_manifest.json").resolve()),
+            "authority_manifest_path": str(authority_manifest_path),
+            "authority_manifest_sha256": (
+                sha256_file(authority_manifest_path)
+                if authority_manifest_path.is_file() else ""),
+            "source_revision": manifest_data.get("source_revision", ""),
+            "source_dirty": manifest_data.get("source_dirty"),
+            "finding_validation_path": str((wd / "finding_validation.json").resolve()),
+            "finding_validation_sha256": (res.get("validation_artifact") or {}).get("sha256", ""),
+            "project_state_path": res.get("project_state_path", ""),
+            "project_state_delta": res.get("project_state_delta", {}),
+            "run_receipt_path": str((wd / "run_receipt.json").resolve()),
+            "run_receipt_status": "bound_by_post_summary_receipt",
             "consistency_errors": summary_consistency_errors,
         }
         # v8.6: project-level state paths and stats
@@ -2035,10 +2059,60 @@ def main():
         summary["domains_covered"] = res.get("domains_covered", {})
         summary["business_graph_open_high_value"] = res.get("business_graph_open_high_value", [])
         summary["persistence_errors"] = res.get("persistence_errors", [])
-        (wd / "summary.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(summary_path, summary)
     except Exception as _e:                       # 落盘失败不阻断收尾打印
         print(f"  ⚠ 落 summary.json 失败: {type(_e).__name__}: {_e}", file=sys.stderr)
+    try:
+        receipt_artifacts = {
+            "summary": wd / "summary.json",
+            "finding_validation": wd / "finding_validation.json",
+            "coverage_ledger": wd / "coverage-ledger.json",
+        }
+        if (wd / "candidate-ledger.json").is_file():
+            receipt_artifacts["candidate_ledger"] = wd / "candidate-ledger.json"
+        if res.get("project_state_path") and pathlib.Path(res["project_state_path"]).is_file():
+            receipt_artifacts["project_state"] = pathlib.Path(res["project_state_path"])
+        receipt = write_run_receipt(
+            wd / "run_receipt.json",
+            manifest_path=wd / "run_manifest.json",
+            artifacts=receipt_artifacts,
+            project_state_delta=res.get("project_state_delta") or {},
+        )
+        _atomic_write_json(delivery_status_path, {
+            "schema_version": 1,
+            "status": "artifacts_bound",
+            "run_status": res.get("status"),
+            "validation_status": (res.get("validation_artifact") or {}).get("status"),
+            "validation_exit_code": (res.get("validation_artifact") or {}).get("exit_code"),
+            "summary_path": str(summary_path.resolve()),
+            "summary_sha256": sha256_file(summary_path),
+            "run_receipt_path": str((wd / "run_receipt.json").resolve()),
+            "run_receipt_sha256": sha256_file(wd / "run_receipt.json"),
+            "receipt_content_sha256": receipt.get("receipt_sha256", ""),
+        })
+    except Exception as _e:
+        res.setdefault("persistence_errors", []).append(
+            f"run_receipt:{type(_e).__name__}:{_e}")
+        if res.get("status") in {"complete", "vuln_found", "low_roi", "no_work"}:
+            res["status"] = "incomplete"
+        try:
+            if not isinstance(summary, dict) and summary_path.is_file():
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if isinstance(summary, dict):
+                summary["status"] = _summary_status(res)
+                summary["run_receipt_status"] = "failed"
+                summary["persistence_errors"] = list(res.get("persistence_errors") or [])
+                _atomic_write_json(summary_path, summary)
+            _atomic_write_json(delivery_status_path, {
+                "schema_version": 1,
+                "status": "failed",
+                "run_receipt_path": str((wd / "run_receipt.json").resolve()),
+                "error": f"{type(_e).__name__}: {_e}",
+            })
+        except Exception as status_error:
+            print(f"  ⚠ 回写交付失败状态失败: {type(status_error).__name__}: {status_error}",
+                  file=sys.stderr)
+        print(f"  ⚠ 落 run_receipt.json 失败: {type(_e).__name__}: {_e}", file=sys.stderr)
     print("─" * 60)
     print(f"终态: {res['status']} ｜ 标记: {res.get('marker')} ｜ 轮次: {res['turn']}")
     if "accepted" in res:          # error/needs_confirm 终态返回里没有 Guardian 账本
@@ -2099,7 +2173,7 @@ def main():
         print(f"⚠ 流式中断已抢救（{res.get('error')}）；已落盘证据在 {wd}")
         print(f"  断点续测: python3 run.py --sid {sid} --resume --target {args.target} --authz <...> [--cookie/--bearer ...]")
     print(f"证据/报告/状态/日志: {wd}（事件流见 events.jsonl）")
-    return 0 if res["status"] == "vuln_found" else 1
+    return 0 if res["status"] in {"vuln_found", "complete", "no_work"} else 1
 
 
 if __name__ == "__main__":

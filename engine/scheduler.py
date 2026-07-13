@@ -125,9 +125,24 @@ def _shallow_negatives(bb: dict) -> list[str]:
 
 def _carryover_intents(bb: dict) -> list[dict]:
     """High-priority pending intents to carry into the next run."""
-    return [{"intent_id": i.get("intent_id", ""), "priority": i.get("priority", "high")}
-            for i in bb.get("intents", [])
-            if i.get("status") == "pending" and i.get("priority") == "high"]
+    carried: list[dict] = []
+    for intent in bb.get("intents", []):
+        if intent.get("status") != "pending" or intent.get("priority") != "high":
+            continue
+        target = canonical_surface_key({
+            "endpoint": intent.get("target_endpoint", ""),
+            "method": intent.get("target_method") or intent.get("method", ""),
+        }) if intent.get("target_endpoint") else ""
+        carried.append({
+            "intent_id": intent.get("intent_id", ""),
+            "priority": intent.get("priority", "high"),
+            "target_surface": target,
+            "target_method": intent.get("target_method") or intent.get("method", ""),
+            "target_params": list(intent.get("target_params") or []),
+            "target_roles": list(intent.get("target_roles") or []),
+            "vuln_class": intent.get("vuln_class", ""),
+        })
+    return carried
 
 
 def select_target_domains(blackboard: dict, requested: list[str] | None = None) -> list[str]:
@@ -189,22 +204,30 @@ def compute_run_scope(
                     params.append(text)
     inv_set = set(inv_eps)
 
-    # Tier 1: high-priority pending intents (carried over)
+    # Tier 1: high-priority pending intents (carried over).  v8.6 only exposed
+    # these as statistics; v8.8 makes their actual target the first scheduled
+    # surface so cross-run work is executable rather than decorative.
     carryover = _carryover_intents(bb)
+    intent_surfaces = [
+        item["target_surface"] for item in carryover
+        if item.get("target_surface") in inv_set
+    ]
     # Tier 2: high-value target-domain surfaces
     biz_surfaces = [ep for ep in _high_value_endpoints(bg, target_domains)
-                    if ep in inv_set]
+                    if ep in inv_set and ep not in known_eps]
     # Tier 3: flow completion surfaces
     flow_surfaces = [ep for ep in _flow_completion_endpoints(bg, bb)
-                     if ep in inv_set]
+                     if ep in inv_set and ep not in known_eps]
     # Tier 4: shallow negatives with signal
-    shallow_negs = [ep for ep in _shallow_negatives(bb) if ep in inv_set]
+    shallow_negs = [ep for ep in _shallow_negatives(bb)
+                    if ep in inv_set and ep not in known_eps]
     # Tier 5: newly discovered endpoints (in inventory, not in bb)
     new_eps = [ep for ep in inv_eps if ep and ep not in known_eps]
     # Tier 6: low-value remaining coverage
-    higher_tiers = set(biz_surfaces) | set(flow_surfaces) | set(shallow_negs)
+    higher_tiers = (set(intent_surfaces) | set(biz_surfaces)
+                    | set(flow_surfaces) | set(shallow_negs))
     remaining = [ep for ep in inv_eps
-                 if ep in known_eps and ep not in higher_tiers]
+                 if ep not in known_eps and ep not in higher_tiers]
 
     # Merge tiers respecting budget, deduplicate preserving priority
     must_test: list[str] = []
@@ -216,7 +239,8 @@ def compute_run_scope(
                 seen.add(ep)
                 must_test.append(ep)
 
-    for batch in (biz_surfaces, flow_surfaces, shallow_negs, new_eps, remaining):
+    for batch in (intent_surfaces, biz_surfaces, flow_surfaces,
+                  shallow_negs, new_eps, remaining):
         _add(batch)
 
     # Hard invariant: every must_test entry must be canonical "METHOD /path".

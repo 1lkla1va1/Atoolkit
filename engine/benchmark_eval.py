@@ -520,14 +520,53 @@ def _finding_rows(summary: Any) -> list[dict[str, Any]]:
 
 def load_findings(summary_path: pathlib.Path, *, trust_legacy: bool = False) -> list[Finding]:
     data = load_structured(summary_path)
+    rows = _finding_rows(data)
+    if not trust_legacy:
+        if not isinstance(data, dict):
+            return []
+        validation_ref = str(data.get("finding_validation_path") or "").strip()
+        validation_path = (
+            pathlib.Path(validation_ref) if validation_ref
+            else summary_path.parent / "finding_validation.json"
+        )
+        if not validation_path.is_absolute():
+            validation_path = summary_path.parent / validation_path
+        if not validation_path.is_file():
+            return []
+        try:
+            validation = load_structured(validation_path)
+            try:
+                from .reporting.validate import verify_validation_artifact
+            except ImportError:  # pragma: no cover - direct script fallback
+                from reporting.validate import verify_validation_artifact
+            verification = verify_validation_artifact(validation, summary_path.parent)
+        except Exception:
+            return []
+        expected_digest = str(data.get("finding_validation_sha256") or "")
+        actual_digest = str(validation.get("validation_sha256") or "")
+        if (not expected_digest or expected_digest != actual_digest
+                or not verification.get("ok")
+                or int(validation.get("exit_code", 3)) != 0):
+            return []
+        rows = [
+            row for row in (validation.get("normalized_findings") or [])
+            if isinstance(row, dict)
+        ]
     findings: list[Finding] = []
-    for index, row in enumerate(_finding_rows(data), start=1):
+    for index, row in enumerate(rows, start=1):
         if not trust_legacy:
             if row.get("acceptance_status") != "accepted":
                 continue
             if row.get("proof_status") != "confirmed":
                 continue
             if row.get("claim_kind") != "root_finding":
+                continue
+        else:
+            # Legacy mode tolerates absent proof metadata, not explicit
+            # pending/hypothesis/rejected metadata.
+            if (row.get("acceptance_status") not in {None, "", "accepted"}
+                    or row.get("proof_status") not in {None, "", "confirmed"}
+                    or row.get("claim_kind") not in {None, "", "root_finding"}):
                 continue
         evidence_file = str(_first(row, "evidence_file", "evidence", "evidence_path") or "")
         evidence_path = _resolve_evidence(summary_path, evidence_file)

@@ -255,7 +255,7 @@ def test_benchmark_ignores_hypothesis_and_requires_exact_method_role(tmp_path):
         "params": ["amount"], "roles": ["user"], "class": "amount-tamper",
         "score": 100,
     }]))
-    findings = load_findings(tmp_path / "summary.json")
+    findings = load_findings(tmp_path / "summary.json", trust_legacy=True)
     assert [finding.id for finding in findings] == ["root"]
     result = evaluate(load_oracle(tmp_path / "oracle.json"), findings, [])
     assert result["total_score"] == 100

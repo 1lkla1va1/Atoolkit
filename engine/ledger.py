@@ -518,6 +518,7 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
             "source": source,
             "legacy_vuln": cell.get("vuln", ""),
             "vuln_class": vuln_class,
+            "reason": str(cell.get("reason") or ""),
             "legacy_reason": cell.get("reason", ""),
             "negative_depth": negative_depth,
             "negative_depth_checked": bool(cell.get("negative_depth_checked", False)),

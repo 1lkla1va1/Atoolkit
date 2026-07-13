@@ -141,7 +141,7 @@ class BusinessGraph:
 
     def build_from_inventory(
         self,
-        endpoints: list[str | dict[str, str]],
+        endpoints: list[str | dict[str, Any]],
         target_domains: list[str] | None = None,
     ) -> None:
         """Seed the graph from inventory. Accepts strings ("POST /api/x") or dicts.
@@ -160,19 +160,47 @@ class BusinessGraph:
             # target_domains is a scheduling hint, never a graph filter.  A
             # cross-domain endpoint must keep every inferred domain so later
             # runs can follow Fact-Intent chains outside the current focus.
-            domains = _infer_domains(path)
-            roles = _infer_roles(path)
+            explicit = ep if isinstance(ep, dict) else {}
+            params = [str(x) for x in (explicit.get("params") or []) if str(x)]
+            domains = _infer_domains(path, params)
+            roles = [str(x) for x in (explicit.get("roles") or []) if str(x)] or _infer_roles(path)
+            observed_roles = [
+                str(x) for x in (explicit.get("observed_roles") or []) if str(x)
+            ]
             obj = _infer_object(path)
             state = _infer_state_effect(method, path)
 
-            self.endpoint_map[key] = {
-                "domains": domains,
-                "objects": [obj],
-                "roles": roles,
-                "state_effect": state,
-                "value": _infer_value(method, path),
-            }
-            for r in roles:
+            entry = self.endpoint_map.setdefault(key, {
+                "domains": [], "objects": [], "roles": [],
+                "observed_roles": [], "params": [], "sources": [],
+                "state_effect": state, "value": _infer_value(method, path),
+                "confirmed_vuln_classes": [],
+            })
+
+            def merge_list(field: str, values: list[str]) -> None:
+                current = entry.setdefault(field, [])
+                for value in values:
+                    if value and value not in current:
+                        current.append(value)
+
+            merge_list("domains", domains)
+            if len(entry["domains"]) > 1 and "general" in entry["domains"]:
+                entry["domains"].remove("general")
+            merge_list("objects", [obj])
+            merge_list("roles", roles)
+            merge_list("observed_roles", observed_roles)
+            merge_list("params", params)
+            source = str(explicit.get("source") or "")
+            merge_list("sources", [source] if source else [])
+            # Never let a later low-information heuristic rebuild downgrade an
+            # observed high-value endpoint.
+            rank = {"low": 0, "medium": 1, "high": 2}
+            inferred_value = _infer_value(method, path)
+            if rank.get(inferred_value, 0) > rank.get(entry.get("value", "low"), 0):
+                entry["value"] = inferred_value
+            if entry.get("state_effect") in (None, "", "read") and state != "read":
+                entry["state_effect"] = state
+            for r in roles + observed_roles:
                 if r not in self.roles:
                     self.roles.append(r)
             if obj not in self.objects:
@@ -194,10 +222,22 @@ class BusinessGraph:
                 "domains": _infer_domains(endpoint, fact_data.get("params")),
                 "objects": [_infer_object(endpoint)],
                 "roles": _infer_roles(endpoint),
+                "observed_roles": [],
+                "params": [],
+                "sources": [],
                 "state_effect": _infer_state_effect(method, endpoint),
                 "value": _infer_value(method, endpoint),
+                "confirmed_vuln_classes": [],
             }
             self.endpoint_map[key] = entry
+
+        for param in fact_data.get("params") or []:
+            text = str(param or "")
+            if text and text not in entry.setdefault("params", []):
+                entry["params"].append(text)
+        affected_role = str(fact_data.get("affected_role") or "")
+        if affected_role and affected_role not in entry.setdefault("observed_roles", []):
+            entry["observed_roles"].append(affected_role)
 
         for role in entry.get("roles", []):
             if role not in self.roles:
@@ -206,14 +246,18 @@ class BusinessGraph:
             if obj not in self.objects:
                 self.objects.append(obj)
 
-        extra_domains = _infer_domains(endpoint, fact_data.get("params"))
+        # Business domains come from the inventory/route model.  Fact params
+        # and vuln classes are observations stored below, not a second domain
+        # classifier (otherwise a vuln named ``idor`` silently pollutes the
+        # graph's business taxonomy).
+        extra_domains = _infer_domains(endpoint)
         for d in extra_domains:
             if d not in entry["domains"]:
                 entry["domains"].append(d)
 
         vc = fact_data.get("vuln_class", "")
-        if vc and vc not in entry["domains"]:
-            entry["domains"].append(vc)
+        if vc and vc not in entry.setdefault("confirmed_vuln_classes", []):
+            entry["confirmed_vuln_classes"].append(vc)
 
         if fact_data.get("summary"):
             entry["last_fact_summary"] = fact_data["summary"]

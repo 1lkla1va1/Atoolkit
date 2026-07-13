@@ -121,6 +121,8 @@ class FactIntentGraph:
         self.facts.append(fact_data)
         new_intents = IntentRuleEngine.generate_intents(fact_data, self)
         for intent in new_intents:
+            intent.setdefault("target_method", fact_data.get("method", ""))
+            intent.setdefault("method", intent.get("target_method", ""))
             intent["intent_id"] = f"intent_{self._next_intent_id:03d}"
             intent.setdefault("status", "pending")  # v8.5.1: ensure status is always set
             self._next_intent_id += 1

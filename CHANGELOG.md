@@ -1,5 +1,16 @@
 # Changelog
 
+## 8.8.0 - 2026-07-13
+
+- 新增原子、带 revision 的 `project_state.json`，统一跨 Run inventory、角色感知 coverage cell、root finding、negative、Intent 与 run history；旧 Blackboard 降为派生兼容视图。
+- 后续 Run 可直接恢复项目业务面与精确未闭格；项目已全闭且无 pending Intent 时不调用模型，避免重复侦察与随机重测。
+- Finding 采集改为有界、fail-closed：识别 canonical/legacy/suspicious 布局，重复 ID、畸形 JSON、超限与 legacy 包均显式报错，不再静默漏 ingest。
+- 新增 manifest → validation → receipt 交付链：首次模型/网络动作前固化版本、源码、授权和指令指纹，收口绑定验证、覆盖、summary 与项目状态增量哈希。
+- 相对 target 绑定 manifest 的 primary target；授权 scope 不再作为相对 URL 基址。空 Finding 默认 exit 2，仅在显式 `--allow-empty` 且 inventory/coverage/candidate 闭环时 exit 0。
+- Scheduler/BusinessGraph 保留真实 METHOD/path、参数、角色和来源；Finding 指纹对数字/UUID/长十六进制对象 ID 保守模板化，不用标题或自由文本 invariant 去重。
+- 根目录 `AGENTS.md` 成为 Codex 项目指令入口，`codex/AGENTS.md` 保留兼容副本；`--doctor` 只读诊断外部 `/src` 指向，不改用户全局配置。
+- 新增 v8.8 fail-closed、跨 Run 真值和 runtime integration 回归测试。
+
 ## 8.7.0 - 2026-07-12
 
 - Finding 统一为 root/impact/chain 证明合同；链式假设不再进入 accepted、严重度或 benchmark。
