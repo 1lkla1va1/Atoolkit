@@ -6,12 +6,18 @@ import pathlib
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse, urlsplit
 
 try:
     from ..host_policy import is_authorized_url, normalize_authorized_scopes
+    from ..run_authority import canonical_method_resolution_key
+    from ..runtime_manifest import validate_manifest_binding
+    from ..safe_io import atomic_write_json, safe_read_text
 except ImportError:  # pragma: no cover - direct package fallback
     from host_policy import is_authorized_url, normalize_authorized_scopes
+    from run_authority import canonical_method_resolution_key
+    from runtime_manifest import validate_manifest_binding
+    from safe_io import atomic_write_json, safe_read_text
 
 from .schema import normalize_finding, resolve_finding_file
 
@@ -785,6 +791,401 @@ def _validate_verification(
             reasons.append("generic finding requires control and exploit packets")
 
 
+def _canonical_asset(value: str) -> str:
+    try:
+        try:
+            from ..project_state import canonical_asset
+        except ImportError:  # pragma: no cover
+            from project_state import canonical_asset
+        return canonical_asset(value)
+    except ImportError:  # pragma: no cover - standalone defensive fallback
+        parsed = urlparse(str(value or ""))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return f"{parsed.scheme}://{parsed.hostname.lower()}:{port}"
+
+
+def _request_components(
+    request_text: str,
+    *,
+    context: ValidationContext | None,
+    finding_target: str,
+) -> dict[str, Any]:
+    match = re.search(
+        r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)\s+HTTP/",
+        request_text, re.I | re.M)
+    if not match:
+        return {}
+    method, raw_target = match.group(1).upper(), match.group(2)
+    parsed = urlsplit(raw_target)
+    host = parsed.netloc
+    scheme = parsed.scheme.lower()
+    if not host:
+        host_match = re.search(r"^Host:\s*([^\s]+)\s*$", request_text, re.I | re.M)
+        host = host_match.group(1) if host_match else ""
+        if context is not None:
+            scheme = urlparse(context.primary_target).scheme or "https"
+        else:
+            scheme = urlparse(str(finding_target or "")).scheme or "https"
+    path = parsed.path or "/"
+    query = parsed.query
+    asset = _canonical_asset(f"{scheme}://{host}") if host else ""
+    body = re.split(r"\r?\n\r?\n", request_text, maxsplit=1)
+    header_block = body[0]
+    headers: dict[str, str] = {}
+    for header_match in re.finditer(
+            r"^([!#$%&'*+.^_`|~0-9A-Za-z-]+):\s*([^\r\n]*)$",
+            header_block, re.M):
+        headers[header_match.group(1).lower()] = header_match.group(2).strip()
+    return {
+        "method": method,
+        "path": path,
+        "query": query,
+        "asset_id": asset,
+        "body": body[1] if len(body) == 2 else "",
+        "headers": headers,
+    }
+
+
+def _json_parameter_names(value: Any) -> set[str]:
+    names: set[str] = set()
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            names.add(str(key))
+            names.update(_json_parameter_names(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            names.update(_json_parameter_names(nested))
+    return names
+
+
+def _body_parameter_names(components: dict[str, Any]) -> tuple[str, set[str]]:
+    headers = components.get("headers")
+    content_type = str(
+        headers.get("content-type") if isinstance(headers, dict) else ""
+    ).split(";", 1)[0].strip().lower()
+    body = str(components.get("body") or "")
+    if content_type == "application/json" or content_type.endswith("+json"):
+        try:
+            return "json", _json_parameter_names(json.loads(body))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return "json", set()
+    if content_type == "application/x-www-form-urlencoded":
+        return "form", {
+            key for key, _value in parse_qsl(body, keep_blank_values=True)
+        }
+    if content_type == "multipart/form-data":
+        return "multipart", {
+            match.group(1)
+            for match in re.finditer(
+                r'^Content-Disposition:[^\r\n]*\bname="([^"\r\n]+)"',
+                body, re.I | re.M)
+        }
+    return "", set()
+
+
+def _request_contains_param(components: dict[str, Any], cell: dict[str, Any]) -> bool:
+    name = str(cell.get("param") or "").strip()
+    if not name:
+        return True
+    location = str(cell.get("param_location") or "").strip().lower()
+    endpoint = str(cell.get("endpoint") or "")
+    path_bound = bool(re.search(
+        rf"(?:\{{{re.escape(name)}\}}|:{re.escape(name)}(?:/|$))",
+        urlsplit(endpoint).path or endpoint, re.I))
+    query_bound = any(
+        key == name for key, _value in parse_qsl(
+            components.get("query", ""), keep_blank_values=True))
+    body_kind, body_names = _body_parameter_names(components)
+    body_bound = name in body_names
+    if location == "path":
+        return path_bound
+    if location == "query":
+        return query_bound
+    if location == "body":
+        return body_bound
+    if location in {"form", "json", "multipart"}:
+        return body_kind == location and body_bound
+    return path_bound or query_bound or body_bound
+
+
+def _semantic_cell_tuple(cell: dict[str, Any]) -> tuple[str, ...]:
+    return (
+        _canonical_asset(str(cell.get("asset_id") or cell.get("asset") or "")),
+        str(cell.get("endpoint") or cell.get("path") or "").strip(),
+        str(cell.get("method") or "").strip().upper(),
+        str(cell.get("param") or "").strip(),
+        str(cell.get("actor_role") or cell.get("role_scope") or "unknown").strip().lower(),
+        str(cell.get("namespace") or "").strip(),
+        str(cell.get("param_location") or "").strip().lower(),
+        str(cell.get("subject_role") or "").strip().lower(),
+        str(cell.get("object_kind") or "").strip().lower(),
+    )
+
+
+def _packet_declared_cells(packet: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = packet.get("exact_cells")
+    if rows is None and isinstance(packet.get("exact_cell"), dict):
+        rows = [packet["exact_cell"]]
+    return [row for row in (rows or []) if isinstance(row, dict)]
+
+
+def _cell_request_path(cell: dict[str, Any]) -> str:
+    """Resolve a namespace-relative endpoint to its physical HTTP path."""
+    endpoint_text = str(cell.get("endpoint") or cell.get("path") or "").strip()
+    endpoint = urlsplit(endpoint_text).path or endpoint_text.split("?", 1)[0] or "/"
+    if not endpoint.startswith("/"):
+        endpoint = f"/{endpoint}"
+    namespace_text = str(cell.get("namespace") or "").strip()
+    namespace = urlsplit(namespace_text).path or namespace_text.split("?", 1)[0]
+    namespace = f"/{namespace.strip('/')}" if namespace.strip("/") else ""
+    if not namespace:
+        return endpoint
+    # Absolute or already-resolved endpoint forms must not receive a second
+    # namespace prefix.
+    if endpoint == namespace or endpoint.startswith(f"{namespace}/"):
+        return endpoint
+    return f"{namespace}{endpoint}"
+
+
+def _cell_matches_raw_request(
+    cell: dict[str, Any], components: dict[str, str],
+) -> bool:
+    if not components:
+        return False
+    if str(cell.get("method") or "").upper() != components.get("method"):
+        return False
+    endpoint = _cell_request_path(cell)
+    request_path = components.get("path", "")
+    if not (
+        _template_path_matches(endpoint, request_path)
+        or _template_path_matches(request_path, endpoint)
+    ):
+        return False
+    asset = _canonical_asset(str(cell.get("asset_id") or ""))
+    if asset and asset != components.get("asset_id"):
+        return False
+    return _request_contains_param(components, cell)
+
+
+def _api_authorization_targets(
+    api: dict[str, Any], finding: dict[str, Any], context: ValidationContext | None,
+) -> list[str]:
+    path = str(api.get("path") or "").strip()
+    parsed_path = urlparse(path)
+    targets: list[str] = []
+    absolute_path = bool(
+        parsed_path.scheme in {"http", "https"} and parsed_path.hostname)
+    if absolute_path:
+        targets.append(path)
+    explicit = []
+    explicit_present = any(key in api for key in ("assets", "asset", "asset_id"))
+    for key in ("assets", "asset", "asset_id"):
+        value = api.get(key)
+        explicit.extend(value if isinstance(value, list) else [value] if value else [])
+    if explicit_present and not explicit:
+        targets.append("")
+        return targets
+    if explicit:
+        relative_path = (
+            (parsed_path.path or "/")
+            + (f"?{parsed_path.query}" if parsed_path.query else "")
+        ) if absolute_path else path
+        for value in explicit:
+            text = str(value or "").strip()
+            parsed = urlparse(text)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                targets.append("")
+            else:
+                base = f"{parsed.scheme}://{parsed.netloc}/"
+                targets.append(urljoin(base, relative_path.lstrip("/")))
+        return targets
+    if absolute_path:
+        return targets
+    if context is not None and context.primary_target:
+        return [urljoin(context.primary_target.rstrip("/") + "/", path.lstrip("/"))]
+    top = str(finding.get("target") or "").strip()
+    parts = top.split(None, 1)
+    if len(parts) == 2 and parts[0].upper() in {
+        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+    }:
+        top = parts[1]
+    parsed = urlparse(top)
+    if parsed.scheme in {"http", "https"} and parsed.hostname:
+        return [urljoin(f"{parsed.scheme}://{parsed.netloc}/", path.lstrip("/"))]
+    return [path]
+
+
+def _inventory_item_authorized(
+    item: Any, context: ValidationContext | None,
+) -> bool:
+    if context is None:
+        return True
+    if isinstance(item, str):
+        text = item.strip()
+        parts = text.split(None, 1)
+        if (len(parts) == 2 and parts[0].upper() in {
+                "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}):
+            text = parts[1]
+        parsed = urlparse(text)
+        return not (
+            parsed.scheme in {"http", "https"} and parsed.hostname
+        ) or context.allows(text)
+    if not isinstance(item, dict):
+        return False
+    endpoint = str(item.get("endpoint") or item.get("path") or "").strip()
+    endpoint_parts = endpoint.split(None, 1)
+    if (len(endpoint_parts) == 2 and endpoint_parts[0].upper() in {
+            "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}):
+        endpoint = endpoint_parts[1]
+    parsed_endpoint = urlparse(endpoint)
+    if (parsed_endpoint.scheme in {"http", "https"}
+            and parsed_endpoint.hostname
+            and not context.allows(endpoint)):
+        return False
+    explicit_present = any(
+        key in item for key in ("assets", "asset", "asset_id"))
+    explicit: list[Any] = []
+    for key in ("assets", "asset", "asset_id"):
+        value = item.get(key)
+        explicit.extend(value if isinstance(value, list) else [value] if value else [])
+    if explicit_present and not explicit:
+        return False
+    relative_target = (
+        (parsed_endpoint.path or "/")
+        + (f"?{parsed_endpoint.query}" if parsed_endpoint.query else "")
+    ) if parsed_endpoint.scheme else endpoint
+    for value in explicit:
+        parsed_asset = urlparse(str(value or "").strip())
+        if parsed_asset.scheme not in {"http", "https"} or not parsed_asset.hostname:
+            return False
+        base = f"{parsed_asset.scheme}://{parsed_asset.netloc}/"
+        target = urljoin(base, str(relative_target or "/").lstrip("/"))
+        if not context.allows(target):
+            return False
+    return True
+
+
+def _validate_api_proof_bindings(
+    finding: dict[str, Any], finding_file: pathlib.Path, run_base: pathlib.Path,
+    packets: list[dict[str, Any]], reasons: list[str],
+    *, authorized_hosts: list[str] | None, context: ValidationContext | None,
+) -> list[dict[str, Any]]:
+    """Bind every declared API/exact cell to a matching raw request packet."""
+    finding_dir = finding_file.parent
+    packet_records: dict[str, dict[str, Any]] = {}
+    for index, packet in enumerate(packets):
+        if not isinstance(packet, dict):
+            continue
+        name = str(packet.get("name") or "").strip()
+        if not name:
+            reasons.append(f"proof_packets[{index}].name required for exact-cell binding")
+            continue
+        if name in packet_records:
+            reasons.append(f"duplicate proof packet name: {name}")
+            continue
+        try:
+            request = resolve_finding_file(
+                finding_dir, packet.get("request_file"), run_base)
+            response = resolve_finding_file(
+                finding_dir, packet.get("response_file"), run_base)
+        except (TypeError, ValueError):
+            continue
+        if not request.is_file() or not response.is_file():
+            continue
+        request_text = _read_text(request)
+        response_text = _read_text(response)
+        packet_records[name] = {
+            "packet": packet,
+            "request": request,
+            "response": response,
+            "components": _request_components(
+                request_text, context=context,
+                finding_target=str(finding.get("target") or "")),
+            "has_response": HTTP_STATUS.search(response_text) is not None,
+            "request_text": request_text,
+            "response_text": response_text,
+        }
+
+    merged: dict[tuple[str, ...], dict[str, Any]] = {}
+    for api_index, api in enumerate(finding.get("apis") or []):
+        if not isinstance(api, dict):
+            continue
+        for target in _api_authorization_targets(api, finding, context):
+            if not target or not _target_allowed(target, authorized_hosts, context):
+                reasons.append(
+                    f"apis[{api_index}] target out of authorized scopes: {target or '<invalid asset>'}")
+        declared_ids = api.get("proof_packet_ids")
+        if declared_ids is not None and not isinstance(declared_ids, list):
+            reasons.append(f"apis[{api_index}].proof_packet_ids must be a list")
+            declared_ids = []
+        if declared_ids is not None and not declared_ids:
+            reasons.append(f"apis[{api_index}].proof_packet_ids cannot be empty")
+        allowed_ids = {
+            str(value) for value in (
+                packet_records.keys() if declared_ids is None else declared_ids)
+        }
+        unknown_ids = sorted(allowed_ids - set(packet_records))
+        if unknown_ids:
+            reasons.append(
+                f"apis[{api_index}].proof_packet_ids reference unknown packets: "
+                + ",".join(unknown_ids))
+
+        # Reuse the canonical schema expansion, but isolate this API so an
+        # unrelated sibling API cannot lend it rows or packets.
+        one_api = dict(finding)
+        one_api["apis"] = [api]
+        api_cells = normalize_finding(
+            one_api, finding_file, run_base).get("exact_cells") or []
+        for cell in api_cells:
+            raw_candidates: list[tuple[str, dict[str, Any]]] = []
+            for packet_id in sorted(allowed_ids):
+                record = packet_records.get(packet_id)
+                if (record is not None and record["has_response"]
+                        and _cell_matches_raw_request(cell, record["components"])):
+                    raw_candidates.append((packet_id, record))
+
+            bound: list[tuple[str, dict[str, Any]]] = []
+            for packet_id, record in raw_candidates:
+                declared_cells = _packet_declared_cells(record["packet"])
+                if declared_cells:
+                    if (any(_semantic_cell_tuple(row) == _semantic_cell_tuple(cell)
+                            for row in declared_cells)
+                            and _identity_assertions_pass(
+                                cell,
+                                record["packet"].get("identity_assertions"),
+                                record["request_text"], record["response_text"],
+                            )):
+                        bound.append((packet_id, record))
+                    continue
+                # Raw HTTP can distinguish method/path/host/param/location.  If
+                # it still matches several semantic cells (role/namespace/
+                # subject/object), the packet must explicitly name its cell.
+                raw_matches = [
+                    row for row in api_cells
+                    if _cell_matches_raw_request(row, record["components"])
+                ]
+                if len({_semantic_cell_tuple(row) for row in raw_matches}) == 1:
+                    bound.append((packet_id, record))
+            if not bound:
+                reasons.append(
+                    f"apis[{api_index}] exact cell has no raw METHOD/path/Host proof binding: "
+                    f"{cell.get('method')} {cell.get('endpoint')} param={cell.get('param')!r} "
+                    f"actor={cell.get('actor_role')!r}")
+                continue
+            identity = _semantic_cell_tuple(cell)
+            item = merged.setdefault(identity, {**cell, "proof_packet_ids": [], "proof_files": []})
+            for packet_id, record in bound:
+                if packet_id not in item["proof_packet_ids"]:
+                    item["proof_packet_ids"].append(packet_id)
+                for proof_path in (record["request"], record["response"]):
+                    relative = proof_path.resolve().relative_to(run_base).as_posix()
+                    if relative not in item["proof_files"]:
+                        item["proof_files"].append(relative)
+    return list(merged.values())
+
+
 def validate_finding(
     finding: dict[str, Any],
     finding_path: str | pathlib.Path,
@@ -868,6 +1269,11 @@ def validate_finding(
         if not str(packet.get("phase") or "").strip():
             reasons.append(f"missing proof_packets[{i}].phase")
 
+    exact_cell_bindings = _validate_api_proof_bindings(
+        finding, finding_file, run_base, packets, reasons,
+        authorized_hosts=authorized_hosts, context=context,
+    )
+
     _validate_verification(finding, packets, finding_dir, run_base, reasons)
     _validate_chain(finding, finding_dir, run_base, reasons)
     _validate_claims(finding, packets, finding_dir, run_base, reasons)
@@ -912,7 +1318,10 @@ def validate_finding(
             for i, ref in enumerate(helpers):
                 _exists(finding_dir, ref, run_base, reasons, f"crypto_chain.helper_files[{i}]")
 
-    normalized = None if reasons else normalize_finding(finding, finding_file, run_base)
+    normalized = None if reasons else normalize_finding(
+        finding, finding_file, run_base,
+        exact_cell_bindings=exact_cell_bindings,
+    )
     return ValidationResult(
         ok=not reasons,
         id=fid,
@@ -957,8 +1366,926 @@ def _canonical_digest(value: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _empty_run_gate(
-    run_dir: pathlib.Path, context: ValidationContext | None = None,
+def _template_path_matches(template: str, concrete: str) -> bool:
+    """Conservatively match ``/x/{id}`` coverage paths to concrete findings."""
+    if template == concrete:
+        return True
+    escaped = re.escape(str(template or ""))
+    pattern = re.sub(r"\\\{[^{}]+\\\}", r"[^/]+", escaped)
+    return bool(pattern and re.fullmatch(pattern, str(concrete or "")))
+
+
+def _surface_has_current_finding(
+    surface: dict[str, Any],
+    findings: list[dict[str, Any]],
+    run_dir: pathlib.Path,
+    source_run_dir: pathlib.Path | None = None,
+) -> bool:
+    evidence_ref = str(surface.get("evidence_ref") or "").strip()
+    if not evidence_ref:
+        return False
+    evidence_path = pathlib.Path(evidence_ref)
+    if evidence_path.is_absolute() and source_run_dir is not None:
+        try:
+            relative = evidence_path.resolve(strict=False).relative_to(
+                source_run_dir.resolve())
+        except ValueError:
+            return False
+        evidence_path = run_dir / relative
+    elif not evidence_path.is_absolute():
+        evidence_path = run_dir / evidence_path
+    evidence_path = evidence_path.resolve(strict=False)
+    try:
+        evidence_relative = evidence_path.relative_to(run_dir.resolve()).as_posix()
+    except ValueError:
+        return False
+
+    try:
+        try:
+            from ..project_state import canonical_asset
+        except ImportError:  # pragma: no cover
+            from project_state import canonical_asset
+    except ImportError:  # pragma: no cover - defensive for standalone tooling
+        canonical_asset = lambda value: str(value or "").strip()  # type: ignore[assignment]
+
+    def values(value: Any) -> list[Any]:
+        if value in (None, "", [], {}):
+            return []
+        return value if isinstance(value, list) else [value]
+
+    surface_method = str(surface.get("method") or "").upper()
+    surface_endpoint = str(surface.get("endpoint") or "").split("?", 1)[0]
+    surface_param = str(surface.get("param") or "").strip()
+    surface_asset = canonical_asset(str(
+        surface.get("asset_id") or surface.get("asset") or ""))
+    explicit_surface_role = surface.get("actor_role") or surface.get("role_scope")
+    surface_roles = {
+        str(role).strip().lower() for role in values(
+            surface.get("actor_roles")
+            or ([explicit_surface_role] if explicit_surface_role else None)
+            or surface.get("roles") or ["unknown"])
+        if str(role).strip()
+    }
+    surface_dimensions = {
+        "namespace": str(surface.get("namespace") or "").strip(),
+        "param_location": str(surface.get("param_location") or "").strip().lower(),
+        "subject_role": str(surface.get("subject_role") or "").strip().lower(),
+        "object_kind": str(surface.get("object_kind") or "").strip().lower(),
+    }
+    surface_class = str(
+        surface.get("vuln_class") or surface.get("legacy_vuln") or "").strip().lower()
+    for finding in findings:
+        proof_refs = {str(ref) for ref in finding.get("proof_files") or []}
+        if evidence_relative not in proof_refs:
+            continue
+        finding_class = str(
+            finding.get("vuln_class") or finding.get("class") or "").strip().lower()
+        if surface_class and finding_class and surface_class != finding_class:
+            continue
+
+        rows = [row for row in finding.get("exact_cells") or []
+                if isinstance(row, dict)]
+        if not rows:
+            assets = values(finding.get("assets") or [
+                finding.get("asset_id") or finding.get("asset") or finding.get("target") or ""]
+            )
+            methods = values(finding.get("methods") or [finding.get("method") or ""])
+            endpoints = values(finding.get("endpoints") or [finding.get("endpoint") or ""])
+            params = values(finding.get("params") or [finding.get("param") or ""])
+            roles = values(finding.get("actor_roles") or finding.get("roles") or [
+                finding.get("actor_role") or finding.get("affected_role") or "unknown"])
+            rows = [{
+                "asset_id": asset, "method": method, "endpoint": endpoint,
+                "param": param, "actor_role": role,
+                "namespace": finding.get("namespace") or "",
+                "param_location": finding.get("param_location") or "",
+                "subject_role": finding.get("subject_role") or "",
+                "object_kind": finding.get("object_kind") or "",
+            } for asset in assets for method in methods for endpoint in endpoints
+              for param in params for role in roles]
+
+        compatible: set[tuple[str, ...]] = set()
+        for row in rows:
+            row_method = str(row.get("method") or "").strip().upper()
+            row_endpoint = str(
+                row.get("endpoint") or row.get("path") or "").split("?", 1)[0]
+            row_param = str(row.get("param") or "").strip()
+            row_role = str(
+                row.get("actor_role") or row.get("role_scope") or "unknown").strip().lower()
+            row_asset = canonical_asset(str(
+                row.get("asset_id") or row.get("asset") or ""))
+            row_dimensions = {
+                "namespace": str(row.get("namespace") or "").strip(),
+                "param_location": str(row.get("param_location") or "").strip().lower(),
+                "subject_role": str(row.get("subject_role") or "").strip().lower(),
+                "object_kind": str(row.get("object_kind") or "").strip().lower(),
+            }
+            if surface_method and row_method != surface_method:
+                continue
+            if surface_endpoint and not (
+                _template_path_matches(surface_endpoint, row_endpoint)
+                or _template_path_matches(row_endpoint, surface_endpoint)
+            ):
+                continue
+            if row_param != surface_param:
+                continue
+            if surface_roles and row_role not in surface_roles:
+                continue
+            if surface_asset and row_asset != surface_asset:
+                continue
+            if any(surface_dimensions[key]
+                   and row_dimensions[key] != surface_dimensions[key]
+                   for key in surface_dimensions):
+                continue
+            compatible.add((
+                row_asset, row_method, row_endpoint, row_param, row_role,
+                row_dimensions["namespace"], row_dimensions["param_location"],
+                row_dimensions["subject_role"], row_dimensions["object_kind"],
+            ))
+        # Legacy surfaces may omit a newer dimension, but only a single exact
+        # finding identity may satisfy that projection.  This keeps old runs
+        # readable without letting one proof close path/query or app variants.
+        if len(compatible) == 1:
+            return True
+    return False
+
+
+def _exact_cell_keys(row: dict[str, Any], fallback_asset: str = "") -> set[str]:
+    """Project runtime/plan rows onto the same v8.9 exact-cell identity."""
+    try:
+        try:
+            from ..project_state import canonical_asset, canonical_project_cell_key
+        except ImportError:  # pragma: no cover
+            from project_state import canonical_asset, canonical_project_cell_key
+        asset = canonical_asset(
+            str(row.get("asset_id") or row.get("asset") or fallback_asset or ""))
+        method = str(row.get("method") or "").strip().upper()
+        path = str(row.get("endpoint") or row.get("path") or "").strip()
+        vuln_class = str(
+            row.get("vuln_class") or row.get("legacy_vuln")
+            or row.get("class") or row.get("vuln") or "").strip()
+        param = str(row.get("param") or "").strip()
+        roles = row.get("actor_roles") or row.get("roles") or [
+            row.get("actor_role") or row.get("role_scope") or "unknown"]
+        if isinstance(roles, str):
+            roles = [roles]
+        if not asset or not method or not path or not vuln_class:
+            return set()
+        return {
+            canonical_project_cell_key(
+                asset,
+                method=method,
+                path=path,
+                param=param,
+                role_scope=str(role or "unknown"),
+                vuln_class=vuln_class,
+                namespace=str(row.get("namespace") or ""),
+                param_location=str(row.get("param_location") or ""),
+                subject_role=str(row.get("subject_role") or ""),
+                object_kind=str(row.get("object_kind") or ""),
+            )
+            for role in roles
+        }
+    except (TypeError, ValueError):
+        return set()
+
+
+def _authority_plan_gate(
+    context: ValidationContext | None,
+    surfaces: list[Any],
+) -> tuple[list[str], dict[str, Any]]:
+    """Ensure session JSON cannot shrink the authority-frozen denominator."""
+    manifest = context.manifest if context is not None else {}
+    plan_text = str((manifest or {}).get("run_plan_path") or "").strip()
+    project_id = str((manifest or {}).get("project_id") or "").strip()
+    if not plan_text:
+        return (["authority_run_plan_missing"] if project_id else []), {
+            "required": bool(project_id), "planned": 0, "present": 0, "closed": 0,
+        }
+    try:
+        plan = json.loads(safe_read_text(pathlib.Path(plan_text)))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ["authority_run_plan_invalid"], {
+            "required": True, "planned": 0, "present": 0, "closed": 0,
+        }
+    rows = plan.get("admitted_cells") if isinstance(plan, dict) else None
+    if not isinstance(rows, list):
+        return ["authority_run_plan_invalid"], {
+            "required": True, "planned": 0, "present": 0, "closed": 0,
+        }
+    fallback_asset = str((manifest or {}).get("primary_target") or "")
+    planned: set[str] = set()
+    reasons: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            reasons.append("authority_run_plan_cell_invalid")
+            continue
+        keys = _exact_cell_keys(row, fallback_asset)
+        if not keys:
+            reasons.append("authority_run_plan_cell_invalid")
+            continue
+        declared = str(row.get("cell_key") or "")
+        if declared and declared not in keys:
+            reasons.append("authority_run_plan_cell_key_mismatch")
+        planned.update(keys)
+    method_items = plan.get("method_resolution_items") if isinstance(plan, dict) else None
+    if not isinstance(method_items, list) or any(
+            not isinstance(item, dict) for item in method_items):
+        reasons.append("authority_method_plan_invalid")
+        method_items = []
+    permitted_amendment_sources = {
+        canonical_method_resolution_key(item, fallback_asset)
+        for item in method_items
+        if item.get("in_run_scope") is True
+    }
+    budget = plan.get("budget") if isinstance(plan, dict) else {}
+    if not isinstance(budget, dict):
+        reasons.append("authority_run_plan_budget_invalid")
+        budget = {}
+    try:
+        surface_budget = int(budget.get("surface_budget", 0) or 0)
+        allowed_cell_count = int(
+            budget.get("allowed_cell_count", len(planned)) or 0)
+    except (TypeError, ValueError):
+        reasons.append("authority_run_plan_budget_invalid")
+        surface_budget = allowed_cell_count = 0
+    if allowed_cell_count != len(planned):
+        reasons.append("authority_run_plan_allowed_count_mismatch")
+    if surface_budget > 0 and (
+            len(planned) > surface_budget or allowed_cell_count > surface_budget):
+        reasons.append("authority_run_plan_budget_exceeded")
+    in_scope_method_items = sum(
+        1 for item in method_items if item.get("in_run_scope") is True)
+    if (surface_budget > 0
+            and len(planned) + in_scope_method_items > surface_budget):
+        reasons.append("authority_method_plan_budget_exceeded")
+    amendment_capacity = (
+        max(0, surface_budget - allowed_cell_count)
+        if surface_budget > 0 else None)
+    amendment_cells: set[str] = set()
+    authority_path_text = str((manifest or {}).get("authority_path") or "")
+    if authority_path_text:
+        authority_root = pathlib.Path(authority_path_text).parent.parent
+        amendments = (
+            authority_root / "events" /
+            str((manifest or {}).get("session_id") or "") /
+            "scope_amendment.jsonl"
+        )
+        if amendments.is_symlink():
+            reasons.append("authority_scope_event_chain_invalid")
+        elif amendments.is_file():
+            previous = ""
+            expected_sequence = 1
+            try:
+                for line in safe_read_text(amendments).splitlines():
+                    record = json.loads(line)
+                    supplied = str(record.get("event_sha256") or "")
+                    canonical = dict(record)
+                    canonical.pop("event_sha256", None)
+                    if (int(record.get("sequence", 0) or 0) != expected_sequence
+                            or str(record.get("previous_event_sha256") or "") != previous
+                            or supplied != hashlib.sha256(json.dumps(
+                                canonical, ensure_ascii=False, sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")).hexdigest()):
+                        reasons.append("authority_scope_event_chain_invalid")
+                        break
+                    event = record.get("event") or {}
+                    keys = _exact_cell_keys(event, fallback_asset)
+                    if not keys:
+                        reasons.append("authority_scope_event_cell_invalid")
+                    else:
+                        declared = str(event.get("cell_key") or "")
+                        if declared and declared not in keys:
+                            reasons.append("authority_scope_event_cell_key_mismatch")
+                        source_key = canonical_method_resolution_key(
+                            event, fallback_asset)
+                        if source_key not in permitted_amendment_sources:
+                            reasons.append(
+                                "authority_scope_event_not_from_frozen_method_item")
+                        elif (amendment_capacity is not None
+                              and len(amendment_cells | keys) > amendment_capacity):
+                            # Each frozen unresolved item consumes one unit of
+                            # the pre-network surface budget.  A model-visible
+                            # discovery stream cannot fan that item out into an
+                            # unbounded denominator after the plan is frozen.
+                            reasons.append("authority_scope_event_budget_exceeded")
+                        else:
+                            amendment_cells.update(keys)
+                            planned.update(keys)
+                    previous = supplied
+                    expected_sequence += 1
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                reasons.append("authority_scope_event_chain_invalid")
+    present: set[str] = set()
+    closed: set[str] = set()
+    terminal = {"confirmed", "not_vulnerable", "not_applicable"}
+    for surface in surfaces:
+        if not isinstance(surface, dict) or surface.get("in_run_scope") is False:
+            continue
+        keys = _exact_cell_keys(surface, fallback_asset)
+        present.update(keys)
+        if str(surface.get("status") or "").strip().lower() in terminal:
+            closed.update(keys)
+    if planned - present:
+        reasons.append("authority_run_plan_cells_missing")
+    if planned - closed:
+        reasons.append("authority_run_plan_cells_open")
+    return reasons, {
+        "required": True,
+        "planned": len(planned),
+        "present": len(planned & present),
+        "closed": len(planned & closed),
+        "missing": sorted(planned - present),
+        "open": sorted(planned - closed),
+    }
+
+
+def _authority_candidate_gate(context: ValidationContext | None) -> list[str]:
+    manifest = context.manifest if context is not None else {}
+    plan_text = str((manifest or {}).get("run_plan_path") or "").strip()
+    if not plan_text:
+        return []
+    try:
+        plan = json.loads(safe_read_text(pathlib.Path(plan_text)))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ["authority_candidate_state_invalid"]
+    latest: dict[str, str] = {}
+    for item in plan.get("candidate_baseline") or []:
+        if isinstance(item, dict) and item.get("candidate_id"):
+            latest[str(item["candidate_id"])] = str(item.get("status") or "")
+    authority_path = str((manifest or {}).get("authority_path") or "")
+    if authority_path:
+        event_path = (
+            pathlib.Path(authority_path).parent.parent / "events" /
+            str((manifest or {}).get("session_id") or "") / "candidate.jsonl"
+        )
+        if event_path.is_symlink():
+            return ["authority_candidate_event_chain_invalid"]
+        if event_path.is_file():
+            previous = ""
+            sequence = 1
+            try:
+                for line in safe_read_text(event_path).splitlines():
+                    record = json.loads(line)
+                    supplied = str(record.get("event_sha256") or "")
+                    canonical = dict(record)
+                    canonical.pop("event_sha256", None)
+                    digest = hashlib.sha256(json.dumps(
+                        canonical, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")).hexdigest()
+                    if (int(record.get("sequence", 0) or 0) != sequence
+                            or str(record.get("previous_event_sha256") or "") != previous
+                            or supplied != digest):
+                        return ["authority_candidate_event_chain_invalid"]
+                    candidate = ((record.get("event") or {}).get("candidate") or {})
+                    candidate_id = str(candidate.get("candidate_id") or "")
+                    if not candidate_id:
+                        return ["authority_candidate_event_invalid"]
+                    latest[candidate_id] = str(candidate.get("status") or "")
+                    previous = supplied
+                    sequence += 1
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return ["authority_candidate_event_chain_invalid"]
+    if any(status in {"proof_ready", "confirmed"} for status in latest.values()):
+        return ["authority_proof_ready_candidate_open"]
+    return []
+
+
+def _authority_method_resolution_gate(
+    context: ValidationContext | None,
+    endpoints: list[Any],
+    unresolved: list[Any],
+) -> list[str]:
+    """Bind unknown-method backlog closure to the immutable run plan.
+
+    Out-of-budget hints remain project backlog and do not block this run.  A
+    planned hint may disappear from ``inventory.unresolved`` only after the
+    parent-owned discovery event chain attests a concrete HTTP method and the
+    resolved row is present in inventory.
+    """
+    manifest = context.manifest if context is not None else {}
+    plan_text = str((manifest or {}).get("run_plan_path") or "").strip()
+    fallback_asset = str((manifest or {}).get("primary_target") or "")
+    if not plan_text:
+        # Legacy sessions have no authority denominator, so no session-owned
+        # in_run_scope=false flag is trusted to suppress unresolved work.
+        return ["inventory_unresolved_open"] if unresolved else []
+    try:
+        plan = json.loads(safe_read_text(pathlib.Path(plan_text)))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ["authority_method_plan_invalid"]
+    rows = plan.get("method_resolution_items") if isinstance(plan, dict) else None
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        return ["authority_method_plan_invalid"]
+
+    reasons: list[str] = []
+
+    def _key(row: dict[str, Any]) -> str:
+        return canonical_method_resolution_key(row, fallback_asset)
+
+    planned_keys = {_key(row) for row in rows}
+    if len(planned_keys) != len(rows):
+        reasons.append("authority_method_plan_duplicate")
+    for row in rows:
+        try:
+            identity = json.loads(_key(row))
+        except json.JSONDecodeError:
+            identity = {}
+        if (not identity.get("asset") or not identity.get("endpoint")
+                or row.get("in_run_scope") is not True):
+            reasons.append("authority_method_plan_invalid")
+
+    unresolved_keys: set[str] = set()
+    for row in unresolved:
+        if not isinstance(row, dict):
+            reasons.append("inventory_unresolved_invalid")
+            continue
+        key = _key(row)
+        unresolved_keys.add(key)
+        expected_scope = key in planned_keys
+        if row.get("in_run_scope") is not expected_scope:
+            reasons.append("authority_method_scope_mismatch")
+
+    endpoint_keys = {
+        _key(row) for row in endpoints
+        if isinstance(row, dict)
+        and str(row.get("method") or "").strip().upper() in {
+            "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+        }
+    }
+
+    attested_resolved: set[str] = set()
+    authority_path = str((manifest or {}).get("authority_path") or "")
+    if authority_path:
+        event_path = (
+            pathlib.Path(authority_path).parent.parent / "events" /
+            str((manifest or {}).get("session_id") or "") / "discovery.jsonl"
+        )
+        if event_path.is_symlink():
+            reasons.append("authority_discovery_event_chain_invalid")
+        elif event_path.is_file():
+            previous = ""
+            sequence = 1
+            try:
+                for line in safe_read_text(event_path).splitlines():
+                    record = json.loads(line)
+                    supplied = str(record.get("event_sha256") or "")
+                    canonical = dict(record)
+                    canonical.pop("event_sha256", None)
+                    digest = hashlib.sha256(json.dumps(
+                        canonical, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")).hexdigest()
+                    if (int(record.get("sequence", 0) or 0) != sequence
+                            or str(record.get("previous_event_sha256") or "") != previous
+                            or supplied != digest):
+                        reasons.append("authority_discovery_event_chain_invalid")
+                        break
+                    event = record.get("event") or {}
+                    surface = event.get("surface") if isinstance(event, dict) else None
+                    if isinstance(surface, dict) and str(
+                            surface.get("method") or "").strip().upper() in {
+                                "GET", "POST", "PUT", "PATCH", "DELETE",
+                                "HEAD", "OPTIONS",
+                            }:
+                        attested_resolved.add(_key(surface))
+                    previous = supplied
+                    sequence += 1
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                reasons.append("authority_discovery_event_chain_invalid")
+
+    for key in planned_keys:
+        if key in unresolved_keys:
+            reasons.append("inventory_unresolved_open")
+        elif key not in endpoint_keys:
+            reasons.append("authority_method_item_missing")
+        elif key not in attested_resolved:
+            reasons.append("authority_method_resolution_unattested")
+    return reasons
+
+
+_EVIDENCE_CELL_DIMENSIONS = {
+    "namespace", "param_location", "subject_role", "object_kind",
+}
+
+
+def _evidence_cell_complete(cell: dict[str, Any]) -> bool:
+    return bool(
+        isinstance(cell, dict)
+        and (cell.get("asset_id") or cell.get("asset"))
+        and str(cell.get("method") or "").upper() in {
+            "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+        }
+        and (cell.get("endpoint") or cell.get("path"))
+        and "param" in cell
+        and any(key in cell for key in ("actor_role", "role_scope", "role"))
+        and any(key in cell for key in ("vuln_class", "class", "vuln"))
+        and _EVIDENCE_CELL_DIMENSIONS.issubset(cell)
+    )
+
+
+def _inline_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _machine_assertion_passes(
+    assertion: dict[str, Any], request_text: str, response_text: str,
+) -> bool:
+    target = str(assertion.get("target") or assertion.get("file") or "").strip().lower()
+    if target in {"request", "request_file", "request.http"}:
+        text = request_text
+    elif target in {"response", "response_file", "response.http"}:
+        text = response_text
+    else:
+        return False
+    relation = str(assertion.get("relation") or "contains").strip().lower()
+    value = str(assertion.get("value") or "")
+    if len(value) < 4:
+        return False
+    if relation == "contains":
+        return value in text
+    if relation == "not_contains":
+        return value not in text
+    if relation == "regex":
+        try:
+            return re.search(value, text, re.M) is not None
+        except re.error:
+            return False
+    return False
+
+
+def _identity_assertions_pass(
+    cell: dict[str, Any], assertions: Any,
+    request_text: str, response_text: str,
+) -> bool:
+    if not isinstance(assertions, dict):
+        assertions = {}
+    required = {
+        "actor_role": str(
+            cell.get("actor_role") or cell.get("role_scope") or "unknown"
+        ).strip().lower(),
+        "subject_role": str(cell.get("subject_role") or "").strip().lower(),
+        "object_kind": str(cell.get("object_kind") or "").strip().lower(),
+    }
+    if required["actor_role"] in {"", "unknown", "anonymous", "anon"}:
+        required["actor_role"] = ""
+    for dimension, value in required.items():
+        if not value:
+            continue
+        assertion = assertions.get(dimension)
+        if not isinstance(assertion, dict):
+            return False
+        marker = str(assertion.get("value") or "").strip().lower()
+        if value not in marker:
+            return False
+        if not _machine_assertion_passes(
+                assertion, request_text, response_text):
+            return False
+    return True
+
+
+def _load_packet_text(
+    packet: dict[str, Any], key: str, envelope_path: pathlib.Path,
+    allowed_root: pathlib.Path,
+) -> tuple[str, pathlib.Path | None]:
+    inline = packet.get(key)
+    if isinstance(inline, str) and inline:
+        return inline, None
+    ref = str(packet.get(f"{key}_file") or "").strip()
+    if not ref:
+        return "", None
+    raw = pathlib.Path(ref)
+    candidate = raw if raw.is_absolute() else envelope_path.parent / raw
+    current = candidate
+    while current != allowed_root and current != current.parent:
+        if current.is_symlink():
+            return "", None
+        current = current.parent
+    try:
+        path = resolve_finding_file(envelope_path.parent, ref, allowed_root)
+    except ValueError:
+        return "", None
+    if path.is_symlink() or not path.is_file():
+        return "", None
+    return _read_text(path), path
+
+
+def _validate_evidence_envelope(
+    envelope_path: pathlib.Path,
+    expected_cell: dict[str, Any],
+    *,
+    expected_kind: str,
+    allowed_root: pathlib.Path,
+    context: ValidationContext | None,
+) -> tuple[bool, dict[str, Any], dict[str, str]]:
+    """Verify a portable negative/dead-end evidence packet.
+
+    The envelope carries raw HTTP (inline or by safe relative reference), exact
+    cell identity, SHA-256 bindings and executable assertions.  Counts and
+    vector labels are derived from validated packets; ledger prose is ignored.
+    """
+    try:
+        document = envelope_path.read_text(encoding="utf-8")
+    except OSError:
+        return False, {}, {}
+    try:
+        envelope = json.loads(document)
+    except json.JSONDecodeError:
+        # Engine Mode already harvests negative_*.md.  A marked JSON block lets
+        # that established channel carry the same strict portable contract;
+        # surrounding prose/frontmatter never enters the trusted object.
+        match = re.search(
+            r"<machine_evidence>\s*(\{.*?\})\s*</machine_evidence>",
+            document, re.S)
+        if not match:
+            return False, {}, {}
+        try:
+            envelope = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return False, {}, {}
+    if (not isinstance(envelope, dict)
+            or str(envelope.get("schema_version") or "") not in {"1", "1.0"}
+            or str(envelope.get("kind") or "") != expected_kind):
+        return False, {}, {}
+    exact_cell = envelope.get("exact_cell")
+    if not isinstance(exact_cell, dict) or not _evidence_cell_complete(exact_cell):
+        return False, {}, {}
+    expected_keys = _exact_cell_keys(expected_cell, "")
+    envelope_keys = _exact_cell_keys(exact_cell, "")
+    if not expected_keys or envelope_keys != expected_keys:
+        return False, {}, {}
+    packets = envelope.get("packets")
+    if not isinstance(packets, list) or not packets:
+        return False, {}, {}
+
+    vectors: set[str] = set()
+    request_hashes: set[str] = set()
+    response_hashes: set[str] = set()
+    artifacts: dict[str, str] = {}
+    try:
+        relative_envelope = envelope_path.resolve().relative_to(
+            allowed_root.resolve()).as_posix()
+    except ValueError:
+        return False, {}, {}
+    artifacts[relative_envelope] = _sha256_file(envelope_path)
+
+    for packet in packets:
+        if not isinstance(packet, dict):
+            return False, {}, {}
+        packet_cell = packet.get("exact_cell") or exact_cell
+        if (not isinstance(packet_cell, dict)
+                or not _evidence_cell_complete(packet_cell)
+                or _exact_cell_keys(packet_cell, "") != expected_keys):
+            return False, {}, {}
+        request_text, request_path = _load_packet_text(
+            packet, "request", envelope_path, allowed_root)
+        response_text, response_path = _load_packet_text(
+            packet, "response", envelope_path, allowed_root)
+        request_hash = str(packet.get("request_sha256") or "").strip().lower()
+        response_hash = str(packet.get("response_sha256") or "").strip().lower()
+        if (not request_text or not response_text
+                or not re.fullmatch(r"[0-9a-f]{64}", request_hash)
+                or not re.fullmatch(r"[0-9a-f]{64}", response_hash)
+                or _inline_sha256(request_text) != request_hash
+                or _inline_sha256(response_text) != response_hash):
+            return False, {}, {}
+        components = _request_components(
+            request_text, context=context,
+            finding_target=str(exact_cell.get("asset_id") or exact_cell.get("asset") or ""))
+        if (not _cell_matches_raw_request(exact_cell, components)
+                or HTTP_STATUS.search(response_text) is None):
+            return False, {}, {}
+        if context is not None:
+            target = f"{components.get('asset_id')}{components.get('path')}"
+            if not context.allows(target):
+                return False, {}, {}
+        vector = str(packet.get("vector") or "").strip().lower()
+        assertions = packet.get("assertions")
+        if (not vector or not isinstance(assertions, list) or not assertions
+                or any(not isinstance(item, dict)
+                       or not _machine_assertion_passes(
+                           item, request_text, response_text)
+                       for item in assertions)):
+            return False, {}, {}
+        identity_assertions = (
+            packet.get("identity_assertions")
+            if packet.get("identity_assertions") is not None
+            else envelope.get("identity_assertions")
+        )
+        if not _identity_assertions_pass(
+                exact_cell, identity_assertions, request_text, response_text):
+            return False, {}, {}
+        vectors.add(vector)
+        request_hashes.add(request_hash)
+        response_hashes.add(response_hash)
+        for physical in (request_path, response_path):
+            if physical is not None:
+                relative = physical.resolve().relative_to(
+                    allowed_root.resolve()).as_posix()
+                artifacts[relative] = _sha256_file(physical)
+
+    return True, {
+        # A copied request cannot manufacture another independent vector.
+        "vectors": sorted(vectors) if len(vectors) == len(request_hashes) else [],
+        "response_count": len(response_hashes),
+        "evidence_types": list(envelope.get("evidence_types") or []),
+        "identities": list(envelope.get("identities") or []),
+        "roles": list(envelope.get("roles") or []),
+    }, artifacts
+
+
+def _project_evidence_path(
+    project_dir: pathlib.Path, ref: str,
+) -> pathlib.Path | None:
+    text = str(ref or "").strip()
+    if text.startswith("session:"):
+        payload = text[len("session:"):]
+        session_id, separator, relative = payload.partition("/")
+        if (not separator or not session_id or ".." in pathlib.Path(relative).parts):
+            return None
+        candidate = project_dir / "sessions" / session_id / relative
+    elif text.startswith("project:"):
+        relative = text[len("project:"):]
+        if not relative or ".." in pathlib.Path(relative).parts:
+            return None
+        candidate = project_dir / relative
+    else:
+        return None
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(project_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    current = candidate
+    while current != project_dir and current != current.parent:
+        if current.is_symlink():
+            return None
+        current = current.parent
+    return resolved if resolved.is_file() else None
+
+
+def _validate_project_evidence_envelopes(
+    project_dir: pathlib.Path,
+    refs: list[Any],
+    expected_cell: dict[str, Any],
+    *,
+    expected_kind: str,
+    context: ValidationContext | None,
+) -> tuple[bool, dict[str, Any]]:
+    vectors: set[str] = set()
+    response_count = 0
+    evidence_types: set[str] = set()
+    identities: set[str] = set()
+    roles: set[str] = set()
+    if not refs:
+        return False, {}
+    for ref in refs:
+        path = _project_evidence_path(project_dir, str(ref or ""))
+        if path is None:
+            return False, {}
+        ok, derived, _artifacts = _validate_evidence_envelope(
+            path, expected_cell, expected_kind=expected_kind,
+            allowed_root=project_dir, context=context)
+        if not ok:
+            return False, {}
+        vectors.update(str(value) for value in derived.get("vectors") or [])
+        response_count += int(derived.get("response_count", 0) or 0)
+        evidence_types.update(
+            str(value) for value in derived.get("evidence_types") or [])
+        identities.update(str(value) for value in derived.get("identities") or [])
+        roles.update(str(value) for value in derived.get("roles") or [])
+    return True, {
+        "vectors": sorted(vectors), "response_count": response_count,
+        "evidence_types": sorted(evidence_types),
+        "identities": sorted(identities), "roles": sorted(roles),
+    }
+
+
+def _validated_dead_end_keys(
+    run_dir: pathlib.Path,
+    context: ValidationContext | None,
+) -> tuple[set[str], list[str], dict[str, str]]:
+    """Validate evidence-attested exact-cell ``not_applicable`` packets."""
+    path = run_dir / "dead_ends.json"
+    if not path.exists():
+        return set(), [], {}
+    if path.is_symlink() or not path.is_file():
+        return set(), ["dead_end_contract_invalid"], {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set(), ["dead_end_contract_invalid"], {}
+    rows = value.get("dead_ends") if isinstance(value, dict) else value
+    if not isinstance(rows, list):
+        return set(), ["dead_end_contract_invalid"], {}
+    try:
+        try:
+            from ..project_state import DEAD_END_REASON_CODES, canonical_asset
+        except ImportError:  # pragma: no cover
+            from project_state import DEAD_END_REASON_CODES, canonical_asset
+    except ImportError:  # pragma: no cover - standalone defensive fallback
+        return set(), ["dead_end_contract_invalid"], {}
+
+    expected_run = str(
+        ((context.manifest or {}).get("session_id") if context else "")
+        or run_dir.name
+    )
+    root = run_dir.resolve()
+    valid_keys: set[str] = set()
+    reasons: list[str] = []
+    artifact_hashes: dict[str, str] = {}
+    dimension_fields = {
+        "namespace", "param_location", "subject_role", "object_kind",
+    }
+    for row in rows:
+        if not isinstance(row, dict):
+            reasons.append("dead_end_contract_invalid")
+            continue
+        reason_code = str(row.get("reason_code") or "").strip()
+        role_present = any(
+            key in row for key in ("role_scope", "role", "actor_role"))
+        vuln_present = any(
+            key in row for key in ("vuln_class", "class", "vuln"))
+        asset_text = str(row.get("asset_id") or row.get("asset") or "").strip()
+        method = str(row.get("method") or "").strip().upper()
+        endpoint = str(row.get("endpoint") or row.get("path") or "").strip()
+        if (str(row.get("status") or "").strip() != "not_applicable"
+                or reason_code not in DEAD_END_REASON_CODES
+                or not str(row.get("refutation") or "").strip()
+                or str(row.get("source_run") or "").strip() != expected_run
+                or not asset_text or not canonical_asset(asset_text)
+                or method not in {
+                    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+                }
+                or not endpoint or "param" not in row
+                or not role_present or not vuln_present
+                or not dimension_fields.issubset(row)):
+            reasons.append("dead_end_contract_invalid")
+            continue
+        refs = list(row.get("evidence_refs") or [])
+        if row.get("evidence_ref"):
+            refs.append(row["evidence_ref"])
+        refs = list(dict.fromkeys(str(ref or "").strip() for ref in refs if str(ref or "").strip()))
+        if not refs:
+            reasons.append("dead_end_evidence_missing")
+            continue
+        evidence_ok = True
+        for ref in refs:
+            relative = ref
+            if ref.startswith("session:"):
+                payload = ref[len("session:"):]
+                sid, separator, relative = payload.partition("/")
+                if not separator or sid != expected_run:
+                    evidence_ok = False
+                    break
+            elif ref.startswith("project:") or pathlib.Path(ref).is_absolute():
+                evidence_ok = False
+                break
+            if ".." in pathlib.Path(relative).parts:
+                evidence_ok = False
+                break
+            candidate = run_dir / relative
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                evidence_ok = False
+                break
+            current = candidate
+            while current != run_dir and current != current.parent:
+                if current.is_symlink():
+                    evidence_ok = False
+                    break
+                current = current.parent
+            if not evidence_ok or not resolved.is_file():
+                evidence_ok = False
+                break
+            envelope_ok, _derived, artifacts = _validate_evidence_envelope(
+                resolved, row, expected_kind="dead_end_evidence",
+                allowed_root=run_dir, context=context)
+            if not envelope_ok:
+                evidence_ok = False
+                break
+            artifact_hashes.update(artifacts)
+        if not evidence_ok:
+            reasons.append("dead_end_evidence_invalid")
+            continue
+        keys = _exact_cell_keys(row, "")
+        if not keys:
+            reasons.append("dead_end_exact_cell_invalid")
+            continue
+        valid_keys.update(keys)
+    return valid_keys, reasons, artifact_hashes
+
+
+def _run_closure_gate(
+    run_dir: pathlib.Path,
+    context: ValidationContext | None = None,
+    *,
+    normalized_findings: list[dict[str, Any]] | None = None,
+    source_run_dir: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     http_methods = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
@@ -966,7 +2293,18 @@ def _empty_run_gate(
     project_dir = (run_dir.parent.parent
                    if run_dir.parent.name == "sessions" else run_dir)
     expected_project_state = (project_dir / "project_state.json").resolve(strict=False)
+    source_run = (source_run_dir or run_dir).resolve()
+    source_project_dir = (
+        source_run.parent.parent
+        if source_run.parent.name == "sessions" else source_run
+    )
+    declared_project_state = (
+        source_project_dir / "project_state.json").resolve(strict=False)
+    dead_end_keys, dead_end_reasons, closure_artifact_hashes = (
+        _validated_dead_end_keys(run_dir, context))
+    reasons.extend(dead_end_reasons)
     endpoints: list[Any] = []
+    unresolved: list[Any] = []
     try:
         inventory = json.loads((run_dir / "inventory.json").read_text(encoding="utf-8"))
         endpoints = inventory.get("endpoints") if isinstance(inventory, dict) else inventory
@@ -976,10 +2314,17 @@ def _empty_run_gate(
             unresolved = inventory.get("unresolved") or []
             if not isinstance(unresolved, list):
                 reasons.append("inventory_unresolved_invalid")
-            elif unresolved:
-                reasons.append("inventory_unresolved_open")
+                unresolved = []
     except (OSError, json.JSONDecodeError):
         reasons.append("inventory_missing_or_invalid")
+    if any(
+        not _inventory_item_authorized(item, context)
+        for item in [
+            *(endpoints if isinstance(endpoints, list) else []),
+            *(unresolved if isinstance(unresolved, list) else []),
+        ]
+    ):
+        reasons.append("inventory_asset_out_of_scope")
     ledger_path = run_dir / "coverage-ledger.json"
     surfaces: list[Any] = []
     if not ledger_path.is_file():
@@ -1001,16 +2346,21 @@ def _empty_run_gate(
                     status = str(surface.get("status") or "").strip().lower()
                     if method not in http_methods:
                         reasons.append("coverage_method_invalid")
+                    if surface.get("in_run_scope") is False:
+                        continue
                     if status not in terminal_statuses:
                         reasons.append("coverage_not_closed")
                     if status == "confirmed":
+                        current_ok = _surface_has_current_finding(
+                            surface, normalized_findings or [], run_dir,
+                            source_run_dir=source_run)
                         historical_ok = False
                         evidence_ref = str(surface.get("evidence_ref") or "").strip()
                         evidence_path = pathlib.Path(evidence_ref) if evidence_ref else None
                         if (evidence_path is not None and evidence_path.is_absolute()
                                 and evidence_path.name == "project_state.json"
-                                and evidence_path.resolve(strict=False) == expected_project_state
-                                and evidence_path.is_file()
+                                and evidence_path.resolve(strict=False) == declared_project_state
+                                and expected_project_state.is_file()
                                 and context is not None):
                             try:
                                 try:
@@ -1025,18 +2375,13 @@ def _empty_run_gate(
                                         canonical_project_cell_key,
                                         verify_project_evidence,
                                     )
-                                project = json.loads(evidence_path.read_text(encoding="utf-8"))
+                                project = json.loads(expected_project_state.read_text(
+                                    encoding="utf-8"))
                                 asset = next(iter(project.get("project_scope") or []), "")
                                 manifest_asset = canonical_asset(context.primary_target)
-                                manifest_project = str(
-                                    (context.manifest or {}).get("project") or "").strip()
                                 identity_ok = (
                                     bool(asset and manifest_asset)
                                     and canonical_asset(asset) == manifest_asset
-                                    and (
-                                        run_dir.parent.name != "sessions"
-                                        or manifest_project == project_dir.name
-                                    )
                                 )
                                 roles = surface.get("roles") or ["unknown"]
                                 vuln_class = str(surface.get("vuln_class")
@@ -1050,31 +2395,186 @@ def _empty_run_gate(
                                         param=str(surface.get("param") or ""),
                                         role_scope=str(role),
                                         vuln_class=vuln_class,
+                                        namespace=str(surface.get("namespace") or ""),
+                                        param_location=str(
+                                            surface.get("param_location") or ""),
+                                        subject_role=str(
+                                            surface.get("subject_role") or ""),
+                                        object_kind=str(
+                                            surface.get("object_kind") or ""),
                                     )
                                     prior = (project.get("cell_registry") or {}).get(key) or {}
                                     if (prior.get("status") != "confirmed"
                                             or not verify_project_evidence(
-                                                evidence_path.parent,
+                                                expected_project_state.parent,
                                                 list(prior.get("evidence_refs") or []),
                                                 dict(prior.get("evidence_hashes") or {}))):
                                         historical_ok = False
                                         break
                             except (OSError, ValueError, json.JSONDecodeError):
                                 historical_ok = False
-                        if not historical_ok:
+                        if not (current_ok or historical_ok):
                             reasons.append("confirmed_coverage_without_canonical_finding")
-                    if (status == "not_applicable"
-                            and not str(surface.get("reason") or "").strip()):
-                        reasons.append("not_applicable_reason_missing")
+                    if status == "not_applicable":
+                        if not str(surface.get("reason") or "").strip():
+                            reasons.append("not_applicable_reason_missing")
+                        surface_keys = _exact_cell_keys(
+                            surface,
+                            str((context.manifest or {}).get("primary_target") or "")
+                            if context else "",
+                        )
+                        historical_dead_end = False
+                        evidence_ref = str(surface.get("evidence_ref") or "").strip()
+                        evidence_path = pathlib.Path(evidence_ref) if evidence_ref else None
+                        if (surface_keys and evidence_path is not None
+                                and evidence_path.is_absolute()
+                                and evidence_path.name == "project_state.json"
+                                and evidence_path.resolve(strict=False)
+                                == declared_project_state
+                                and expected_project_state.is_file()
+                                and context is not None):
+                            try:
+                                try:
+                                    from ..project_state import (
+                                        DEAD_END_REASON_CODES,
+                                        canonical_asset,
+                                        verify_project_evidence,
+                                    )
+                                except ImportError:  # pragma: no cover
+                                    from project_state import (
+                                        DEAD_END_REASON_CODES,
+                                        canonical_asset,
+                                        verify_project_evidence,
+                                    )
+                                project = json.loads(expected_project_state.read_text(
+                                    encoding="utf-8"))
+                                manifest_asset = canonical_asset(context.primary_target)
+                                scope_assets = {
+                                    canonical_asset(value)
+                                    for value in (project.get("project_scope") or [])
+                                }
+                                historical_dead_end = bool(
+                                    manifest_asset and manifest_asset in scope_assets)
+                                registry = project.get("cell_registry") or {}
+                                for key in surface_keys:
+                                    prior = registry.get(key) or {}
+                                    if (prior.get("status") != "not_applicable"
+                                            or prior.get("reason_code")
+                                            not in DEAD_END_REASON_CODES
+                                            or not str(prior.get("refutation") or "").strip()
+                                            or not verify_project_evidence(
+                                                expected_project_state.parent,
+                                                list(prior.get("evidence_refs") or []),
+                                                dict(prior.get("evidence_hashes") or {}))
+                                            or not _validate_project_evidence_envelopes(
+                                                expected_project_state.parent,
+                                                list(prior.get("evidence_refs") or []),
+                                                surface,
+                                                expected_kind="dead_end_evidence",
+                                                context=context,
+                                            )[0]):
+                                        historical_dead_end = False
+                                        break
+                            except (OSError, ValueError, json.JSONDecodeError):
+                                historical_dead_end = False
+                        if (not surface_keys
+                                or (not surface_keys.issubset(dead_end_keys)
+                                    and not historical_dead_end)):
+                            reasons.append("not_applicable_contract_missing")
                     if status == "not_vulnerable":
                         negative = surface.get("negative")
                         evidence_ref = str(surface.get("evidence_ref") or "").strip()
+                        evidence_marker = pathlib.Path(evidence_ref) if evidence_ref else None
+                        historical_negative: dict[str, Any] | None = None
+                        if (evidence_marker is not None
+                                and evidence_marker.is_absolute()
+                                and evidence_marker.name == "project_state.json"
+                                and evidence_marker.resolve(strict=False)
+                                == declared_project_state
+                                and expected_project_state.is_file()
+                                and context is not None):
+                            try:
+                                try:
+                                    from ..project_state import verify_project_evidence
+                                except ImportError:  # pragma: no cover
+                                    from project_state import verify_project_evidence
+                                project = json.loads(expected_project_state.read_text(
+                                    encoding="utf-8"))
+                                registry = project.get("cell_registry") or {}
+                                surface_keys = _exact_cell_keys(
+                                    surface, context.primary_target)
+                                combined = {
+                                    "vectors": [], "response_count": 0,
+                                    "evidence_types": [], "identities": [], "roles": [],
+                                }
+                                valid_historical = bool(surface_keys)
+                                for key in surface_keys:
+                                    prior = registry.get(key) or {}
+                                    refs = list(prior.get("evidence_refs") or [])
+                                    semantic_ok, derived = (
+                                        _validate_project_evidence_envelopes(
+                                            expected_project_state.parent, refs, surface,
+                                            expected_kind="negative_evidence",
+                                            context=context,
+                                        ))
+                                    if (prior.get("status") != "not_vulnerable"
+                                            or not verify_project_evidence(
+                                                expected_project_state.parent, refs,
+                                                dict(prior.get("evidence_hashes") or {}))
+                                            or not semantic_ok):
+                                        valid_historical = False
+                                        break
+                                    for field in (
+                                            "vectors", "evidence_types",
+                                            "identities", "roles"):
+                                        combined[field] = list(dict.fromkeys([
+                                            *combined[field],
+                                            *list(derived.get(field) or []),
+                                        ]))
+                                    combined["response_count"] += int(
+                                        derived.get("response_count", 0) or 0)
+                                if valid_historical:
+                                    historical_negative = combined
+                            except (OSError, ValueError, json.JSONDecodeError):
+                                historical_negative = None
+                        if historical_negative is not None:
+                            try:
+                                try:
+                                    from ..knowledge import negative_sufficient
+                                except ImportError:  # pragma: no cover
+                                    from knowledge import negative_sufficient
+                                sufficient, _ = negative_sufficient(
+                                    surface, historical_negative, None)
+                                if not sufficient:
+                                    reasons.append("negative_depth_insufficient")
+                            except Exception:
+                                reasons.append("negative_depth_invalid")
+                            continue
                         if not isinstance(negative, dict) or not evidence_ref:
                             reasons.append("negative_evidence_missing")
                         else:
                             evidence_path = pathlib.Path(evidence_ref)
-                            if not evidence_path.is_absolute():
+                            if evidence_path.is_absolute():
+                                try:
+                                    relative = evidence_path.resolve(
+                                        strict=False).relative_to(source_project_dir)
+                                except ValueError:
+                                    reasons.append("negative_evidence_escape")
+                                    continue
+                                evidence_path = project_dir / relative
+                            else:
                                 evidence_path = run_dir / evidence_path
+                            current_path = evidence_path
+                            unsafe_evidence_path = False
+                            while (current_path != project_dir
+                                   and current_path != current_path.parent):
+                                if current_path.is_symlink():
+                                    unsafe_evidence_path = True
+                                    break
+                                current_path = current_path.parent
+                            if unsafe_evidence_path:
+                                reasons.append("negative_evidence_invalid")
+                                continue
                             resolved = evidence_path.resolve(strict=False)
                             project_dir = (run_dir.parent.parent
                                            if run_dir.parent.name == "sessions"
@@ -1086,12 +2586,31 @@ def _empty_run_gate(
                             else:
                                 if not resolved.is_file():
                                     reasons.append("negative_evidence_missing")
+                                    continue
+                            allowed_root = run_dir
+                            try:
+                                resolved.relative_to(run_dir.resolve())
+                            except ValueError:
+                                allowed_root = project_dir
+                            envelope_ok, derived_negative, artifacts = (
+                                _validate_evidence_envelope(
+                                    resolved, surface,
+                                    expected_kind="negative_evidence",
+                                    allowed_root=allowed_root,
+                                    context=context,
+                                ))
+                            if not envelope_ok:
+                                reasons.append("negative_evidence_invalid")
+                                continue
+                            if allowed_root == run_dir:
+                                closure_artifact_hashes.update(artifacts)
                             try:
                                 try:
                                     from ..knowledge import negative_sufficient
                                 except ImportError:  # pragma: no cover
                                     from knowledge import negative_sufficient
-                                sufficient, _ = negative_sufficient(surface, negative, None)
+                                sufficient, _ = negative_sufficient(
+                                    surface, derived_negative, None)
                                 if not sufficient:
                                     reasons.append("negative_depth_insufficient")
                             except Exception:
@@ -1182,11 +2701,15 @@ def _empty_run_gate(
                         break
                 if mismatch:
                     reasons.append("inventory_exact_cell_coverage_mismatch")
-            if any(isinstance(item, dict) and item.get("in_run_scope") is False
-                   for item in surfaces):
-                reasons.append("coverage_out_of_run")
         except (TypeError, ValueError):
             reasons.append("inventory_coverage_invalid")
+    reasons.extend(_authority_method_resolution_gate(
+        context,
+        endpoints if isinstance(endpoints, list) else [],
+        unresolved if isinstance(unresolved, list) else [],
+    ))
+    plan_reasons, plan_stats = _authority_plan_gate(context, surfaces)
+    reasons.extend(plan_reasons)
     try:
         candidates = json.loads((run_dir / "candidate-ledger.json").read_text(encoding="utf-8"))
         if (not isinstance(candidates, dict)
@@ -1207,6 +2730,7 @@ def _empty_run_gate(
     except json.JSONDecodeError:
         rows = []
         reasons.append("candidate_ledger_invalid")
+    reasons.extend(_authority_candidate_gate(context))
     session_gate: dict[str, Any] = {"result": "error", "reasons": []}
     if ledger_path.is_file():
         try:
@@ -1220,7 +2744,11 @@ def _empty_run_gate(
                 ledger_path=ledger_path,
                 inventory_path=run_dir / "inventory.json",
                 candidates=rows or None,
-                finding_candidate_ids=set(),
+                finding_candidate_ids={
+                    str(item.get("source_candidate_id") or "")
+                    for item in (normalized_findings or [])
+                    if str(item.get("source_candidate_id") or "")
+                },
             )
         except Exception as exc:
             reasons.append(f"session_gate_error:{type(exc).__name__}:{exc}")
@@ -1237,11 +2765,25 @@ def _empty_run_gate(
         "result": "pass" if not reasons and session_gate.get("result") == "pass" else "fail",
         "reasons": reasons,
         "session_gate": session_gate,
+        "authority_plan": plan_stats,
+        "artifact_hashes": closure_artifact_hashes,
     }
 
 
+def _empty_run_gate(
+    run_dir: pathlib.Path, context: ValidationContext | None = None,
+) -> dict[str, Any]:
+    """Backward-compatible alias; all new validation uses the run-wide gate."""
+    return _run_closure_gate(run_dir, context=context, normalized_findings=[])
+
+
 def _manifest_context(
-    run_dir: pathlib.Path, allowed_hosts: list[str] | None = None,
+    run_dir: pathlib.Path,
+    allowed_hosts: list[str] | None = None,
+    *,
+    expected_authority_dir: pathlib.Path | None = None,
+    expected_project_id: str = "",
+    expected_project_name: str = "",
 ) -> tuple[ValidationContext | None, pathlib.Path | None, list[dict[str, Any]]]:
     manifest_path = run_dir / "run_manifest.json"
     errors: list[dict[str, Any]] = []
@@ -1251,9 +2793,15 @@ def _manifest_context(
             "reason": "run_manifest.json is required before finding validation",
         })
         return None, None, errors
+    if manifest_path.is_symlink():
+        errors.append({
+            "code": "invalid_manifest",
+            "reason": "run_manifest.json cannot be a symlink",
+        })
+        return None, manifest_path, errors
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        manifest = json.loads(safe_read_text(manifest_path))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         errors.append({"code": "invalid_manifest", "reason": str(exc)})
         return None, manifest_path, errors
     required = {
@@ -1268,44 +2816,31 @@ def _manifest_context(
             "code": "manifest_fields_missing", "fields": missing,
             "reason": "runtime manifest is incomplete",
         })
-    authority_text = str(manifest.get("authority_path") or "").strip()
-    authority_path = pathlib.Path(authority_text).expanduser() if authority_text else None
-    context_manifest = manifest
-    context_manifest_path = manifest_path
-    if authority_path is None or not authority_path.is_absolute():
+    binding = validate_manifest_binding(
+        manifest, run_dir=run_dir, manifest_path=manifest_path,
+        authority_dir=expected_authority_dir)
+    errors.extend(binding.get("errors") or [])
+    if expected_project_id and str(manifest.get("project_id") or "") != str(
+            expected_project_id):
         errors.append({
-            "code": "invalid_manifest_authority",
-            "reason": "authority_path must be an absolute path",
+            "code": "manifest_project_id_mismatch",
+            "expected": str(expected_project_id),
+            "actual": str(manifest.get("project_id") or ""),
+            "reason": "manifest project_id differs from the finalizer authority",
         })
-    elif authority_path.resolve(strict=False) == manifest_path.resolve():
+    if expected_project_name and str(manifest.get("project") or "") != str(
+            expected_project_name):
         errors.append({
-            "code": "self_authorized_manifest",
-            "reason": "authority manifest must be outside the writable run directory",
+            "code": "manifest_project_name_mismatch",
+            "expected": str(expected_project_name),
+            "actual": str(manifest.get("project") or ""),
+            "reason": "manifest project differs from the finalizer project",
         })
-    else:
-        if not authority_path.is_file():
-            errors.append({
-                "code": "missing_manifest_authority",
-                "path": str(authority_path),
-                "reason": "authoritative manifest copy is missing",
-            })
-        else:
-            try:
-                authority = json.loads(authority_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                errors.append({
-                    "code": "invalid_manifest_authority", "path": str(authority_path),
-                    "reason": str(exc),
-                })
-            else:
-                context_manifest = authority
-                context_manifest_path = authority_path
-                if authority != manifest:
-                    errors.append({
-                        "code": "manifest_authority_mismatch",
-                        "path": str(authority_path),
-                        "reason": "session and authority manifests differ",
-                    })
+    authority = binding.get("authority_manifest")
+    context_manifest = authority if isinstance(authority, dict) else manifest
+    authority_text = str(binding.get("authority_path") or "")
+    context_manifest_path = (
+        pathlib.Path(authority_text) if authority_text else manifest_path)
     context = ValidationContext.from_manifest(
         context_manifest, manifest_path=context_manifest_path)
     if allowed_hosts:
@@ -1326,6 +2861,10 @@ def validate_run_artifacts(
     allowed_hosts: list[str] | None = None,
     allow_empty: bool = False,
     output_path: str | pathlib.Path | None = None,
+    expected_authority_dir: str | pathlib.Path | None = None,
+    expected_project_id: str = "",
+    expected_project_name: str = "",
+    source_run_dir: str | pathlib.Path | None = None,
 ) -> dict[str, Any]:
     """Single library entry point used by both CLI and orchestrator."""
     from .collect import collect_structured_findings
@@ -1337,7 +2876,19 @@ def validate_run_artifacts(
         from version import __version__
 
     base = pathlib.Path(run_dir).resolve()
-    context, manifest_path, preflight_errors = _manifest_context(base, allowed_hosts)
+    expected_authority = (
+        pathlib.Path(expected_authority_dir).resolve()
+        if expected_authority_dir is not None else None)
+    source_run = (
+        pathlib.Path(source_run_dir).resolve()
+        if source_run_dir is not None else base)
+    context, manifest_path, preflight_errors = _manifest_context(
+        base,
+        allowed_hosts,
+        expected_authority_dir=expected_authority,
+        expected_project_id=expected_project_id,
+        expected_project_name=expected_project_name,
+    )
     collected = collect_structured_findings(
         base,
         authorized_hosts=(allowed_hosts or None) if context is None else None,
@@ -1376,6 +2927,13 @@ def validate_run_artifacts(
     artifact_hashes: dict[str, str] = {}
     if manifest_path and manifest_path.is_file():
         artifact_hashes[manifest_path.relative_to(base).as_posix()] = _sha256_file(manifest_path)
+    for closure_name in (
+        "inventory.json", "coverage-ledger.json", "candidate-ledger.json",
+        "dead_ends.json",
+    ):
+        closure_path = base / closure_name
+        if closure_path.is_file():
+            artifact_hashes[closure_name] = _sha256_file(closure_path)
     for normalized in normalized_confirmed:
         for ref in normalized.get("proof_files") or []:
             path = (base / str(ref)).resolve()
@@ -1389,23 +2947,57 @@ def validate_run_artifacts(
             else:
                 ingestion_errors.append({"code": "proof_file_missing", "path": relative})
 
+    # Canonical ingestion is all-or-nothing.  A mixed batch containing one
+    # malformed/rejected finding must not expose the remaining rows as project
+    # truth merely because they validated individually.
+    if rejected or ingestion_errors:
+        confirmed = []
+        normalized_confirmed = []
+
     canonical_count = int((collected.get("counts") or {}).get("canonical", 0) or 0)
-    empty_gate = None
+    closure_gate = _run_closure_gate(
+        base, context=context, normalized_findings=normalized_confirmed,
+        source_run_dir=source_run)
+    for ref, digest in (closure_gate.get("artifact_hashes") or {}).items():
+        path = (base / str(ref)).resolve()
+        try:
+            path.relative_to(base)
+        except ValueError:
+            ingestion_errors.append({
+                "code": "closure_evidence_escape", "path": str(ref)})
+            continue
+        if not path.is_file() or _sha256_file(path) != str(digest):
+            ingestion_errors.append({
+                "code": "closure_evidence_hash_mismatch", "path": str(ref)})
+            continue
+        artifact_hashes[str(ref)] = str(digest)
+    if ingestion_errors:
+        confirmed = []
+        normalized_confirmed = []
+    proof_reasons: list[dict[str, Any]] = []
+    proof_reasons.extend(rejected)
+    proof_reasons.extend(ingestion_errors)
+    proof_gate = {
+        "result": "pass" if not proof_reasons else "fail",
+        "reasons": proof_reasons,
+        "canonical_count": canonical_count,
+        "proof_confirmed_count": len(confirmed),
+    }
     precondition_missing = any(
         item.get("code") == "missing_manifest" for item in preflight_errors)
     if precondition_missing:
         status, exit_code = "precondition_missing", 2
-    elif canonical_count == 0 and not rejected and not ingestion_errors:
-        if allow_empty:
-            empty_gate = _empty_run_gate(base, context=context)
-            status = "empty_allowed" if empty_gate["result"] == "pass" else "empty_input"
-            exit_code = 0 if empty_gate["result"] == "pass" else 2
-        else:
-            status, exit_code = "empty_input", 2
     elif rejected or ingestion_errors:
         status, exit_code = "invalid", 1
-    else:
+    elif closure_gate["result"] != "pass":
+        status = "incomplete_with_findings" if confirmed else "incomplete"
+        exit_code = 2
+    elif confirmed:
         status, exit_code = "valid", 0
+    elif allow_empty:
+        status, exit_code = "empty_allowed", 0
+    else:
+        status, exit_code = "empty_input", 2
 
     counts = {
         **(collected.get("counts") or {}),
@@ -1434,15 +3026,18 @@ def validate_run_artifacts(
         "warnings": list(collected.get("warnings") or []),
         "artifact_hashes": artifact_hashes,
         "counts": counts,
+        "proof_gate": proof_gate,
+        "closure_gate": closure_gate,
     }
-    if empty_gate is not None:
-        result["empty_gate"] = empty_gate
+    # v8.8 callers used empty_gate; retain the projection while making the
+    # run-wide closure gate authoritative for both empty and non-empty runs.
+    if canonical_count == 0:
+        result["empty_gate"] = closure_gate
     result["validation_sha256"] = _canonical_digest(result)
     output = pathlib.Path(output_path) if output_path else base / "finding_validation.json"
     if not output.is_absolute():
         output = base / output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(output, result)
     return result
 
 
@@ -1478,6 +3073,19 @@ def verify_validation_artifact(
                 "expected": authority_expected,
                 "actual": authority_actual,
             })
+        elif authority_path.is_file():
+            try:
+                authority_manifest = json.loads(safe_read_text(authority_path))
+                binding = validate_manifest_binding(
+                    authority_manifest,
+                    run_dir=base,
+                    manifest_path=base / "run_manifest.json",
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                mismatches.append({"path": str(authority_path),
+                                   "reason": f"manifest_binding_error:{exc}"})
+            else:
+                mismatches.extend(binding.get("errors") or [])
     expected_digest = str(report.get("validation_sha256") or "")
     if expected_digest and _canonical_digest(report) != expected_digest:
         mismatches.append({"path": "<validation>", "reason": "validation_digest_mismatch"})

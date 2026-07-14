@@ -1,5 +1,19 @@
 # Changelog
 
+## 8.9.0 - 2026-07-14
+
+- 修复真实 shop recon 暴露的 phantom GET、三元 URL、fetch body/FormData 参数和 auth-flow 角色错误；不确定 method 保持 unresolved，不再制造覆盖分母。
+- 运行时 Cell 身份加入 asset 与精确 role，阻止一个子域/角色的 finding 或 negative 关闭其他子域/角色；普通文本 `SKIP` 不再形成 terminal not-applicable。
+- Validator 对有/无 Finding 的所有 Run 统一执行 closure gate；新增 `incomplete_with_findings`，缺 ledger 的合法 Finding 不再把整轮伪装成完成。
+- 无效 manifest/proof 不再污染项目真值；ProjectState 保留 singular param、多资产 scope，并使用幂等 revision/CAS 提交。
+- 新增 symlink-safe `safe_io`、跨 Session manifest replay 防护、immutable project commit、receipt authority anchor 与独立 verify API。
+- 新增带 lock/journal/CAS/恢复的 exactly-once finalizer；Engine 与外部 Wrapped Skill 共用，Direct Skill 明确降级为 untrusted diagnostic。
+- 审核确认 POSIX 进程组不能约束 `setsid()` 后代；当前 Codex/wrapper 后端均 fail closed 为 diagnostic，不得改写跨 Run ProjectState，直到接入可证明静默的 cgroup/job/container 监督器。
+- 精确预算门禁前移到任何 Cell 变更之前；ProjectState/manifest/receipt/commit 链增加硬链接拒绝、自哈希和可达链验证。
+- live Codex backend 默认 fail closed；只有显式接受 unrestricted egress 才启动，并永不声称已做 pre-exec host/path enforcement。
+- 新增显式 `--base-path` 与稳定 origin+namespace 项目命名；target 的 `/login/` 等入口路径不会被猜成业务根。
+- 新增 legacy Run 保守迁移：旧报告只生成待复验 Intent/open inventory，永不自动升级为 proof-confirmed。
+
 ## 8.8.0 - 2026-07-13
 
 - 新增原子、带 revision 的 `project_state.json`，统一跨 Run inventory、角色感知 coverage cell、root finding、negative、Intent 与 run history；旧 Blackboard 降为派生兼容视图。

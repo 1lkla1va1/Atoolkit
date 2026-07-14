@@ -17,9 +17,11 @@ from typing import Any
 try:
     from .vuln_classes import norm_vc, vc_matches, is_chainable
     from .surface_key import canonical_surface_key
+    from .safe_io import atomic_write_text
 except ImportError:
     from vuln_classes import norm_vc, vc_matches, is_chainable
     from surface_key import canonical_surface_key
+    from safe_io import atomic_write_text
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +258,21 @@ class FactIntentGraph:
                 if i.get("status") == "pending" and i.get("priority") == "high"
             ),
         }
+
+    def save(self, path: str | pathlib.Path) -> None:
+        """Persist this run graph without following state namespace links."""
+        destination = pathlib.Path(path)
+        atomic_write_text(
+            destination,
+            json.dumps({
+                "facts": self.facts,
+                "intents": self.intents,
+                "_next_fact_id": self._next_fact_id,
+                "_next_intent_id": self._next_intent_id,
+            }, ensure_ascii=False, indent=2),
+            root=destination.parent,
+            reject_leaf_symlink=True,
+        )
 
     # -- cross-run persistence (section 9.7) --------------------------------
 
@@ -820,8 +837,12 @@ def merge_run_to_blackboard(blackboard_path: str, run_graph: FactIntentGraph,
     bb.setdefault("domains_covered", {})
     bb.setdefault("surface_index", {})
 
-    bb_path.parent.mkdir(parents=True, exist_ok=True)
-    bb_path.write_text(json.dumps(bb, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(
+        bb_path,
+        json.dumps(bb, ensure_ascii=False, indent=2),
+        root=bb_path.parent,
+        reject_leaf_symlink=True,
+    )
     return bb
 
 

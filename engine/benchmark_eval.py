@@ -14,6 +14,7 @@ import json
 import pathlib
 import re
 import sys
+import tempfile
 from dataclasses import asdict, dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
@@ -536,17 +537,59 @@ def load_findings(summary_path: pathlib.Path, *, trust_legacy: bool = False) -> 
         try:
             validation = load_structured(validation_path)
             try:
-                from .reporting.validate import verify_validation_artifact
+                from .reporting.validate import (
+                    validate_run_artifacts,
+                    verify_validation_artifact,
+                )
+                from .runtime_manifest import verify_run_receipt
             except ImportError:  # pragma: no cover - direct script fallback
-                from reporting.validate import verify_validation_artifact
+                from reporting.validate import validate_run_artifacts, verify_validation_artifact
+                from runtime_manifest import verify_run_receipt
             verification = verify_validation_artifact(validation, summary_path.parent)
+            receipt_ref = str(data.get("run_receipt_path") or "").strip()
+            receipt_path = (
+                pathlib.Path(receipt_ref) if receipt_ref
+                else summary_path.parent / "run_receipt.json"
+            )
+            if not receipt_path.is_absolute():
+                receipt_path = summary_path.parent / receipt_path
+            receipt_verification = verify_run_receipt(
+                receipt_path, run_dir=summary_path.parent,
+            )
+            # Keep the replay scratch directory beneath the already-resolved
+            # run directory.  On macOS the process-wide temp root is commonly
+            # reached through ``/var`` (a symlink to ``/private/var``), which
+            # the parent-owned safe writer correctly refuses to traverse.
+            with tempfile.TemporaryDirectory(
+                prefix=".atoolkit-benchmark-validate-",
+                dir=str(summary_path.parent.resolve()),
+            ) as temp:
+                replay = validate_run_artifacts(
+                    summary_path.parent,
+                    allow_empty=not bool(validation.get("normalized_findings")),
+                    output_path=pathlib.Path(temp) / "finding_validation.json",
+                )
         except Exception:
             return []
         expected_digest = str(data.get("finding_validation_sha256") or "")
         actual_digest = str(validation.get("validation_sha256") or "")
+        proof_gate = validation.get("proof_gate") or {}
+        replay_proof_gate = replay.get("proof_gate") or {}
+        normalized_digest = json.dumps(
+            validation.get("normalized_findings") or [],
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        replay_normalized_digest = json.dumps(
+            replay.get("normalized_findings") or [],
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
         if (not expected_digest or expected_digest != actual_digest
                 or not verification.get("ok")
-                or int(validation.get("exit_code", 3)) != 0):
+                or not receipt_verification.get("integrity_valid")
+                or not receipt_verification.get("delivery_complete")
+                or proof_gate.get("result") != "pass"
+                or replay_proof_gate.get("result") != "pass"
+                or normalized_digest != replay_normalized_digest):
             return []
         rows = [
             row for row in (validation.get("normalized_findings") or [])

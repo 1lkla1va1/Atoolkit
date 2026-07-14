@@ -11,8 +11,10 @@ import pathlib
 
 try:
     from .surface_key import canonical_cell_key, canonical_surface_key, is_canonical
+    from .safe_io import atomic_write_text
 except ImportError:
     from surface_key import canonical_cell_key, canonical_surface_key, is_canonical
+    from safe_io import atomic_write_text
 
 _PRIORITY_SCORE = {"high": 0, "medium": 1, "low": 2}
 _DOMAIN_SEQUENCE = ["auth", "txn", "idor", "input", "admin", "file", "info"]
@@ -306,8 +308,12 @@ def load_run_scope(project_dir: str | pathlib.Path) -> list[str]:
 def save_run_scope(project_dir: str | pathlib.Path, scope: dict) -> None:
     """Persist run_scope.json to the project directory."""
     path = pathlib.Path(project_dir) / "run_scope.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(scope, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(
+        path,
+        json.dumps(scope, ensure_ascii=False, indent=2),
+        root=path.parent,
+        reject_leaf_symlink=True,
+    )
 
 # -- Budget gate ------------------------------------------------------------
 

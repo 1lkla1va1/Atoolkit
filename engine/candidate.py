@@ -30,9 +30,11 @@ from typing import Any
 try:
     from .knowledge import (positive_depth_meets, positive_depth_floor_for,
                             risk_dimensions_for)
+    from .safe_io import atomic_write_text
 except ImportError:  # pragma: no cover - script execution fallback
     from knowledge import (positive_depth_meets, positive_depth_floor_for,
                            risk_dimensions_for)
+    from safe_io import atomic_write_text
 
 
 # ── 候选状态机（§4.1：v6 六态 + 深度）─────────────────────────────────────
@@ -665,8 +667,13 @@ class CandidateLedger:
         return cls(data.get("candidates") or [], metadata=data.get("metadata") or {})
 
     def save(self, path: str | pathlib.Path) -> None:
-        pathlib.Path(path).write_text(
-            json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        destination = pathlib.Path(path)
+        atomic_write_text(
+            destination,
+            json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
+            root=destination.parent,
+            reject_leaf_symlink=True,
+        )
 
     def get(self, candidate_id: str) -> dict[str, Any] | None:
         for c in self.candidates:

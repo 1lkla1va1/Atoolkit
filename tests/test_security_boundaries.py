@@ -234,7 +234,13 @@ def test_legacy_markdown_is_candidate_only_and_cannot_close_coverage(tmp_path):
     assert out["status"] != "vuln_found"
 
 
-@pytest.mark.parametrize("bad", ["../escape", "/tmp/escape", "a/b", "..", "", "a" * 129])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "../escape", "/tmp/escape", "a/b", "..", "", "a" * 129,
+        "HEAD", "head", "Head", "PROJECT", "project", "Project",
+    ],
+)
 def test_session_id_rejects_path_traversal(bad):
     with pytest.raises(ValueError):
         safe_session_id(bad)
@@ -256,6 +262,21 @@ def test_private_writer_uses_owner_only_permissions(tmp_path):
     _secure_write_text(path, "Cookie: secret")
     assert path.stat().st_mode & 0o777 == 0o600
     assert path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_private_writer_replaces_hardlink_without_mutating_external_inode(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("sentinel", encoding="utf-8")
+    run = tmp_path / "run"
+    run.mkdir()
+    alias = run / "authz.md"
+    os.link(outside, alias)
+
+    _secure_write_text(alias, "new authorization")
+
+    assert outside.read_text(encoding="utf-8") == "sentinel"
+    assert alias.read_text(encoding="utf-8") == "new authorization"
+    assert os.stat(outside).st_ino != os.stat(alias).st_ino
 
 
 def test_codex_stream_close_terminates_child(monkeypatch, tmp_path):

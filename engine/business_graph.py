@@ -14,8 +14,10 @@ from typing import Any
 
 try:
     from .surface_key import canonical_surface_key
+    from .safe_io import atomic_write_text
 except ImportError:
     from surface_key import canonical_surface_key
+    from safe_io import atomic_write_text
 
 
 # ---------------------------------------------------------------------------
@@ -290,10 +292,11 @@ class BusinessGraph:
 
     def export_to_file(self, path: str | pathlib.Path) -> None:
         p = pathlib.Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(
+        atomic_write_text(
+            p,
             json.dumps(self._to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
+            root=p.parent,
+            reject_leaf_symlink=True,
         )
 
     @classmethod

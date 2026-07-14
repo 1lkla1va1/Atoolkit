@@ -19,7 +19,10 @@ import os
 import pathlib
 import signal
 import subprocess
+import time
 from typing import Iterator
+
+from engine.safe_io import atomic_write_text
 
 
 class CodexExecError(RuntimeError):
@@ -34,43 +37,124 @@ class CodexModelUnsupportedError(CodexExecError):
     """Raised when the configured model is not available to this account."""
 
 
+_PROCESS_GROUP_TERM_GRACE_SECONDS = 2.0
+_PROCESS_GROUP_KILL_GRACE_SECONDS = 2.0
+_PROCESS_GROUP_POLL_SECONDS = 0.02
+
+
+def _process_group_exists(pgid: int) -> bool:
+    """Probe a saved POSIX process group id; only ESRCH means quiescent."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_group_exit(
+    pgid: int,
+    *,
+    leader: subprocess.Popen,
+    timeout: float,
+) -> bool:
+    """Reap the leader as needed, but wait on the whole saved PGID."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        # poll() may reap the direct child, but its return value must not make
+        # us skip descendants that remain in the same process group.
+        leader.poll()
+        if not _process_group_exists(pgid):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_PROCESS_GROUP_POLL_SECONDS, remaining))
+
+
+def _quiesce_process_group(leader: subprocess.Popen, *, pgid: int) -> None:
+    """TERM, then KILL, and require killpg probing to reach ESRCH."""
+    if not _process_group_exists(pgid):
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        raise CodexExecError(
+            f"cannot signal codex process group {pgid} with SIGTERM: {exc}"
+        ) from exc
+    if _wait_for_process_group_exit(
+        pgid,
+        leader=leader,
+        timeout=_PROCESS_GROUP_TERM_GRACE_SECONDS,
+    ):
+        return
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        raise CodexExecError(
+            f"cannot signal codex process group {pgid} with SIGKILL: {exc}"
+        ) from exc
+    if _wait_for_process_group_exit(
+        pgid,
+        leader=leader,
+        timeout=_PROCESS_GROUP_KILL_GRACE_SECONDS,
+    ):
+        return
+    raise CodexExecError(
+        f"codex process group {pgid} is still alive after SIGKILL; "
+        "run finalization is unsafe"
+    )
+
+
 class CodexAdapter:
     name = "codex"
+    # A process group cannot contain a descendant that calls setsid().  The
+    # engine therefore freezes diagnostics but refuses trusted project truth
+    # until this adapter is hosted by an attested cgroup/job/container.
+    process_containment_verified = False
 
     # Windows 上 npm 全局安装的 codex 是 shell 脚本（非 .exe），
     # Python subprocess.Popen 需要 .cmd 包装器才能执行。
     _codex_bin = "codex.cmd" if os.name == "nt" else "codex"
 
     def __init__(self, model: str = "gpt-5.5", workdir: str = ".",
-                 allow_hosts: list[str] | None = None):
+                 allow_hosts: list[str] | None = None,
+                 allow_unrestricted_egress: bool = False):
         self.model = model
         self.workdir = workdir
         # host 白名单：Codex 沙箱不做 host 级限制，所以这里建议配合一个
         # 本地出站代理（如 mitmproxy/自写转发）只放行 allow_hosts，把"授权范围"硬约束落到网络层。
         self.allow_hosts = allow_hosts or []
+        self.allow_unrestricted_egress = bool(allow_unrestricted_egress)
 
     @staticmethod
     def _terminate_process(proc: subprocess.Popen) -> None:
-        """Stop Codex and its child tool processes when streaming is aborted."""
-        if proc.poll() is not None:
+        """Stop Codex and prove its complete process group is gone."""
+        if os.name != "nt":
+            pgid = getattr(proc, "_atoolkit_process_group_id", None)
+            if not isinstance(pgid, int) or pgid <= 0:
+                raise CodexExecError("codex subprocess has no saved process group id")
+            _quiesce_process_group(proc, pgid=pgid)
             return
-        try:
-            if os.name == "nt":
+
+        if proc.poll() is None:
+            try:
                 proc.terminate()
-            else:
-                os.killpg(proc.pid, signal.SIGTERM)
-            proc.wait(timeout=2)
-            return
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        try:
-            if os.name == "nt":
-                proc.kill()
-            else:
-                os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+                proc.wait(timeout=_PROCESS_GROUP_TERM_GRACE_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    proc.kill()
+                    proc.wait(timeout=_PROCESS_GROUP_KILL_GRACE_SECONDS)
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    raise CodexExecError(
+                        "codex subprocess did not terminate after forced cleanup"
+                    ) from exc
 
     def run(self, prompt: str, *, session_id: str) -> Iterator[str]:
         wd_abs = os.path.abspath(self.workdir)
@@ -79,9 +163,14 @@ class CodexAdapter:
             "--skip-git-repo-check",             # 工作区可能非 git 仓库（runs/ 下）
             "-m", self.model,
             "--sandbox", "workspace-write",      # 硬约束地板：只能写工作区
-            # 网络出站：workspace-write 默认关网，必须显式开，否则模型 curl 不到靶场。
-            # ⚠ 这会放开「全部」出站，不止 allow_hosts；授权范围收口仍需配合出站代理。
-            "-c", "sandbox_workspace_write.network_access=true",
+            # There is no host-aware broker in this backend.  Keep egress off
+            # unless the parent CLI has recorded the explicit unrestricted
+            # downgrade; allow_hosts is post-action policy, not a hard claim.
+            "-c", (
+                "sandbox_workspace_write.network_access=true"
+                if self.allow_unrestricted_egress
+                else "sandbox_workspace_write.network_access=false"
+            ),
             # 写盘收口：默认还放开 /tmp、$TMPDIR，模型会把证据写到工作目录外、采集层看不到
             # （合格报告被漏判 low_roi）。把可写根钉死为本会话目录，机制上消除目录漂移。
             "-c", f'sandbox_workspace_write.writable_roots=["{wd_abs}"]',
@@ -95,6 +184,12 @@ class CodexAdapter:
             stderr=subprocess.STDOUT, text=True, bufsize=1,
             start_new_session=(os.name != "nt"),
         )
+        if os.name != "nt":
+            # start_new_session makes the process PID its PGID.  Persist that
+            # fact before streaming; the leader may be reaped before cleanup.
+            spawned_pid = getattr(proc, "pid", None)
+            if isinstance(spawned_pid, int) and spawned_pid > 0:
+                proc._atoolkit_process_group_id = spawned_pid  # type: ignore[attr-defined]
         chunks: list[str] = []
         try:
             assert proc.stdin and proc.stdout
@@ -108,7 +203,8 @@ class CodexAdapter:
             self._terminate_process(proc)
             try:
                 response_path = pathlib.Path(self.workdir, "last_response.md")
-                response_path.write_text("".join(chunks), encoding="utf-8")
+                atomic_write_text(
+                    response_path, "".join(chunks), root=pathlib.Path(self.workdir))
                 response_path.chmod(0o600)
             except OSError:
                 pass
@@ -135,7 +231,8 @@ if __name__ == "__main__":
     wd.mkdir(parents=True, exist_ok=True)
     (wd / "authz.md").write_text("# 授权范围\n- 仅限：https://target.example\n", encoding="utf-8")
     adapter = CodexAdapter(model="gpt-5.5", workdir=str(wd),
-                           allow_hosts=["target.example"])
+                           allow_hosts=["target.example"],
+                           allow_unrestricted_egress=True)
     # 真实使用时由 orchestrator.assemble_prompt() 拼装；这里直接喂一段
     prompt = sys.stdin.read() if not sys.stdin.isatty() else "对 https://target.example 做授权 SRC 测试，先告诉我首个攻击面。"
     for chunk in adapter.run(prompt, session_id=sid):

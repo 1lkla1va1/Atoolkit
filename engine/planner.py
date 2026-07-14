@@ -49,6 +49,8 @@ HIGH_VALUE_TAGS = {
     "object-ownership", "idor", "privilege", "callback", "ssrf", "file-upload",
 }
 
+_HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+
 
 def _as_list(value: Any) -> list[Any]:
     if value is None or value == "":
@@ -81,9 +83,20 @@ def _dedupe(values: Iterable[Any]) -> list[str]:
 
 
 def _split_method(method: Any) -> list[str]:
-    raw = str(method or "GET").upper().strip()
-    parts = re.split(r"[/,| ]+", raw)
-    return [p for p in parts if p] or ["GET"]
+    """Split explicitly observed methods; preserve unresolved as ``""``.
+
+    A missing method is not GET.  Browser-context defaults are established by
+    ``surface`` (fetch/form/link); a bare CLI/JSON/string endpoint must first go
+    through method resolution and must not become a coverage surface here.
+    """
+    if method is None:
+        return [""]
+    raw_values = _as_list(method)
+    parts: list[str] = []
+    for raw_value in raw_values:
+        raw = str(raw_value or "").upper().strip()
+        parts.extend(p for p in re.split(r"[/,| ]+", raw) if p in _HTTP_METHODS)
+    return _dedupe(parts) or [""]
 
 
 def _endpoint_from_item(item: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -103,22 +116,62 @@ def _endpoint_from_item(item: str | dict[str, Any]) -> tuple[str, dict[str, Any]
     return text, meta
 
 
-def extract_params(endpoint: str, meta: dict[str, Any] | None = None) -> list[str]:
-    """Extract param names from inventory metadata, query strings, and path placeholders."""
+def extract_param_specs(endpoint: str, meta: dict[str, Any] | None = None) -> list[tuple[str, str]]:
+    """Extract ``(name, location)`` pairs without conflating query and body.
+
+    Structured location fields win over a legacy flattened ``params`` list.
+    Legacy-only names remain location-unknown rather than being guessed.
+    """
     meta = meta or {}
-    params: list[str] = []
-    for key in ("param", "params", "parameters", "query_params", "body_params", "form_params"):
-        for value in _as_list(meta.get(key)):
+    specs: list[tuple[str, str]] = []
+
+    for key, location in (
+        ("query_params", "query"), ("body_params", "body"),
+        ("form_params", "form"), ("path_params", "path"),
+    ):
+        values = meta.get(key)
+        for value in _as_list(values):
             if isinstance(value, dict):
+                item_location = str(value.get("location") or value.get("in") or location).strip().lower()
                 value = value.get("name") or value.get("key") or value.get("param")
-            params.append(str(value or "").strip())
+            else:
+                item_location = location
+            name = str(value or "").strip()
+            if name:
+                specs.append((name, item_location))
 
     parsed = urlsplit(endpoint)
     for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
-        params.append(key)
+        specs.append((key, "query"))
     for name in re.findall(r"{([^{}]+)}|:([A-Za-z_][A-Za-z0-9_]*)", parsed.path or endpoint):
-        params.extend(x for x in name if x)
-    return _dedupe(params)
+        specs.extend((value, "path") for value in name if value)
+
+    structured_names = {name.lower() for name, location in specs if location}
+    legacy_location = str(meta.get("param_location") or "").strip().lower()
+    for key in ("param", "params", "parameters"):
+        for value in _as_list(meta.get(key)):
+            if isinstance(value, dict):
+                item_location = str(value.get("location") or value.get("in") or legacy_location).strip().lower()
+                value = value.get("name") or value.get("key") or value.get("param")
+            else:
+                item_location = legacy_location
+            name = str(value or "").strip()
+            if name and (name.lower() not in structured_names or item_location):
+                specs.append((name, item_location))
+
+    seen: set[tuple[str, str]] = set()
+    result: list[tuple[str, str]] = []
+    for name, location in specs:
+        key = (name.lower(), location.lower())
+        if key not in seen:
+            seen.add(key)
+            result.append((name, location))
+    return result
+
+
+def extract_params(endpoint: str, meta: dict[str, Any] | None = None) -> list[str]:
+    """Backward-compatible flattened view of :func:`extract_param_specs`."""
+    return _dedupe(name for name, _location in extract_param_specs(endpoint, meta))
 
 
 def infer_risk_tags(param: str = "", endpoint: str = "", feature: str = "") -> list[str]:
@@ -163,16 +216,33 @@ def infer_feature(endpoint: str, meta: dict[str, Any] | None = None) -> str:
 
 def infer_roles(endpoint: str, meta: dict[str, Any] | None = None) -> list[str]:
     meta = meta or {}
-    explicit = _as_list(meta.get("roles") or meta.get("role") or meta.get("needed_roles"))
-    if explicit:
-        return _dedupe(str(x) for x in explicit)
+    explicit: list[str] = []
+    for key in ("roles", "role", "needed_roles"):
+        explicit.extend(str(x) for x in _as_list(meta.get(key)))
+    observed = [str(x) for x in _as_list(meta.get("observed_roles"))]
     low = endpoint.lower()
+
+    # Authentication-flow semantics take precedence over path-role heuristics.
+    # A merchant/admin login is first an anonymous entry and then establishes
+    # that role; treating it as merchant/admin-only loses the unauthenticated
+    # half of the flow.  Explicit and traffic-observed roles are always kept.
+    if is_auth_flow_endpoint(endpoint, str(meta.get("feature") or "")):
+        if "admin" in low:
+            established_roles = ["admin"]
+        elif "merchant" in low:
+            established_roles = ["merchant"]
+        else:
+            established_roles = [
+                role for role in _dedupe(explicit + observed)
+                if role.lower() != "anonymous"
+            ] or ["user"]
+        return _dedupe(["anonymous"] + established_roles + explicit + observed)
+    if explicit or observed:
+        return _dedupe(explicit + observed)
     if "admin" in low:
         return ADMIN_DIFF_ROLES
     if "merchant" in low:
         return ["merchant"]
-    if is_auth_flow_endpoint(endpoint):
-        return ["anonymous", "user"]
     return list(DEFAULT_ROLES)
 
 
@@ -201,7 +271,14 @@ class PlannedSurface:
     endpoint: str
     method: str
     param: str = ""
+    param_location: str = ""
+    assets: list[str] = field(default_factory=list)
+    namespace: str = ""
+    subject_role: str = ""
+    object_kind: str = ""
     roles: list[str] = field(default_factory=list)
+    explicit_roles: list[str] = field(default_factory=list)
+    observed_roles: list[str] = field(default_factory=list)
     risk_tags: list[str] = field(default_factory=list)
     feature: str = "default"
     status: str = "not_tested"
@@ -212,19 +289,36 @@ class PlannedSurface:
     tasks: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        if not data.get("assets"):
+            data.pop("assets", None)
+        return data
 
 
 def make_surface_id(endpoint: str, method: str, param: str = "", roles: Iterable[str] | None = None,
-                    risk_tags: Iterable[str] | None = None) -> str:
+                    risk_tags: Iterable[str] | None = None, param_location: str = "",
+                    *, assets: Iterable[str] | None = None, namespace: str = "",
+                    subject_role: str = "", object_kind: str = "") -> str:
     role_s = ",".join(_dedupe(roles or [])) or "any"
     risk_s = ",".join(_dedupe(risk_tags or []))
     parts = [method.upper(), endpoint]
     if param:
-        parts.append(param)
+        parts.append(f"{param_location}:{param}" if param_location else param)
     parts.append(f"[{role_s}]")
     if risk_s:
         parts.append(f"{{{risk_s}}}")
+    exact_dimensions = []
+    asset_values = sorted(_dedupe(assets or []), key=str.lower)
+    if asset_values:
+        exact_dimensions.append("assets=" + ",".join(asset_values))
+    if str(namespace or "").strip():
+        exact_dimensions.append("namespace=" + str(namespace).strip())
+    if str(subject_role or "").strip():
+        exact_dimensions.append("subject=" + str(subject_role).strip().lower())
+    if str(object_kind or "").strip():
+        exact_dimensions.append("object=" + str(object_kind).strip().lower())
+    if exact_dimensions:
+        parts.append("<" + ";".join(exact_dimensions) + ">")
     return " ".join(parts)
 
 
@@ -297,20 +391,36 @@ def plan_surfaces(endpoints: list[str | dict[str, Any]], *, default_roles: list[
     dict is annotated with a ``domains`` key regardless of filtering.
     """
     surfaces: list[PlannedSurface] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, tuple[str, ...], str, str, str]] = set()
     for item in endpoints:
         endpoint, meta = _endpoint_from_item(item)
         if not endpoint:
             continue
         feature = infer_feature(endpoint, meta)
         roles = infer_roles(endpoint, meta) or list(default_roles or DEFAULT_ROLES)
-        params = extract_params(endpoint, meta) or [""]
-        methods = _split_method(meta.get("method") or meta.get("methods") or "GET")
+        explicit_roles = _dedupe(
+            str(value)
+            for key in ("roles", "role", "needed_roles")
+            for value in _as_list(meta.get(key))
+        )
+        observed_roles = _dedupe(str(value) for value in _as_list(meta.get("observed_roles")))
+        param_specs = extract_param_specs(endpoint, meta) or [("", "")]
+        if "method" in meta:
+            raw_methods = meta.get("method")
+        elif "methods" in meta:
+            raw_methods = meta.get("methods")
+        else:
+            raw_methods = ""
+        methods = _split_method(raw_methods)
         source = default_source(meta)
         clean_endpoint = urlsplit(endpoint).path or endpoint.split("?", 1)[0]
 
         for method in methods:
-            for param in params:
+            # Unresolved inventory belongs to the method-resolution queue, not
+            # Coverage/task scheduling.  The inventory record retains method="".
+            if not method:
+                continue
+            for param, param_location in param_specs:
                 risk_tags = infer_risk_tags(param, clean_endpoint, feature)
                 if not risk_tags:
                     risk_tags = ["general-review"]
@@ -318,16 +428,41 @@ def plan_surfaces(endpoints: list[str | dict[str, Any]], *, default_roles: list[
                 tasks.extend(plan_object_pair_tasks(clean_endpoint, method, param, roles, risk_tags))
                 tasks.extend(plan_role_diff_tasks(clean_endpoint, method, roles, risk_tags))
                 tasks.extend(plan_auth_flow_tasks(clean_endpoint, method, roles, risk_tags))
-                surface_id = make_surface_id(clean_endpoint, method, param, roles, risk_tags)
-                if surface_id in seen:
+                assets = _dedupe(
+                    str(value) for key in ("assets", "asset", "asset_id")
+                    for value in _as_list(meta.get(key)))
+                namespace = str(meta.get("namespace") or "").strip()
+                subject_role = str(meta.get("subject_role") or "").strip().lower()
+                object_kind = str(meta.get("object_kind") or "").strip().lower()
+                surface_id = make_surface_id(
+                    clean_endpoint, method, param, roles, risk_tags,
+                    param_location=param_location,
+                    assets=assets, namespace=namespace,
+                    subject_role=subject_role, object_kind=object_kind,
+                )
+                dedupe_key = (
+                    surface_id,
+                    tuple(sorted((value.lower() for value in assets))),
+                    namespace,
+                    subject_role,
+                    object_kind,
+                )
+                if dedupe_key in seen:
                     continue
-                seen.add(surface_id)
+                seen.add(dedupe_key)
                 surfaces.append(PlannedSurface(
                     surface_id=surface_id,
                     endpoint=clean_endpoint,
                     method=method.upper(),
                     param=param,
+                    param_location=param_location,
+                    assets=assets,
+                    namespace=namespace,
+                    subject_role=subject_role,
+                    object_kind=object_kind,
                     roles=roles,
+                    explicit_roles=explicit_roles,
+                    observed_roles=observed_roles,
                     risk_tags=risk_tags,
                     feature=feature,
                     status="not_tested",
@@ -363,10 +498,6 @@ def main(argv: list[str] | None = None) -> int:
     endpoints = data.get("discovered_apis") if isinstance(data, dict) else data
     print(json.dumps({"surfaces": plan_surfaces(endpoints or [])}, ensure_ascii=False, indent=2))
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
 
 
 # ---------------------------------------------------------------------------
@@ -544,3 +675,7 @@ def filter_surfaces_by_domain(surfaces: list[dict],
     # Sort: target-domain surfaces first, others after
     surfaces.sort(key=lambda s: s.get("_domain_priority", 1))
     return surfaces
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -13,6 +13,7 @@ import pytest
 from engine.business_graph import BusinessGraph
 from engine.project_state import (
     ProjectStateCorrupt,
+    ProjectStateError,
     ProjectStateStore,
     canonical_project_cell_key,
     finding_fingerprint,
@@ -27,26 +28,33 @@ def _store(tmp_path):
     return ProjectStateStore(tmp_path, project_scope=[SCOPE])
 
 
-def test_project_store_schema_revision_and_run_history_are_idempotent(tmp_path):
+def test_project_store_same_run_is_content_addressed_and_rejects_rewrite(tmp_path):
     store = _store(tmp_path)
+    commit = {
+        "inventory": [{"asset": SCOPE, "method": "GET", "endpoint": "/api/users"}],
+        "run_summary": {"status": "incomplete", "inventory_delta": 1},
+    }
     first = store.commit_run(
         "run-1",
-        inventory=[{"asset": SCOPE, "method": "GET", "endpoint": "/api/users"}],
-        run_summary={"status": "incomplete", "inventory_delta": 1},
+        **commit,
     )
-    second = store.commit_run(
-        "run-1",
-        run_summary={"status": "complete", "inventory_delta": 1},
-    )
+    retried = store.commit_run("run-1", **commit)
 
-    assert first["schema_version"] == 1
-    assert second["revision"] == first["revision"] + 1
-    assert second["merged_run_ids"] == ["run-1"]
-    assert list(second["run_history"]) == ["run-1"]
-    assert second["run_history"]["run-1"]["status"] == "complete"
+    assert first["schema_version"] == 2
+    assert retried["revision"] == first["revision"]
+    assert store.last_commit["idempotent"] is True
+    assert retried["merged_run_ids"] == ["run-1"]
+    assert list(retried["run_history"]) == ["run-1"]
+    assert retried["run_history"]["run-1"]["status"] == "incomplete"
+
+    with pytest.raises(ProjectStateError, match="same run_id.*different input"):
+        store.commit_run(
+            "run-1",
+            run_summary={"status": "complete", "inventory_delta": 1},
+        )
 
     on_disk = json.loads((tmp_path / "project_state.json").read_text(encoding="utf-8"))
-    assert on_disk == second
+    assert on_disk == first
 
 
 def test_project_store_serializes_two_writers_without_lost_update(tmp_path):
@@ -165,19 +173,80 @@ def test_finding_fingerprint_is_conservative_and_templates_object_ids():
     common = {
         "asset": SCOPE, "method": "GET", "vuln_class": "idor",
         "params": ["id"], "affected_role": "user",
+        "param_location": "path",
+        "root_cause": "shared order loader omits the owner check",
     }
     first = finding_fingerprint({**common, "endpoint": "/api/orders/1001"})
     same_root = finding_fingerprint({**common, "endpoint": "/api/orders/9876"})
     other_param = finding_fingerprint({
         **common, "endpoint": "/api/orders/1001", "params": ["owner_id"],
     })
+    other_root = finding_fingerprint({
+        **common, "endpoint": "/api/orders/1001",
+        "root_cause": "route middleware trusts a forged role header",
+    })
     other_role = finding_fingerprint({
         **common, "endpoint": "/api/orders/1001", "affected_role": "admin",
     })
 
     assert first == same_root
-    assert first != other_param
+    assert first == other_param
+    assert first != other_root
     assert first != other_role
+
+
+def test_fixed_numeric_routes_do_not_alias_without_path_param_schema():
+    first = canonical_project_cell_key(
+        SCOPE, method="GET", path="/reports/2024", role_scope="user",
+        vuln_class="sqli")
+    second = canonical_project_cell_key(
+        SCOPE, method="GET", path="/reports/2025", role_scope="user",
+        vuln_class="sqli")
+    common = {
+        "asset": SCOPE, "method": "GET", "affected_role": "user",
+        "root_cause": "fixed report route lacks a guard",
+    }
+
+    assert first != second
+    assert finding_fingerprint({**common, "endpoint": "/reports/2024"}) != (
+        finding_fingerprint({**common, "endpoint": "/reports/2025"}))
+
+
+def test_observed_path_parameter_still_templates_one_concrete_object_segment():
+    first = canonical_project_cell_key(
+        SCOPE, method="GET", path="/orders/1001", param="id",
+        param_location="path", role_scope="user", vuln_class="idor")
+    second = canonical_project_cell_key(
+        SCOPE, method="GET", path="/orders/9876", param="id",
+        param_location="path", role_scope="user", vuln_class="idor")
+
+    assert first == second
+
+
+def test_existing_explicit_schema_templates_non_numeric_object_values(tmp_path):
+    proof = tmp_path / "sessions" / "run-1" / "proof.json"
+    proof.parent.mkdir(parents=True)
+    proof.write_text("{}", encoding="utf-8")
+    state = _store(tmp_path).commit_run(
+        "run-1",
+        inventory=[{
+            "asset": SCOPE, "method": "GET",
+            "endpoint": "/users/{username}", "params": ["username"],
+            "roles": ["user"],
+        }],
+        findings=[{
+            "id": "f-user", "acceptance_status": "accepted",
+            "proof_status": "confirmed", "claim_kind": "root_finding",
+            "asset": SCOPE, "method": "GET", "endpoint": "/users/alice",
+            "params": ["username"], "affected_role": "user",
+            "vuln_class": "idor", "root_cause": "owner guard omitted",
+            "proof_files": ["proof.json"],
+        }],
+    )
+
+    cell = next(iter(state["cell_registry"].values()))
+    assert cell["path"] == "/users/{id}"
+    assert cell["param_location"] == "path"
 
 
 def test_legacy_blackboard_import_is_conservative_and_idempotent(tmp_path):

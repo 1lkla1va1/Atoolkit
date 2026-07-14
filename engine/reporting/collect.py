@@ -153,6 +153,7 @@ def collect_structured_findings(
     for item in parsed:
         by_id.setdefault(item[3], []).append(item)
     conflicted: set[str] = set()
+    representatives: dict[str, pathlib.Path] = {}
     for fid, items in by_id.items():
         hashes = {_sha256(item[1]) for item in items}
         if len(hashes) > 1:
@@ -166,9 +167,20 @@ def collect_structured_findings(
                 "code": "duplicate_id_shadow", "id": fid,
                 "paths": [str(item[1]) for item in items],
             })
+            # Identical bytes under the same ID are one logical finding.  Pick
+            # one canonical representative deterministically; processing both
+            # would duplicate normalized/project truth even though there is no
+            # content conflict.
+            canonical = [item for item in items if item[0]["layout"] == "canonical"]
+            chosen = min(canonical or items, key=lambda item: str(item[1]))
+            representatives[fid] = chosen[1]
+        else:
+            representatives[fid] = items[0][1]
 
     for artifact, path, finding, fid in parsed:
         if fid in conflicted:
+            continue
+        if representatives.get(fid) != path:
             continue
         layout = artifact["layout"]
         if layout != "canonical":

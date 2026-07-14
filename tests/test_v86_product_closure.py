@@ -62,7 +62,7 @@ def test_cli_endpoint_inventory_splits_embedded_methods():
     ]
 
 
-def test_surface_budget_closes_all_cells_on_selected_surface(tmp_path):
+def test_surface_budget_only_mutates_the_selected_exact_cell(tmp_path):
     class OneCellPerTurn:
         name = "one-cell"
 
@@ -92,12 +92,21 @@ def test_surface_budget_closes_all_cells_on_selected_surface(tmp_path):
         cell for cell in out["state"]["matrix"].values()
         if cell["endpoint"] == "/api/only"
     ]
-    assert adapter.calls == 2
-    assert len(selected) == 2
-    assert all(cell["state"] == "skipped" for cell in selected)
+    # Plain-text SKIP is advisory only in v8.9; it cannot close a frozen cell.
+    assert adapter.calls == 3
+    # v8.9 freezes an exact asset x actor denominator.  Planner defaults this
+    # legacy string inventory to anonymous + user, so two vulnerability classes
+    # produce four independently open cells.
+    assert len(selected) == 4
+    assert all(cell["state"] == "untested" for cell in selected)
+    # The host-selected surface_ctx binds the advisory declaration to the one
+    # budgeted exact cell. It remains open and cannot annotate the other role,
+    # vulnerability class, or any other out-of-run cell.
+    assert sum(bool(cell.get("deferred_by_text_skip")) for cell in selected) == 1
     stats = out["coverage_ledger"]["stats"]
-    assert stats["in_scope_closed"] == stats["in_scope_total"] == 2
-    assert stats["out_of_run"] == 2
+    assert stats["in_scope_closed"] == 0
+    assert stats["in_scope_open"] == stats["in_scope_total"] == 1
+    assert stats["out_of_run"] == 7
     assert out["status"] == "incomplete"
 
 
@@ -443,9 +452,11 @@ def test_repeated_no_evidence_chain_intent_is_deferred(tmp_path):
     blackboard = json.loads((project / "blackboard.json").read_text(encoding="utf-8"))
     statuses = [intent.get("status") for intent in blackboard["intents"]]
     assert "claimed" not in statuses
-    assert statuses == ["deferred"]
-    assert blackboard["intents"][0]["attempts"] == 0
-    assert blackboard["intents"][0]["dispatches"] == 2
+    # Closure failed with zero proof roots, so the attempt cannot mutate
+    # cross-run Intent truth; it remains pending for a later valid run.
+    assert statuses == ["pending"]
+    assert blackboard["intents"][0].get("attempts", 0) == 0
+    assert blackboard["intents"][0].get("dispatches", 0) == 0
 
 
 def test_intent_budget_limits_unique_claims_for_whole_run(tmp_path):
@@ -475,8 +486,8 @@ def test_intent_budget_limits_unique_claims_for_whole_run(tmp_path):
     )
     assert out["scheduler_stats"]["claimed_intents_this_run"] == 1
     blackboard = json.loads((project / "blackboard.json").read_text(encoding="utf-8"))
-    assert sum(intent.get("status") == "deferred" for intent in blackboard["intents"]) == 1
-    assert sum(intent.get("status") == "pending" for intent in blackboard["intents"]) >= 1
+    assert sum(intent.get("status") == "deferred" for intent in blackboard["intents"]) == 0
+    assert sum(intent.get("status") == "pending" for intent in blackboard["intents"]) == 2
     assert sum(int(intent.get("attempts", 0) or 0) for intent in blackboard["intents"]) == 0
 
 
@@ -517,8 +528,8 @@ def test_inherited_dead_end_is_not_applicable():
         "endpoint": "/api/removed", "method": "GET", "status": "not_applicable",
         "reason": "dead end: endpoint removed",
     }]
-    assert _apply_blackboard_skips(state, inherited) == 2
-    assert {cell["state"] for cell in state.matrix.values()} == {SKIPPED}
+    assert _apply_blackboard_skips(state, inherited) == 0
+    assert {cell["state"] for cell in state.matrix.values()} == {"untested"}
 
 
 def test_ledger_keeps_one_row_per_vulnerability_cell(tmp_path):

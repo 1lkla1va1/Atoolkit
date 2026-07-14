@@ -17,8 +17,12 @@ from urllib.parse import parse_qsl, urlsplit
 
 try:
     from .planner import HIGH_VALUE_TAGS, infer_risk_tags, make_surface_id, plan_surfaces
+    from .project_state import canonical_asset
+    from .safe_io import atomic_write_text
 except ImportError:  # pragma: no cover - script execution fallback
     from planner import HIGH_VALUE_TAGS, infer_risk_tags, make_surface_id, plan_surfaces
+    from project_state import canonical_asset
+    from safe_io import atomic_write_text
 
 
 STATUS_NOT_TESTED = "not_tested"
@@ -125,11 +129,17 @@ def _clean_method(value: Any) -> str:
 
 def _roles_from_cell(cell: dict[str, Any]) -> list[str]:
     surface = cell.get("surface") if isinstance(cell.get("surface"), dict) else {}
+    exact = (cell.get("actor_role") or cell.get("role_scope")
+             or surface.get("actor_role") or surface.get("role_scope"))
+    if str(exact or "").strip():
+        return [str(exact).strip().lower()]
     return _dedupe(
         _as_list(cell.get("roles"))
         + _as_list(cell.get("needed_roles"))
+        + _as_list(cell.get("observed_roles"))
         + _as_list(surface.get("roles"))
         + _as_list(surface.get("needed_roles"))
+        + _as_list(surface.get("observed_roles"))
     ) or ["unknown"]
 
 
@@ -373,7 +383,13 @@ class CoverageLedger:
         return candidates[:n]
 
     def save(self, path: str | pathlib.Path) -> None:
-        pathlib.Path(path).write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        destination = pathlib.Path(path)
+        atomic_write_text(
+            destination,
+            json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
+            root=destination.parent,
+            reject_leaf_symlink=True,
+        )
 
 
 def normalize_surface(surface: dict[str, Any]) -> dict[str, Any]:
@@ -482,9 +498,17 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
     feature = str(cell.get("feature") or surface_meta.get("feature") or "default")
     cell_state = str(cell.get("state") or "").lower()
     status = normalize_status(cell.get("state") or cell.get("status"))
+    structured_dead_end = bool(cell.get("structured_dead_end"))
+    if cell_state == "skipped" and not structured_dead_end:
+        status = STATUS_NOT_TESTED
     source = str(surface_meta.get("source") or cell.get("source") or "legacy-matrix")
     roles = _roles_from_cell(cell)
     next_actions = _dedupe(cell.get("next_actions") or [])
+    if cell_state == "skipped" and not structured_dead_end:
+        next_actions = _dedupe([
+            *next_actions,
+            "revisit deferred CELL SKIP; structured dead_end proof required",
+        ])
     if cell_state == SHALLOW_NEGATIVE and not next_actions:
         next_actions = ["add sufficient negative evidence and response proof"]
     if cell.get("needs"):
@@ -495,6 +519,12 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
     # no longer see the raw shallow_negative token). Tag the surface here so the
     # marker survives the round-trip through add_surface/normalize_surface.
     negative_depth = "shallow" if cell_state == SHALLOW_NEGATIVE else None
+    asset_id = canonical_asset(
+        cell.get("asset_id") or surface_meta.get("asset_id") or "")
+    actor_role = str(
+        cell.get("actor_role") or cell.get("role_scope")
+        or surface_meta.get("actor_role") or roles[0] or "unknown"
+    ).strip().lower() or "unknown"
 
     surfaces: list[dict[str, Any]] = []
     for param in _params_from_cell(cell):
@@ -504,7 +534,22 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
         surfaces.append({
             # Coverage identity is a cell, not merely a request surface.  Two
             # vuln classes on the same METHOD/path must never merge.
-            "surface_id": f"{base_surface_id} × {vuln_class or 'general-review'}",
+            "surface_id": (
+                f"{base_surface_id} × {vuln_class or 'general-review'}"
+                f" @ {asset_id or 'unknown-asset'} as {actor_role}"
+            ),
+            "asset_id": asset_id,
+            "actor_role": actor_role,
+            "role_scope": actor_role,
+            "namespace": str(
+                cell.get("namespace") or surface_meta.get("namespace") or ""),
+            "param_location": str(
+                cell.get("param_location")
+                or surface_meta.get("param_location") or "").lower(),
+            "subject_role": str(
+                cell.get("subject_role") or surface_meta.get("subject_role") or "").lower(),
+            "object_kind": str(
+                cell.get("object_kind") or surface_meta.get("object_kind") or "").lower(),
             "endpoint": endpoint,
             "method": method,
             "param": param,
@@ -524,6 +569,10 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
             "negative_depth_checked": bool(cell.get("negative_depth_checked", False)),
             "negative": cell.get("negative") if isinstance(cell.get("negative"), dict) else None,
             "inherited_from_blackboard": bool(cell.get("inherited_from_blackboard", False)),
+            "structured_dead_end": structured_dead_end,
+            "deferred_by_text_skip": bool(
+                cell.get("deferred_by_text_skip")
+                or (cell_state == "skipped" and not structured_dead_end)),
         })
     return surfaces
 

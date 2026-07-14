@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 
 from engine.orchestrator import run_session
 from engine.project_state import ProjectStateStore
@@ -9,6 +10,7 @@ from tests.test_reporting_proof_contract import _idor_fixture
 
 class RecordingAdapter:
     name = "fixture"
+    process_containment_verified = True
 
     def __init__(self, workdir, response="LOW_ROI\n"):
         self.workdir = workdir
@@ -87,6 +89,47 @@ def test_second_run_restores_project_inventory_without_new_recon(tmp_path):
                for item in inventory["endpoints"])
 
 
+def test_second_run_keeps_same_path_app_and_object_variants_distinct(tmp_path):
+    project = tmp_path / "target"
+    ProjectStateStore(project, project_scope=["https://t.example/"]).commit_run(
+        "run-1",
+        inventory=[
+            {
+                "asset": "https://t.example/", "method": "GET",
+                "endpoint": "/api/profile", "namespace": "/shop",
+                "subject_role": "customer", "object_kind": "profile",
+                "roles": ["user"],
+            },
+            {
+                "asset": "https://t.example/", "method": "GET",
+                "endpoint": "/api/profile", "namespace": "/admin",
+                "subject_role": "operator", "object_kind": "profile",
+                "roles": ["admin"],
+            },
+        ],
+    )
+    workdir = project / "sessions" / "run-2"
+    workdir.mkdir(parents=True)
+    adapter = RecordingAdapter(workdir)
+
+    _run(project, "run-2", adapter, endpoints=None, vuln_classes=["idor"])
+
+    inventory = json.loads((workdir / "inventory.json").read_text(
+        encoding="utf-8"))
+    variants = [
+        item for item in inventory["endpoints"]
+        if item.get("endpoint") == "/api/profile"
+    ]
+    assert len(variants) == 2
+    assert {
+        (item["namespace"], item["subject_role"], item["object_kind"])
+        for item in variants
+    } == {
+        ("/shop", "customer", "profile"),
+        ("/admin", "operator", "profile"),
+    }
+
+
 def test_conclude_commits_only_proof_confirmed_root_to_project_registry(tmp_path):
     project = tmp_path / "target"
     workdir = project / "sessions" / "run-1"
@@ -157,7 +200,8 @@ def test_validation_failure_forces_incomplete_and_blocks_registry_commit(tmp_pat
     assert out["validation_artifact"]["exit_code"] == 1
     assert out["final_report_path"] == ""
     assert not (workdir / "final_report.md").exists()
-    assert ProjectStateStore(project).load()["finding_registry"] == {}
+    assert ProjectStateStore(project).preview()["finding_registry"] == {}
+    assert not (project / "project_state.json").exists()
 
 
 def test_no_work_does_not_override_invalid_finding_validation(tmp_path):
@@ -267,13 +311,15 @@ def test_unresolved_project_path_is_promoted_when_method_is_observed(tmp_path):
     _run(project, "run-2", adapter, endpoints=None, vuln_classes=["amount-tamper"])
 
     state = store.load()
-    assert state["inventory"]["unresolved"] == {}
-    record = next(iter(state["inventory"]["surfaces"].values()))
-    assert record["method"] == "POST"
+    # The observation occurred in a zero-finding, closure-incomplete run, so
+    # it remains session/authority diagnostic data and cannot promote project
+    # inventory truth yet.
+    assert state["inventory"]["unresolved"]
+    assert state["inventory"]["surfaces"] == {}
     method_intents = [
         item for item in state["intents"] if item.get("source") == "method_resolution"
     ]
-    assert method_intents and method_intents[0]["status"] == "completed"
+    assert method_intents and method_intents[0]["status"] == "pending"
 
 
 def test_runtime_inventory_filters_other_project_assets(tmp_path):
@@ -387,8 +433,32 @@ def test_evidence_attested_dead_end_is_restored_without_retest(tmp_path):
     project = tmp_path / "target"
     proof_dir = project / "sessions" / "run-1"
     proof_dir.mkdir(parents=True)
-    (proof_dir / "removed.json").write_text(
-        '{"status": 404, "route": "removed"}', encoding="utf-8")
+    request = "GET /api/removed HTTP/1.1\nHost: t.example\nCookie: sid=user-a\n\n"
+    response = 'HTTP/1.1 404 Not Found\n\n{"route":"removed"}'
+    (proof_dir / "removed.json").write_text(json.dumps({
+        "schema_version": "1.0", "kind": "dead_end_evidence",
+        "exact_cell": {
+            "asset_id": "https://t.example:443", "method": "GET",
+            "endpoint": "/api/removed", "param": "", "role_scope": "user",
+            "vuln_class": "idor", "namespace": "", "param_location": "",
+            "subject_role": "", "object_kind": "",
+        },
+        "packets": [{
+            "vector": "route_probe", "request": request, "response": response,
+            "request_sha256": hashlib.sha256(request.encode()).hexdigest(),
+            "response_sha256": hashlib.sha256(response.encode()).hexdigest(),
+            "assertions": [{
+                "target": "response", "relation": "contains",
+                "value": "404 Not Found",
+            }],
+            "identity_assertions": {
+                "actor_role": {
+                    "target": "request", "relation": "contains",
+                    "value": "sid=user-a",
+                },
+            },
+        }],
+    }), encoding="utf-8")
     state = ProjectStateStore(
         project, project_scope=["https://t.example/"]).commit_run(
         "run-1",

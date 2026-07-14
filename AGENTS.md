@@ -9,29 +9,30 @@
 - **证据落盘**：所有 curl/HTTP 包、响应、报告一律写入 `runs/<sid>/`（由会话指定）。**说做了 ≠ 真做了，落盘才算数。**
 - **登录态**：遇登录二次核身/验证码/短信 → 停，输出 `NEED_INPUT`，由人提供新鲜 Cookie/Session，不要自行从截图读凭据登录。
 - **终态标记**：每次任务结束，在**最后一条消息的独立一行**只输出一个：`VULN_FOUND` / `LOW_ROI` / `NEED_INPUT` / `ERROR`。
-- **外部强制说明（⚙）**：下文带 ⚙ 的规则由外壳/沙箱强制（网络白名单、危险命令拦截、超时切向、无 PoC 拒收、终态裁定）。即便你忘了，系统也会拦你——专注测试与判断即可。
+- **外部强制说明（⚙）**：下文带 ⚙ 的报告验证、危险动作分类、超时切向和终态裁定由外壳执行。当前 Codex backend **没有可证明的 pre-exec 网络白名单**：live 默认拒绝；显式 unrestricted 降级也不得声称已做出站硬约束。
+- **进程容器说明（⚙）**：本地 POSIX 进程组不能包含 `setsid()` 后代；当前 Codex/wrapper 运行因此为 `authority_trusted=false` 的 diagnostic，不得改写跨 Run ProjectState。
 - **报告前**：逐条跑完「七问验证门」，只有 P1/P2/P3 才写报告（正文 ≥ 200 字、含可执行 curl/HTTP 包）。
 
 ---
-
 
 > 本文件只装**边界**和**报告标准**，不装方法论。具体怎么测、用什么 payload、走什么路径，
 > 由你自主决定，并按需检索深度 playbook（见「决策树」末尾的 SKILL 路由）。
 > 每次切换测试方向前，回头重读一遍下方「速查卡」。
 >
-> 【模型无关说明】本文件是给「你」（任意模型）的**软约束**；带 ⚙ 标记的规则由**外壳代码强制执行**，
-> 不依赖你的记忆或自觉——即便你忘了，系统也会拦你。你只需专注测试与判断。
+> 【模型无关说明】本文件是给「你」（任意模型）的**软约束**；带 ⚙ 标记的报告/状态规则由
+> **外壳代码**校验。当前 Codex backend 没有可证明的 pre-exec 网络白名单，不能把提示词或
+> allow-host 列表说成出站硬约束。
 >
 > 【运行模式说明】本文件同时服务 **Engine Mode**（`run.py` 驱动）和 **Skill Mode**（QoderWork / 任意 agent 直接读取）。
 > 部分规则标注了模式适用范围；未标注的规则对两种模式均生效。
 
 ---
 
-## 0.0 运行身份与跨 Run 真值（v8.8）
+## 0.0 运行身份与跨 Run 真值（v8.9）
 
-- **首个网络动作之前**必须已有 `run_manifest.json`。Engine Mode 由外壳创建；Skill Mode 用 `python3 -m engine.runtime_manifest init-manifest --mode skill --run-dir <session> --primary-target <url> --allow <scope> --authz-file <authz.md> --instruction AGENTS.md --instruction SKILL.md` 创建。失败即停。
-- `<project>/project_state.json`（schema 1）是跨 Run 唯一权威。`blackboard.json`、`business_graph.json`、`run_scope.json` 和摘要均为派生视图，禁止反向覆盖项目真值。
-- 继承闭格必须精确匹配 `asset + METHOD/path + param + role + vuln_class`；unknown role 不是通配符。未知 method 的新路径先进入 unresolved inventory，不得默认成 GET 后误闭格。
+- **首个网络动作之前**必须已有 host-owned `run_manifest.json` 与 frozen `run_plan.json`。Engine Mode 由父进程创建；Skill Mode 由外部 `engine.skill_wrapper` 创建。只有能证明全部后代已容器/cgroup/job 隔离并静默的后端才可设置 `authority_trusted=true`；当前内置 Codex/wrapper 与 Direct Skill 均为 diagnostic。
+- `<project>/project_state.json`（schema 2）是跨 Run 唯一权威。`blackboard.json`、`business_graph.json`、`run_scope.json` 和摘要均为派生视图，禁止反向覆盖项目真值。
+- 继承闭格必须精确匹配 `origin + namespace + METHOD/path + param/location + actor/subject/object + vuln_class`；unknown role 不是通配符。未知 method 的新路径进入 unresolved queue，不得默认 GET。
 - 项目 Finding 注册表只接收确定性校验后的 `accepted + proof_status=confirmed + claim.kind=root_finding`。标题、散文和链式假设均不能作为去重或闭格依据。
 
 ## 0. Phase 0 侦察协议
@@ -44,7 +45,7 @@
 2. **非 API 页面与表单扫描**：提取 HTML 表单 action 和高价值非 API 页面 → `[HTML]` 前缀记录
 3. **API 端点枚举**：逐一 curl 检查可达性，分类（公开/需认证/不存在） → 更新 `endpoint_inventory.md`；匿名 200 只说明可达，不能直接定性为未授权
 4. **业务流建模**：走一遍用户/商户/管理核心流程，记录端点和参数 → `business_flow.md`
-5. **攻击面清单生成**：合并以上产出，每个 surface = endpoint/method/param/role/risk_tags/status → `attack_surface_list.md`
+5. **攻击面清单生成**：合并以上产出，每个 surface = asset/endpoint/method/param/location/role/risk_tags/status → authoritative `inventory.json`；`attack_surface_list.md` 仅为派生人类视图
 6. **完整性检查**：对照决策树分支确认无空白方向，缺失方向继续侦察或标 NEED_INPUT
 
 ### 测试账号完备性验证
@@ -168,9 +169,9 @@ Phase 0 侦察应优先覆盖本轮域内的端点——其他域的端点记录
 
 先覆盖，再收口。每个发现的攻击面都必须拆成 `endpoint / method / param / role / risk_tag`，并维护覆盖格状态：`not_tested`、`confirmed`、`not_vulnerable`、`shallow_negative`、`blocked`、`not_applicable`、`exploring`。
 
-**Skill Mode 覆盖台账**：用 markdown 表格维护覆盖状态（格式见 skillmode-reference.md §覆盖台账）。`status` 列只允许上述七种值，`depth` 列只允许 `✓`（达到 depth floor）或 `✗ <原因>`。终态时 `not_tested` 的高价值 surface → 标 `incomplete`。`exploring` 表示正在对该 surface 做非结构化深度测试，不受 checklist 约束，有明确结论后转为 `confirmed` / `not_vulnerable` / `shallow_negative`。
+**Skill Mode 覆盖台账**：authoritative 输入是 `coverage-ledger.json`；Markdown 表格只是派生视图。`status` 只允许上述七种值。终态时 frozen run scope 内仍有 `not_tested` 高价值 cell → `incomplete`。`exploring` 有明确结论后转为 `confirmed` / `not_vulnerable` / `shallow_negative`。
 
-**跨 Run dead-end 合同（Engine Mode）**：普通 `SKIP`、预算不足、缺账号和模型自行放弃都不能跨 Run 关闭覆盖格。只有确实“不适用”的精确单元才写入会话根目录 `dead_ends.json`，格式为 `{"schema_version":"1.0","dead_ends":[...]}`；每项必须包含 `status=not_applicable`、精确 `asset/method/endpoint/param/role_scope/vuln_class`、`reason_code`、`refutation` 和可读取的 `evidence_refs`。`reason_code` 只允许：`endpoint_removed`、`feature_disabled`、`method_not_supported`、`parameter_not_consumed`、`role_not_applicable`、`vulnerability_class_not_applicable`。缺字段或证据校验失败时只作为本轮提示，不进入项目真值。
+**跨 Run dead-end 合同（Engine Mode）**：普通 `SKIP`、预算不足、缺账号和模型自行放弃都不能跨 Run 关闭覆盖格。只有确实“不适用”的精确单元才写入会话根目录 `dead_ends.json`，格式为 `{"schema_version":"1.0","dead_ends":[...]}`；每项必须包含 `status=not_applicable`、精确 `asset/method/endpoint/param/role_scope/vuln_class`，并显式提供 `namespace/param_location/subject_role/object_kind`（无值时写空字符串）、`reason_code`、`refutation` 和可读取的 `evidence_refs`。`reason_code` 只允许：`endpoint_removed`、`feature_disabled`、`method_not_supported`、`parameter_not_consumed`、`role_not_applicable`、`vulnerability_class_not_applicable`。缺字段或证据校验失败时只作为本轮提示，不进入项目真值。
 
 ### 高价值格不得空白
 
@@ -209,7 +210,7 @@ Phase 0 侦察应优先覆盖本轮域内的端点——其他域的端点记录
 
 多阶段测试架构下，前一阶段标记为 `not_vulnerable` 的输入验证类 surface，后一阶段必须使用不同的 payload 编码格式和注入策略重新测试。前阶段的阴性记录（含已测试 payload 列表和响应模式）是后阶段的测试起点，不是终点。
 
-**阴性落盘格式**：Skill Mode 使用合并文件 `negative_findings.md`（完整格式见 skillmode-reference.md §阴性落盘）。每条阴性须含已测试向量描述 + depth_floor_met + status。
+**阴性落盘格式**：Skill Mode 使用 authoritative `negative_findings.json`；Markdown 仅作派生说明。每条阴性必须绑定 exact cell、请求/响应、actor/subject/object、向量、depth、evidence hash 与 source session。
 
 ### 阻塞要分类
 
@@ -361,7 +362,7 @@ Phase 0 侦察应优先覆盖本轮域内的端点——其他域的端点记录
 
 **恢复协议**：如果发现自己不确定之前测试过什么（长对话记忆模糊），**先读 `state/` 目录下的所有文件**再继续测试。以磁盘状态为准，不依赖工作记忆。
 
-**定期快照**：每测试 10 个 surface，将当前覆盖表快照写入 `state/coverage_snapshot.md`。
+**定期快照**：每测试 10 个 surface，更新 `coverage-ledger.json`；可额外生成 `state/coverage_snapshot.md` 人类视图。
 
 ---
 
@@ -390,9 +391,9 @@ Phase 0 侦察应优先覆盖本轮域内的端点——其他域的端点记录
 □ 所有 not_vulnerable 的 depth_floor_met = yes？
 □ 所有 shallow_negative 有 next_actions？
 □ 覆盖表与实际 evidence 文件一致？
-□ 已运行 `python3 -m engine.reporting.cli <run_dir> --output finding_validation.json`？默认空结果 exit 2；只有 inventory/coverage/candidate 全闭环时才可显式 `--allow-empty` 并以 exit 0 收口。
+□ 外部 wrapper/Engine 是否已停止 agent，并调用共享 exactly-once finalizer？是否有可验证的全后代进程容器/cgroup/job 静默证明？若无，产物只能为 diagnostic；仅 loose reporting CLI 不代表整轮闭合。
 □ summary 只收录 `proof_confirmed + claim.kind=root_finding`，chain hypothesis 留在 Intent/附录？
-□ 已把验证结果原子提交到 `project_state.json`，并运行 `python3 -m engine.runtime_manifest receipt --run-dir <run_dir>` 生成绑定启动清单和最终产物哈希的 receipt？
+□ `delivery_status.json` 是否同时满足 integrity、proof、closure、authority 与 network assurance？receipt 是否绑定 immutable commit 而非 live project state？
 
 ### 终态判定规则
 

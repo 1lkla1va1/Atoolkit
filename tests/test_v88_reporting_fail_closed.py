@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import pathlib
 import pytest
 
@@ -112,7 +113,7 @@ def test_empty_input_is_nonzero_by_default(tmp_path):
 
     report = validate_run_artifacts(tmp_path)
 
-    assert report["status"] == "empty_input"
+    assert report["status"] == "incomplete"
     assert report["exit_code"] == 2
     assert reporting_main([str(tmp_path)]) == 2
 
@@ -144,7 +145,7 @@ def test_benchmark_ignores_handwritten_accepted_summary_without_validation(tmp_p
     assert load_findings(tmp_path / "summary.json") == []
 
 
-def test_benchmark_reads_validator_projection_not_summary_rows(tmp_path):
+def test_benchmark_requires_receipt_and_complete_closure_not_summary_rows(tmp_path):
     _idor_fixture(tmp_path)
     _manifest(tmp_path)
     validation = validate_run_artifacts(tmp_path)
@@ -159,12 +160,33 @@ def test_benchmark_reads_validator_projection_not_summary_rows(tmp_path):
 
     findings = load_findings(tmp_path / "summary.json")
 
-    assert [finding.id for finding in findings] == ["finding_001"]
+    assert findings == []
 
 
 def test_allow_empty_requires_and_accepts_a_complete_physical_gate(tmp_path):
     _manifest(tmp_path)
-    _write(tmp_path / "negative.md", "not applicable evidence")
+    request = "GET /api/health HTTP/1.1\nHost: t.example\n\n"
+    response = 'HTTP/1.1 200 OK\n\n{"status":"ok"}'
+    exact_cell = {
+        "asset_id": "https://t.example:443", "endpoint": "/api/health",
+        "method": "GET", "param": "", "role_scope": "unknown",
+        "vuln_class": "information-only", "namespace": "",
+        "param_location": "", "subject_role": "", "object_kind": "",
+    }
+    _write(tmp_path / "negative.json", json.dumps({
+        "schema_version": "1.0", "kind": "dead_end_evidence",
+        "exact_cell": exact_cell,
+        "packets": [{
+            "vector": "liveness_probe", "request": request,
+            "response": response,
+            "request_sha256": hashlib.sha256(request.encode()).hexdigest(),
+            "response_sha256": hashlib.sha256(response.encode()).hexdigest(),
+            "assertions": [{
+                "target": "response", "relation": "contains",
+                "value": '"status":"ok"',
+            }],
+        }],
+    }))
     _write(tmp_path / "inventory.json", json.dumps({
         "endpoints": [{"endpoint": "/api/health", "method": "GET"}],
     }))
@@ -172,9 +194,16 @@ def test_allow_empty_requires_and_accepts_a_complete_physical_gate(tmp_path):
         "schema_version": 1,
         "surfaces": [{
             "surface_id": "health",
+            "asset_id": "https://t.example:443",
             "endpoint": "/api/health",
             "method": "GET",
             "param": "",
+            "roles": ["unknown"],
+            "vuln_class": "information-only",
+            "namespace": "",
+            "param_location": "",
+            "subject_role": "",
+            "object_kind": "",
             "status": "not_applicable",
             "reason": "health endpoint has no security-sensitive state",
             "in_run_scope": True,
@@ -184,12 +213,65 @@ def test_allow_empty_requires_and_accepts_a_complete_physical_gate(tmp_path):
     _write(tmp_path / "candidate-ledger.json", json.dumps({
         "schema_version": "1.1", "candidates": [],
     }))
+    _write(tmp_path / "dead_ends.json", json.dumps({
+        "dead_ends": [{
+            "status": "not_applicable",
+            "reason_code": "vulnerability_class_not_applicable",
+            "refutation": "The endpoint exposes only a constant liveness value.",
+            "source_run": tmp_path.name,
+            "asset_id": "https://t.example:443",
+            "endpoint": "/api/health",
+            "method": "GET",
+            "param": "",
+            "role_scope": "unknown",
+            "vuln_class": "information-only",
+            "namespace": "",
+            "param_location": "",
+            "subject_role": "",
+            "object_kind": "",
+            "evidence_refs": ["negative.json"],
+        }],
+    }))
 
     report = validate_run_artifacts(tmp_path, allow_empty=True)
 
     assert report["status"] == "empty_allowed"
     assert report["exit_code"] == 0
     assert report["empty_gate"]["result"] == "pass"
+
+
+def test_not_applicable_reason_without_structured_dead_end_cannot_close(tmp_path):
+    _manifest(tmp_path)
+    _write(tmp_path / "inventory.json", json.dumps({
+        "endpoints": [{"endpoint": "/api/health", "method": "GET"}],
+    }))
+    _write(tmp_path / "coverage-ledger.json", json.dumps({
+        "schema_version": 1,
+        "surfaces": [{
+            "surface_id": "health",
+            "asset_id": "https://t.example:443",
+            "endpoint": "/api/health",
+            "method": "GET",
+            "param": "",
+            "roles": ["unknown"],
+            "vuln_class": "information-only",
+            "namespace": "",
+            "param_location": "",
+            "subject_role": "",
+            "object_kind": "",
+            "status": "not_applicable",
+            "reason": "self-asserted text only",
+            "in_run_scope": True,
+        }],
+    }))
+    _write(tmp_path / "candidate-ledger.json", json.dumps({
+        "schema_version": "1.1", "candidates": [],
+    }))
+
+    report = validate_run_artifacts(tmp_path, allow_empty=True)
+
+    assert report["exit_code"] == 2
+    assert "not_applicable_contract_missing" in report["empty_gate"]["reasons"]
 
 
 def test_allow_empty_rejects_recoverable_blocked_surface(tmp_path):
@@ -452,7 +534,9 @@ def test_relative_target_binds_only_to_manifest_primary_target(tmp_path):
 
     report = validate_run_artifacts(tmp_path)
 
-    assert report["exit_code"] == 0, report["proof_pending_or_rejected"]
+    assert report["exit_code"] == 2, report["proof_pending_or_rejected"]
+    assert report["proof_gate"]["result"] == "pass"
+    assert report["closure_gate"]["result"] == "fail"
     assert report["counts"]["proof_confirmed"] == 1
 
 
@@ -496,7 +580,8 @@ def test_validation_digest_detects_evidence_mutation(tmp_path):
     _idor_fixture(tmp_path)
     _manifest(tmp_path)
     report = validate_run_artifacts(tmp_path)
-    assert report["exit_code"] == 0
+    assert report["exit_code"] == 2
+    assert report["proof_gate"]["result"] == "pass"
     assert verify_validation_artifact(report, tmp_path)["ok"] is True
 
     _write(tmp_path / "findings/finding_001/response_attacker.http", "changed")
@@ -561,8 +646,8 @@ def test_manifest_receipt_and_doctor_record_provenance_without_claiming_foreign_
     _write(repo / "skill/核心技能文件.v3.md", "# core\nbody\n")
     _write(repo / "AGENTS.md", "header\nbody\n")
     _write(repo / "codex/AGENTS.md", "header\nbody\n")
-    _write(repo / "SKILL.md", "---\nversion: 8.8.0\n---\n")
-    _write(repo / "CHANGELOG.md", "# Changelog\n\n## 8.8.0 - 2026-07-13\n")
+    _write(repo / "SKILL.md", "---\nversion: 8.9.0\n---\n")
+    _write(repo / "CHANGELOG.md", "# Changelog\n\n## 8.9.0 - 2026-07-13\n")
     foreign = tmp_path / "foreign/src.md"
     _write(foreign, "foreign")
     (codex_home / "prompts").mkdir(parents=True)

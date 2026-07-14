@@ -16,8 +16,9 @@
 换模型：改 --model 即可；换运行时：把 CodexAdapter 换成别的 ModelAdapter（本文件 1 处）。
 """
 from __future__ import annotations
-import argparse, inspect, sys, time, re, pathlib, json, shutil, os, secrets
+import argparse, inspect, sys, time, re, pathlib, json, shutil, os, secrets, hashlib
 from fnmatch import fnmatch
+from urllib.parse import urlsplit
 
 ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -29,7 +30,9 @@ from engine.verify import (verify_idor, extract_poc, urllib_transport,  # noqa: 
 from engine.host_policy import (authorization_scope_from_url, hostname_from_url,
                                 normalize_authorized_scopes,
                                 parse_authorized_scope)  # noqa: E402
-from engine.runtime_manifest import doctor, sha256_file, write_run_receipt  # noqa: E402
+from engine.runtime_manifest import doctor  # noqa: E402
+from engine.run_authority import validate_session_id as _validate_session_id  # noqa: E402
+from engine.safe_io import atomic_write_text, ensure_directory  # noqa: E402
 from engine.version import __version__  # noqa: E402
 
 
@@ -43,23 +46,53 @@ def safe_project_slug(value: str) -> str:
     return slug or "target"
 
 
-_SAFE_SID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+def normalize_explicit_base_path(value: str) -> str:
+    """Normalize an explicitly supplied application namespace.
+
+    Target URL paths are deliberately not consulted: ``/login/`` is an entry
+    page, not proof that it is the stable application root.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return "/"
+    if "?" in raw or "#" in raw or "\\" in raw or "\x00" in raw:
+        raise ValueError("--base-path 只能是无 query/fragment 的 URL path")
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    segments: list[str] = []
+    for segment in raw.split("/"):
+        if segment in {"", "."}:
+            continue
+        if segment == "..":
+            raise ValueError("--base-path 不能包含 ..")
+        segments.append(segment)
+    return "/" + "/".join(segments) + ("/" if segments else "")
+
+
+def default_project_slug(target: str, *, base_path: str = "/") -> str:
+    """Stable project slug from origin plus an *explicit* app namespace."""
+    parsed = urlsplit(str(target or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "target"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    origin_label = safe_project_slug(f"{parsed.hostname}_{port}")
+    namespace = normalize_explicit_base_path(base_path)
+    if namespace == "/":
+        return origin_label
+    readable = safe_project_slug(namespace.strip("/").replace("/", "_"))[:36]
+    digest = hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:10]
+    return safe_project_slug(f"{origin_label}_{readable}_{digest}")
 
 
 def safe_session_id(value: str) -> str:
     """Validate, rather than sanitize, a session ID used as a path component."""
-    sid = str(value or "").strip()
-    if not _SAFE_SID_RE.fullmatch(sid) or sid in {".", ".."}:
-        raise ValueError(
-            "session ID 仅允许 1-128 位字母、数字、点、下划线和连字符，且不能是路径"
-        )
-    return sid
+    return _validate_session_id(value)
 
 
 def safe_session_dir(base: pathlib.Path, sid: str) -> pathlib.Path:
     """Resolve a session child path and reject traversal or existing symlinks."""
     clean_sid = safe_session_id(sid)
-    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ensure_directory(base)
     try:
         base.chmod(0o700)
     except OSError:
@@ -77,7 +110,7 @@ def safe_session_dir(base: pathlib.Path, sid: str) -> pathlib.Path:
 
 
 def _secure_mkdir(path: pathlib.Path) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ensure_directory(path)
     try:
         path.chmod(0o700)
     except OSError:
@@ -85,41 +118,38 @@ def _secure_mkdir(path: pathlib.Path) -> None:
 
 
 def _secure_write_text(path: pathlib.Path, value: str) -> None:
-    """Write a private file without following a final-component symlink."""
+    """Atomically write without mutating symlink or hardlink targets."""
     _secure_mkdir(path.parent)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            fd = -1
-            handle.write(value)
-    finally:
-        if fd >= 0:
-            os.close(fd)
+    atomic_write_text(
+        path,
+        value,
+        root=path.parent,
+        mode=0o600,
+        # Atomic replacement removes an alias entry without following it and
+        # leaves any other hardlink inode untouched.
+        reject_leaf_symlink=False,
+    )
 
 
 def _atomic_write_json(path: pathlib.Path, value: dict) -> None:
     """Atomically replace a private JSON delivery artifact."""
-    temporary = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
-    try:
-        _secure_write_text(
-            temporary, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
-        os.replace(temporary, path)
-        try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-        except OSError:
-            directory_fd = None
-        if directory_fd is not None:
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    _secure_write_text(
+        path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _write_runtime_inventory(
+    path: pathlib.Path,
+    value: dict,
+    *,
+    root: pathlib.Path,
+) -> None:
+    """Persist parent-owned inventory without changing its legacy JSON format."""
+    atomic_write_text(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2),
+        root=root,
+        reject_leaf_symlink=True,
+    )
 
 
 def build_verify_fn(identities: dict, victim_marker: str, hosts: list[str],
@@ -279,11 +309,19 @@ def _score_run(argv: list[str]) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     scorecard_json = run_dir / "scorecard.json"
     scorecard_md = run_dir / "scorecard.md"
-    scorecard_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    scorecard_md.write_text(
+    atomic_write_text(
+        scorecard_json,
+        json.dumps(result, ensure_ascii=False, indent=2),
+        root=run_dir,
+        reject_leaf_symlink=True,
+    )
+    atomic_write_text(
+        scorecard_md,
         _render_scorecard_md(result, sid=sid, oracle_path=args.oracle,
                              summary_path=summary_path, coverage_path=coverage_path),
-        encoding="utf-8")
+        root=run_dir,
+        reject_leaf_symlink=True,
+    )
     json.dump(result, sys.stdout, ensure_ascii=False, indent=None if args.compact else 2)
     sys.stdout.write("\n")
     print(f"scorecard_json={scorecard_json}")
@@ -411,10 +449,14 @@ def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list, list[dict]]:
     endpoints: list = []
     records: list[dict] = []
 
-    def normalized(endpoint: str, method: str = "GET") -> tuple[str, str, str]:
-        key = canonical_surface_key({"endpoint": endpoint, "method": method})
+    def normalized(endpoint: str, method: str = "") -> tuple[str, str, str]:
+        # A bare path is a discovery hint, not an observed GET.  Passing an
+        # empty default preserves the unresolved method until traffic/source
+        # code proves one.
+        key = canonical_surface_key(
+            {"endpoint": endpoint, "method": method}, default_method="")
         normalized_method, _, path = key.partition(" ")
-        return key, normalized_method or "GET", path
+        return (key if normalized_method else ""), normalized_method, path
 
     from engine.surface_key import canonical_surface_key
     if p.exists():
@@ -427,8 +469,9 @@ def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list, list[dict]]:
                     if not endpoint:
                         continue
                     endpoint_key, endpoint_method, endpoint_path = normalized(
-                        endpoint, str(item.get("method") or "GET"))
+                        endpoint, str(item.get("method") or ""))
                     rec = {
+                        **item,
                         "endpoint": endpoint_path,
                         "method": endpoint_method,
                         "params": item.get("params") or item.get("parameters") or [],
@@ -439,13 +482,15 @@ def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list, list[dict]]:
                         "last_seen": item.get("last_seen") or "",
                         "discovered_during_testing": bool(item.get("discovered_during_testing", False)),
                     }
-                    endpoints.append({**rec})
+                    if endpoint_method:
+                        endpoints.append({**rec})
                     records.append(rec)
                     continue
                 endpoint = str(item or "").strip()
                 if endpoint:
                     endpoint_key, endpoint_method, endpoint_path = normalized(endpoint)
-                    endpoints.append(endpoint_key)
+                    if endpoint_method:
+                        endpoints.append(endpoint_key)
                     records.append({
                         "endpoint": endpoint_path,
                         "method": endpoint_method,
@@ -463,7 +508,8 @@ def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list, list[dict]]:
             if not endpoint or endpoint.lstrip().startswith("#"):
                 continue
             endpoint_key, endpoint_method, endpoint_path = normalized(endpoint)
-            endpoints.append(endpoint_key)
+            if endpoint_method:
+                endpoints.append(endpoint_key)
             records.append({
                 "endpoint": endpoint_path,
                 "method": endpoint_method,
@@ -479,7 +525,8 @@ def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list, list[dict]]:
             if not endpoint or endpoint.lstrip().startswith("#"):
                 continue
             endpoint_key, endpoint_method, endpoint_path = normalized(endpoint)
-            endpoints.append(endpoint_key)
+            if endpoint_method:
+                endpoints.append(endpoint_key)
             records.append({
                 "endpoint": endpoint_path,
                 "method": endpoint_method,
@@ -500,7 +547,7 @@ def _merge_inventory_records(records: list[dict]) -> list[dict]:
             continue
         key = (
             str(rec.get("endpoint") or ""),
-            str(rec.get("method") or "GET").upper(),
+            str(rec.get("method") or "").upper(),
             bool(rec.get("discovered_during_testing")),
         )
         if not key[0]:
@@ -760,7 +807,11 @@ def _run_self_check() -> int:
         ))
         return recon, oracle, reporting
 
-    fixture_root = pathlib.Path(tempfile.mkdtemp(prefix="atoolkit-selfcheck-"))
+    # macOS exposes tempfile paths through the system `/var -> /private/var`
+    # alias.  Canonicalize this trusted self-check boundary before exercising
+    # the no-symlink authority writer.
+    fixture_root = pathlib.Path(
+        tempfile.mkdtemp(prefix="atoolkit-selfcheck-")).resolve()
     recon_dir, oracle_path, reporting_fixture = _make_self_check_fixtures(fixture_root)
     print("▶ self-check（临时 fixture，不接模型/网络）")
 
@@ -816,7 +867,7 @@ def _run_self_check() -> int:
 
     # 断言4：surface 内容嗅探 + wrapper + 变量一跳 + 相对路径 + body shorthand 参数。
     def _assert4():
-        tmp = pathlib.Path(tempfile.mkdtemp())
+        tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
         (tmp / "bundle.asset").write_text(
             "const detailUrl = '../api/order/detail.php?order_no=1';\n"
             "fetch(detailUrl, { method: 'POST', body: JSON.stringify({ user_id, status }) });\n"
@@ -849,7 +900,7 @@ def _run_self_check() -> int:
 
     # 断言6：benchmark_eval 能从 evidence request 提取 method/params。
     def _assert6():
-        tmp = pathlib.Path(tempfile.mkdtemp())
+        tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
         (tmp / "evidence.json").write_text(json.dumps({
             "request": {
                 "method": "POST",
@@ -882,7 +933,7 @@ def _run_self_check() -> int:
         ok = validate_finding(finding, fixture / "finding.json", fixture,
                               authorized_hosts=["t.example"])
         assert ok.ok, f"basic_idor 应 accepted: {ok.reasons}"
-        tmp = pathlib.Path(tempfile.mkdtemp())
+        tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
         dst = tmp / "findings" / "finding_001"
         shutil.copytree(fixture, dst)
         (dst / "response_1.http").unlink()
@@ -892,7 +943,7 @@ def _run_self_check() -> int:
         assert not rejected.ok and any("response_file" in r for r in rejected.reasons), \
             f"缺 response 应 rejected: {rejected.reasons}"
         shutil.rmtree(tmp)
-        tmp = pathlib.Path(tempfile.mkdtemp())
+        tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
         dst = tmp / "findings" / "finding_001"
         shutil.copytree(fixture, dst)
         escaped = load_finding(dst / "finding.json")
@@ -908,7 +959,7 @@ def _run_self_check() -> int:
         from engine.reporting.collect import collect_structured_findings
         from engine.reporting.render_md import render_final_report
         fixture = reporting_fixture
-        tmp = pathlib.Path(tempfile.mkdtemp())
+        tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
         dst = tmp / "findings" / "finding_001"
         shutil.copytree(fixture, dst)
         collected = collect_structured_findings(tmp, authorized_hosts=["t.example"])
@@ -929,7 +980,7 @@ def _run_self_check() -> int:
     def _assert9():
         from engine.orchestrator import CognitiveState, harvest_evidence, _conclude
         fixture = reporting_fixture
-        tmp = pathlib.Path(tempfile.mkdtemp())
+        tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
         dst = tmp / "findings" / "finding_001"
         shutil.copytree(fixture, dst)
         state = CognitiveState(sid="selfcheck", target="https://t.example")
@@ -959,7 +1010,7 @@ def _run_self_check() -> int:
         from engine.knowledge import load_cards
         import tempfile
         cards = load_cards()
-        tmp = pathlib.Path(tempfile.mkdtemp())
+        tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
         cl = CandidateLedger()
         dim_text = (
             "DIM: object-ownership | CANDIDATE: 换 attacker 读取他人订单 | need:owner建单+attacker改单号 | P1 | probe:三步越权\n"
@@ -1072,7 +1123,7 @@ def _run_self_check() -> int:
         from engine.candidate import CandidateLedger, compute_coverage_gaps, coverage_gaps_nonempty
         from engine.orchestrator import CognitiveState, _conclude, harvest_evidence
         import tempfile
-        tmp = pathlib.Path(tempfile.mkdtemp())
+        tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
         cl = CandidateLedger(candidates=[{
             "candidate_id": "cand_001", "surface_id": "GET /api/x id [user] {object-ownership,idor}",
             "endpoint": "/api/x", "method": "GET", "status": "proof_ready",
@@ -1107,7 +1158,7 @@ def _run_self_check() -> int:
                 assert "phase: recall" in prompt, "无候选首轮应进入 recall phase"
                 yield "DIM: input-validation | NONE: 本轮无候选\nLOW_ROI\n"
 
-        tmp = pathlib.Path(tempfile.mkdtemp()) / "runs" / "sess-phase"
+        tmp = pathlib.Path(tempfile.mkdtemp()).resolve() / "runs" / "sess-phase"
         tmp.mkdir(parents=True)
         out = run_session(
             PhaseAdapter(),
@@ -1132,7 +1183,7 @@ def _run_self_check() -> int:
     def _assert17():
         """run.py score 只读赛后产物并写 scorecard.json/md。"""
         import tempfile
-        tmp = pathlib.Path(tempfile.mkdtemp()) / "runs" / "sess-score"
+        tmp = pathlib.Path(tempfile.mkdtemp()).resolve() / "runs" / "sess-score"
         tmp.mkdir(parents=True)
         oracle = tmp / "oracle.json"
         oracle.write_text(json.dumps([{
@@ -1361,7 +1412,7 @@ def _run_self_check() -> int:
     def _assert23():
         """v8.6.1 端到端: surface_budget 限制 METHOD/path Surface。"""
         import tempfile
-        _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_rc3_"))
+        _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_rc3_")).resolve()
         try:
             res = _run_budget_dryrun(_fdir)
             sched = res.get("scheduler_stats", {})
@@ -1407,7 +1458,7 @@ def _run_self_check() -> int:
         import tempfile, json
         from engine.orchestrator import NEGATIVE_WITH_EVIDENCE, run_session, MockAdapter
         from engine.project_state import ProjectStateStore
-        _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_deep_"))
+        _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_deep_")).resolve()
         try:
             _proj = _fdir / "deep_proj"
             _proj.mkdir(parents=True, exist_ok=True)
@@ -1461,7 +1512,7 @@ def _run_self_check() -> int:
         """rc3 端到端: 浅阴性 run2 保持 open（不被深阴性误继承为 skip）"""
         import tempfile, json
         from engine.orchestrator import SKIPPED, run_session, MockAdapter
-        _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_shallow_"))
+        _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_shallow_")).resolve()
         try:
             _proj = _fdir / "shallow_proj"
             _proj.mkdir(parents=True, exist_ok=True)
@@ -1547,7 +1598,7 @@ def _run_self_check() -> int:
         """rc3 端到端: summary 有 domains_covered、无 domains_coveraged、
         含 business_graph_open_high_value、scheduler_stats 非空"""
         import tempfile, json
-        _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_summary_"))
+        _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_summary_")).resolve()
         try:
             res = _run_budget_dryrun(_fdir)
             _bad = "domains_cover" + "aged"  # avoid self-match
@@ -1570,10 +1621,10 @@ def _run_self_check() -> int:
             shutil.rmtree(_fdir, ignore_errors=True)
 
     def _assert29():
-        """rc3: run_summary.md 生成 + 四权威产物失效导致 self-check fail"""
+        """Finalizer projections exist without promoting incomplete graph truth."""
         import tempfile, json, pathlib as _p
         from engine.orchestrator import run_session, MockAdapter
-        _fdir = _p.Path(tempfile.mkdtemp(prefix="selfcheck_auth_"))
+        _fdir = _p.Path(tempfile.mkdtemp(prefix="selfcheck_auth_")).resolve()
         try:
             _proj = _fdir / "auth_proj"
             _proj.mkdir(parents=True, exist_ok=True)
@@ -1592,8 +1643,17 @@ def _run_self_check() -> int:
             assert _rs.exists(), f"run_summary.md 未生成: {_rs}"
             # run_scope.json 应存在
             assert (_proj / "run_scope.json").exists(), "run_scope.json 未生成"
-            # business_graph.json 应存在
-            assert (_proj / "business_graph.json").exists(), "business_graph.json 未生成"
+            # business_graph is cumulative project truth and is published only
+            # after full closure.  This fixture remains incomplete under the
+            # v8.9 exact-role denominator, so it must not leak a partial graph.
+            _run_complete = bool(
+                (res.get("delivery_status") or {}).get("run_complete"))
+            if _run_complete:
+                assert (_proj / "business_graph.json").exists(), (
+                    "完整 run 未生成 business_graph.json")
+            else:
+                assert not (_proj / "business_graph.json").exists(), (
+                    "未闭合 run 不得发布 business_graph.json 项目真值")
             # blackboard.json 应存在（_conclude 写回）
             assert (_proj / "blackboard.json").exists(), "blackboard.json 未生成"
             # 验证 run_scope.json 全 canonical
@@ -1601,8 +1661,8 @@ def _run_self_check() -> int:
             from engine.surface_key import is_canonical
             for k in scope.get("must_test", []):
                 assert is_canonical(k), f"run_scope must_test 含非 canonical key: {k!r}"
-            print("  断言29 ✅ run_summary.md + run_scope.json + business_graph.json + "
-                  "blackboard.json 四权威产物生成且 must_test 全 canonical")
+            print("  断言29 ✅ run_summary/run_scope/blackboard 投影生成，"
+                  "business_graph 按 closure gate 发布，must_test 全 canonical")
         finally:
             import shutil
             shutil.rmtree(_fdir, ignore_errors=True)
@@ -1681,6 +1741,18 @@ def main():
                     help="--identity 凭据的注入方式：cookie→Cookie 头；bearer→Authorization: Bearer")
     ap.add_argument("--model", default="gpt-5.5", help="模型名（换模型只改这里）")
     ap.add_argument("--allow", action="append", default=[], help="额外授权 host（可多次）")
+    ap.add_argument("--base-path", default="",
+                    help="显式应用根路径（如 /range/pentest/shop/）；不从 target 的 /login/ 等入口猜测")
+    ap.add_argument("--allow-path", action="append", default=[],
+                    help="授权路径前缀（可多次，写入 manifest；当前 Codex backend 不提供 hard pre-exec）")
+    ap.add_argument("--deny-path", action="append", default=[],
+                    help="禁止路径前缀（可多次，供产物验证；当前 Codex backend 不提供 hard pre-exec）")
+    ap.add_argument("--allow-unrestricted-egress", action="store_true",
+                    help="危险降级：允许当前 Codex backend 的非受控网络；不会标记为 preexec_enforced")
+    ap.add_argument("--target-fingerprint", default="",
+                    help="显式部署 fingerprint；v8.9 只保存/比较，不自动把历史 cell 标 stale")
+    ap.add_argument("--target-fingerprint-file", default="",
+                    help="从文件读取显式部署 fingerprint（与 --target-fingerprint 二选一）")
     ap.add_argument("--identity", action="append", default=[],
                     help="复验身份 label:cred（cookie 模式如 owner:session=A；bearer 模式如 owner:eyJ...；可多次）")
     ap.add_argument("--victim-marker", default="", help="证明越权的受害者数据特征串")
@@ -1754,6 +1826,27 @@ def main():
     # 非 self-check：--target/--authz 仍为必填（argparse 层已放宽为非 required 以放行 --self-check）。
     if not args.target or not args.authz:
         ap.error("--target 与 --authz 为必填（自检门用 --self-check，可不带这两参数）")
+    if args.target_fingerprint and args.target_fingerprint_file:
+        ap.error("--target-fingerprint 与 --target-fingerprint-file 不能同时使用")
+    if not args.dry_run and not args.allow_unrestricted_egress:
+        ap.error(
+            "当前 Codex backend 无法证明命令执行前的 host/path 出站约束；"
+            "live run 默认拒绝。若明确接受风险，传 --allow-unrestricted-egress"
+        )
+    try:
+        explicit_base_path = normalize_explicit_base_path(args.base_path)
+    except ValueError as exc:
+        ap.error(str(exc))
+    if args.target_fingerprint_file:
+        fingerprint_path = pathlib.Path(args.target_fingerprint_file)
+        try:
+            target_fingerprint = fingerprint_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            ap.error(f"无法读取 --target-fingerprint-file: {exc}")
+    else:
+        target_fingerprint = args.target_fingerprint.strip()
+    if (args.target_fingerprint or args.target_fingerprint_file) and not target_fingerprint:
+        ap.error("target fingerprint 不能为空")
 
     # 会话目录与落盘（runs/ 已被 .gitignore）
     os.umask(0o077)
@@ -1764,8 +1857,8 @@ def main():
     except ValueError as exc:
         ap.error(str(exc))
     # v8.6: project-level state layout
-    _project_slug = safe_project_slug(args.project or (
-        host_of(args.target).replace(".", "_") if args.target else "")
+    _project_slug = safe_project_slug(
+        args.project or default_project_slug(args.target, base_path=explicit_base_path)
     )
     if _project_slug:
         project_dir = ROOT / "runs" / "targets" / _project_slug
@@ -1818,6 +1911,14 @@ def main():
     if any(parse_authorized_scope(scope) is None for scope in raw_scopes):
         ap.error("--allow 必须是合法的 host、host:port、*.domain 或 http(s) URL")
     hosts = normalize_authorized_scopes(raw_scopes)
+    try:
+        allow_paths = [normalize_explicit_base_path(value) for value in args.allow_path]
+        deny_paths = [normalize_explicit_base_path(value) for value in args.deny_path]
+    except ValueError as exc:
+        ap.error(str(exc))
+    authorization_assurance = (
+        "dry_run_no_network" if args.dry_run else "unrestricted_user_accepted"
+    )
 
     # 覆盖矩阵的攻击面来源（支柱 2）：
     #   ① --endpoints：文件(每行一个，# 注释) 或逗号分隔
@@ -1856,7 +1957,7 @@ def main():
         inv_records = [
             {
                 "endpoint": s.get("endpoint", ""),
-                "method": s.get("method", "GET"),
+                "method": s.get("method") or "",
                 "source": s.get("source", "manual"),
                 "source_file": s.get("source_file", ""),
                 "source_line": s.get("source_line", 0),
@@ -1871,23 +1972,37 @@ def main():
 
     # 正式覆盖跑统一落 endpoint 台账：--endpoints-only 也必须有 inventory.json，
     # 这样 session_gate 能解释 endpoint 来源，报告引用未登记面也能被拦住。
-    if endpoints or args.recon_dir:
+    unresolved_inventory: list[dict] = []
+    if args.endpoints or args.recon_dir:
         inv_path = wd / "inventory.json"
         existing_discovered = []
+        existing_unresolved = []
         if inv_path.exists():
             try:
                 old = json.loads(inv_path.read_text(encoding="utf-8"))
                 old_recs = old.get("endpoints") if isinstance(old, dict) else old
                 existing_discovered = [r for r in old_recs
                                        if isinstance(r, dict) and r.get("discovered_during_testing")]
+                if isinstance(old, dict):
+                    existing_unresolved = [
+                        r for r in (old.get("unresolved") or [])
+                        if isinstance(r, dict)
+                    ]
             except Exception:
                 existing_discovered = []
-        inv_records = _merge_inventory_records(
-            _filter_endpoint_records(inventory_records + existing_discovered, args.exclude_endpoint))
-        inv_path.write_text(
-            json.dumps({"endpoints": inv_records,
-                        "saturation_reached": is_saturated(inv_records)},
-                       ensure_ascii=False, indent=2), encoding="utf-8")
+                existing_unresolved = []
+        inv_records = _merge_inventory_records(_filter_endpoint_records(
+            inventory_records + existing_discovered + existing_unresolved,
+            args.exclude_endpoint))
+        resolved_inventory = [row for row in inv_records if row.get("method")]
+        unresolved_inventory = [row for row in inv_records if not row.get("method")]
+        _write_runtime_inventory(
+            inv_path,
+            {"endpoints": resolved_inventory,
+             "unresolved": unresolved_inventory,
+             "saturation_reached": is_saturated(resolved_inventory)},
+            root=wd,
+        )
 
     # v8.8: subsequent runs may start from authoritative project inventory.
     project_inventory_count = 0
@@ -1925,13 +2040,19 @@ def main():
         adapter, verify_fn = MockAdapter(wd), None      # dry-run 不联网复验
     else:
         from codex.codex_adapter import CodexAdapter
-        adapter = CodexAdapter(model=args.model, workdir=str(wd), allow_hosts=hosts)
+        adapter = CodexAdapter(
+            model=args.model,
+            workdir=str(wd),
+            allow_hosts=hosts,
+            allow_unrestricted_egress=args.allow_unrestricted_egress,
+        )
         verify_fn = build_verify_fn(
             identities, args.victim_marker, hosts, owner_label=args.owner_label)
 
     target = args.target + (f"\n（本会话凭据见 {wd/'cookies.txt'}，按其中的 header 行原样带上）" if cred else "")
 
     print(f"▶ 会话 {sid} ｜ 模型 {'mock' if args.dry_run else args.model} ｜ 授权 host {hosts}")
+    print(f"  网络保证: {authorization_assurance} ｜ preexec_enforced=false")
     print(f"  复验: {'开（'+','.join(identities)+'）' if verify_fn else '关'} ｜ 工作目录 {wd}")
     auth_flow_note = " + auth-flow gated" if (args.enable_auth_flow_column or not args.vuln_class) else ""
     if args.recon_dir:
@@ -1963,6 +2084,7 @@ def main():
         "confirm_policy": args.confirm_policy,
         "skill_hint": hint,
         "endpoints": inventory,
+        "unresolved_endpoints": unresolved_inventory,
         "vuln_classes": (args.vuln_class or None),
         "resume": args.resume,
     }
@@ -1980,6 +2102,18 @@ def main():
         run_kwargs["lens"] = [x.strip() for x in args.lens.split(",") if x.strip()]
     if "exclude_endpoints" in inspect.signature(run_session).parameters:
         run_kwargs["exclude_endpoints"] = args.exclude_endpoint
+    optional_runtime_args = {
+        "base_path": explicit_base_path,
+        "base_path_explicit": bool(args.base_path),
+        "allow_paths": allow_paths,
+        "deny_paths": deny_paths,
+        "authorization_assurance": authorization_assurance,
+        "target_fingerprint": target_fingerprint,
+    }
+    run_parameters = inspect.signature(run_session).parameters
+    for key, value in optional_runtime_args.items():
+        if key in run_parameters:
+            run_kwargs[key] = value
     # v8.6: project-level state — domain scope + budgets
     if _target_domains:
         run_kwargs["target_domains"] = _target_domains
@@ -1988,131 +2122,18 @@ def main():
     if args.intent_budget:
         run_kwargs["intent_budget"] = args.intent_budget
     res = run_session(adapter, **run_kwargs)
-    # 硬门：正式覆盖跑必须同时有 inventory 与 ledger；否则终态强制 incomplete。
     led_stats = (res.get("coverage_ledger") or {}).get("stats") or {}
-    inv_missing = not (wd / "inventory.json").exists()
-    ledger_path = pathlib.Path(res.get("coverage_ledger_path") or (wd / "coverage-ledger.json"))
-    ledger_missing = not ledger_path.exists()
-    if (inv_missing or ledger_missing or led_stats.get("total", 0) == 0) and not args.ad_hoc:
-        print("✗ 正式覆盖跑缺少 inventory/coverage-ledger 或 surface 数为 0 → 终态强制 incomplete")
-        res["status"] = "incomplete"
-    # 落 summary.json：结构对齐 engine.benchmark_eval.load_findings（dict 含 findings 键，每条行有 endpoint）。
-    # aggregate_findings 用 root_cause/affected_role 命名，benchmark_eval 读 class/roles，故在此产物里补字段映射
-    # （不改 aggregate_findings 本身）。落盘失败不阻断收尾打印。
-    summary_path = wd / "summary.json"
-    delivery_status_path = wd / "delivery_status.json"
-    summary = None
-    try:
-        summary_findings = _summary_findings(res)
-        manifest_data = json.loads(
-            (wd / "run_manifest.json").read_text(encoding="utf-8"))
-        authority_manifest_path = pathlib.Path(
-            manifest_data.get("authority_path") or wd / "run_manifest.json")
-        summary_consistency_errors = [
-            err for finding in summary_findings
-            for err in finding.get("consistency_errors", [])
-        ]
-        if summary_consistency_errors:
-            res.setdefault("persistence_errors", []).extend(
-                f"summary_consistency:{err}" for err in summary_consistency_errors)
-            if res.get("status") in {"complete", "vuln_found", "low_roi"}:
-                res["status"] = "incomplete"
-        summary = {
-            "atoolkit_version": __version__,
-            "findings": summary_findings,
-            "legacy_candidates": [
-                _map_finding_for_summary(f, i)
-                for i, f in enumerate(res.get("legacy_candidates") or [])
-            ],
-            "status": _summary_status(res),
-            "accepted": res.get("accepted", []),
-            "coverage_ledger_path": res.get("coverage_ledger_path"),
-            "session_gate": res.get("session_gate"),
-            "turn": res.get("turn"),
-            "marker": res.get("marker"),
-            "final_report_path": res.get("final_report_path"),
-            "final_report_status": res.get("final_report_status", "not_generated"),
-            "structured_findings": res.get("structured_findings", {"accepted": 0, "rejected": 0}),
-            "run_manifest_path": str((wd / "run_manifest.json").resolve()),
-            "authority_manifest_path": str(authority_manifest_path),
-            "authority_manifest_sha256": (
-                sha256_file(authority_manifest_path)
-                if authority_manifest_path.is_file() else ""),
-            "source_revision": manifest_data.get("source_revision", ""),
-            "source_dirty": manifest_data.get("source_dirty"),
-            "finding_validation_path": str((wd / "finding_validation.json").resolve()),
-            "finding_validation_sha256": (res.get("validation_artifact") or {}).get("sha256", ""),
-            "project_state_path": res.get("project_state_path", ""),
-            "project_state_delta": res.get("project_state_delta", {}),
-            "run_receipt_path": str((wd / "run_receipt.json").resolve()),
-            "run_receipt_status": "bound_by_post_summary_receipt",
-            "consistency_errors": summary_consistency_errors,
-        }
-        # v8.6: project-level state paths and stats
-        if project_dir:
-            summary["project_path"] = str(project_dir)
-            summary["blackboard_path"] = str(project_dir / "blackboard.json")
-            summary["business_graph_path"] = str(project_dir / "business_graph.json")
-            summary["run_scope_path"] = str(project_dir / "run_scope.json")
-        summary["graph_stats"] = res.get("graph_stats", {})
-        summary["scheduler_stats"] = res.get("scheduler_stats", {})
-        summary["domains_covered"] = res.get("domains_covered", {})
-        summary["business_graph_open_high_value"] = res.get("business_graph_open_high_value", [])
-        summary["persistence_errors"] = res.get("persistence_errors", [])
-        _atomic_write_json(summary_path, summary)
-    except Exception as _e:                       # 落盘失败不阻断收尾打印
-        print(f"  ⚠ 落 summary.json 失败: {type(_e).__name__}: {_e}", file=sys.stderr)
-    try:
-        receipt_artifacts = {
-            "summary": wd / "summary.json",
-            "finding_validation": wd / "finding_validation.json",
-            "coverage_ledger": wd / "coverage-ledger.json",
-        }
-        if (wd / "candidate-ledger.json").is_file():
-            receipt_artifacts["candidate_ledger"] = wd / "candidate-ledger.json"
-        if res.get("project_state_path") and pathlib.Path(res["project_state_path"]).is_file():
-            receipt_artifacts["project_state"] = pathlib.Path(res["project_state_path"])
-        receipt = write_run_receipt(
-            wd / "run_receipt.json",
-            manifest_path=wd / "run_manifest.json",
-            artifacts=receipt_artifacts,
-            project_state_delta=res.get("project_state_delta") or {},
+    delivery = res.get("delivery_status") or {}
+    if delivery:
+        print(
+            f"交付: {delivery.get('status')} | integrity="
+            f"{delivery.get('integrity_valid')} | complete="
+            f"{delivery.get('delivery_complete')} | assurance="
+            f"{delivery.get('authorization_assurance')}"
         )
-        _atomic_write_json(delivery_status_path, {
-            "schema_version": 1,
-            "status": "artifacts_bound",
-            "run_status": res.get("status"),
-            "validation_status": (res.get("validation_artifact") or {}).get("status"),
-            "validation_exit_code": (res.get("validation_artifact") or {}).get("exit_code"),
-            "summary_path": str(summary_path.resolve()),
-            "summary_sha256": sha256_file(summary_path),
-            "run_receipt_path": str((wd / "run_receipt.json").resolve()),
-            "run_receipt_sha256": sha256_file(wd / "run_receipt.json"),
-            "receipt_content_sha256": receipt.get("receipt_sha256", ""),
-        })
-    except Exception as _e:
-        res.setdefault("persistence_errors", []).append(
-            f"run_receipt:{type(_e).__name__}:{_e}")
-        if res.get("status") in {"complete", "vuln_found", "low_roi", "no_work"}:
-            res["status"] = "incomplete"
-        try:
-            if not isinstance(summary, dict) and summary_path.is_file():
-                summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            if isinstance(summary, dict):
-                summary["status"] = _summary_status(res)
-                summary["run_receipt_status"] = "failed"
-                summary["persistence_errors"] = list(res.get("persistence_errors") or [])
-                _atomic_write_json(summary_path, summary)
-            _atomic_write_json(delivery_status_path, {
-                "schema_version": 1,
-                "status": "failed",
-                "run_receipt_path": str((wd / "run_receipt.json").resolve()),
-                "error": f"{type(_e).__name__}: {_e}",
-            })
-        except Exception as status_error:
-            print(f"  ⚠ 回写交付失败状态失败: {type(status_error).__name__}: {status_error}",
-                  file=sys.stderr)
-        print(f"  ⚠ 落 run_receipt.json 失败: {type(_e).__name__}: {_e}", file=sys.stderr)
+    else:
+        res.setdefault("persistence_errors", []).append("shared_finalizer:missing_delivery")
+        res["status"] = "incomplete"
     print("─" * 60)
     print(f"终态: {res['status']} ｜ 标记: {res.get('marker')} ｜ 轮次: {res['turn']}")
     if "accepted" in res:          # error/needs_confirm 终态返回里没有 Guardian 账本
@@ -2173,7 +2194,9 @@ def main():
         print(f"⚠ 流式中断已抢救（{res.get('error')}）；已落盘证据在 {wd}")
         print(f"  断点续测: python3 run.py --sid {sid} --resume --target {args.target} --authz <...> [--cookie/--bearer ...]")
     print(f"证据/报告/状态/日志: {wd}（事件流见 events.jsonl）")
-    return 0 if res["status"] in {"vuln_found", "complete", "no_work"} else 1
+    if isinstance(delivery, dict) and "exit_code" in delivery:
+        return int(delivery.get("exit_code", 3))
+    return 3
 
 
 if __name__ == "__main__":

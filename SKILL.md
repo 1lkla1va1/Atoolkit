@@ -1,7 +1,7 @@
 ---
 name: Atoolkit
 description: Authorized AI-assisted SRC/bug-bounty vulnerability research toolkit. Use whenever the user wants to read, install, configure, or run this Atoolkit package; mentions SRC 漏洞挖掘, 授权靶场, bug bounty, Codex AGENTS.md, /src, Guardian 质检, PoC 复验, or model-independent security testing automation. Only proceed for clearly authorized defensive testing or educational lab contexts.
-version: 8.8.0
+version: 8.9.0
 ---
 
 # Atoolkit Skill
@@ -34,14 +34,36 @@ Paths in this skill are relative to the skill package root.
 
 ## Skill Mode Runtime
 
-When not using `run.py` engine, run by this framework:
+There are two Skill trust levels, plus a backend capability gate:
+
+- **Attested Wrapped Skill Mode (eligible for verification)**: an external host invokes
+  `python3 -m engine.skill_wrapper`, freezes the run plan outside the agent
+  writable root, waits for the agent to stop, then runs the exactly-once
+  finalizer. This is the only Skill path eligible to set
+  `authority_trusted=true`, and only when its supervisor can attest that every
+  descendant is contained and quiescent.
+- **Bundled local wrapper (diagnostic today)**: a POSIX process group cannot
+  contain descendants that call `setsid()`. The bundled backend therefore
+  reports `process_containment_verified=false`, refuses ProjectState mutation,
+  and exits incomplete even though its session artifacts remain reviewable.
+- **Direct Skill Mode (diagnostic)**: the same agent invokes init/finalize in
+  its own writable workspace. Its artifacts are useful for review, but the
+  finalizer returns untrusted/incomplete and must never claim tamper-resistant
+  delivery.
+
+Use Engine Mode or the wrapper for canonical session diagnostics. Do not claim
+trusted cross-run delivery with the bundled Codex backends until an attested
+cgroup/job/container supervisor is integrated.
 
 ### Startup sequence
 
 1. Read `authz.md` and confirm the absolute primary target and every authorized scope.
-2. Before the first network action, create `run_manifest.json` with `python3 -m engine.runtime_manifest init-manifest --mode skill --run-dir <session> --primary-target <url> --allow <scope> --authz-file <authz.md> --instruction AGENTS.md --instruction SKILL.md`. A manifest failure is a hard stop.
+2. Before the agent starts, the external wrapper creates the authority identity,
+   `run_manifest.json`, and frozen `run_plan.json`. A manifest/run-plan failure
+   is a hard stop. Running `init-manifest` from Direct Skill Mode is diagnostic,
+   not an independent trust anchor.
 3. Load `<project>/project_state.json` when present. It is the cross-run authority; `blackboard.json`, `business_graph.json`, and summaries are derived views only.
-4. Read `hint.md`, then execute Phase 0 recon per `skill/recon-checklist.md` and initialize the coverage ledger from `attack_surface_list.md`.
+4. Read `hint.md`, then execute Phase 0 recon per `skill/recon-checklist.md` and initialize authoritative JSON `inventory.json` plus `coverage-ledger.json`. `attack_surface_list.md` is a derived human view, not the closure source.
 5. Merge new inventory into project inventory by asset + method + path. Unknown methods stay unresolved and must not default to GET.
 6. Restore coverage only for an exact asset + method/path + param + role + vuln-class cell, then schedule pending Intents and still-open cells.
 
@@ -59,7 +81,23 @@ For each surface in the queue:
 
 ### Termination self-check
 
-At session end, run all checks in the Skill Mode self-check list (§9 of the core skill file), then run `python3 -m engine.reporting.cli <session>`. Empty findings fail with exit 2 unless `--allow-empty` is explicitly supplied and inventory, coverage, and candidate gates are complete. Finally create `run_receipt.json` with `python3 -m engine.runtime_manifest receipt --run-dir <session>`.
+At session end, run all checks in the Skill Mode self-check list (§9 of the
+core skill file). The external wrapper must then stop the saved agent process
+group and call the shared finalizer. Process-group cleanup alone is not
+containment, so the bundled wrapper remains diagnostic. Do not use the loose
+`runtime_manifest receipt` command as a completion claim; it only produces a
+diagnostic receipt.
+
+```bash
+python3 -m engine.skill_wrapper \
+  --run-dir <session> --project-dir <project> \
+  --authority-dir <outside-agent-writable-root> \
+  --target <url> --inventory <inventory.json> -- \
+  codex exec <task>
+```
+
+Finalizer exit codes are `0=verified complete`, `1=invalid/conflict`,
+`2=incomplete, uncontained, or direct-self-authorized`, `3=operational error`.
 
 ## Fact-Intent Protocol
 
@@ -117,7 +155,7 @@ For targets requiring multiple runs (large SRC programs, 50+ endpoints):
 
 ### Before testing (run startup)
 
-1. Load or initialize `runs/targets/{target}/project_state.json` (schema 1).
+1. Load or migrate `runs/targets/{target}/project_state.json` (schema 2).
 2. Merge project inventory into this session before recon; recon is incremental, not a reset.
 3. Restore only exact role-aware coverage cells. Unknown role is not a wildcard, and legacy facts without evidence remain pending revalidation.
 4. Add pending Intents to the work queue, followed by open/high-value cells. A fully closed matrix with no pending Intent is a valid no-work run and must not call a model.
@@ -125,14 +163,18 @@ For targets requiring multiple runs (large SRC programs, 50+ endpoints):
 ### After testing (run shutdown)
 
 1. Run deterministic finding validation; only accepted + proof-confirmed + `claim.kind=root_finding` entries may enter the project finding registry.
-2. Commit inventory, exact coverage cells, root-finding fingerprints, negatives, Intents, and run history atomically to `project_state.json`.
+2. For an attested run, the shared finalizer commits the outcome whitelist through a journaled,
+   exactly-once transaction. Invalid proof commits no project truth;
+   incomplete-with-findings commits only proof-valid roots and deterministic
+   derived surfaces. An untrusted run commits no project truth at all.
 3. Regenerate `blackboard.json`, `business_graph.json`, `run_scope.json`, and summaries as compatibility views; never merge them back as equal authorities.
-4. Write `run_receipt.json`, binding the immutable start manifest to validation, coverage, summary, and project-state delta hashes.
+4. Bind `run_receipt.json` to an immutable project commit snapshot and the
+   host authority anchor. Never bind the mutable live `project_state.json`.
 
 ### Directory structure
 
     runs/{target}/
-      project_state.json       # authoritative, revisioned cross-run truth
+      project_state.json       # authoritative, revisioned cross-run truth (schema 2)
       .atoolkit/manifests/     # authority copies outside session write scope
       blackboard.json          # derived compatibility view
       business_graph.json      # derived endpoint→domain view
@@ -142,8 +184,10 @@ For targets requiring multiple runs (large SRC programs, 50+ endpoints):
 
 An optional `sessions/run_NNN/dead_ends.json` may close a cell across runs only
 when it carries the exact asset/method/path/param/role/vulnerability identity,
-an enumerated not-applicable reason code, a concrete refutation, and physical
-evidence references. Ordinary model/budget skips never enter project truth.
+explicit `namespace`, `param_location`, `subject_role`, and `object_kind`
+fields (empty strings are valid), an enumerated not-applicable reason code, a
+concrete refutation, and physical evidence references. Ordinary model/budget
+skips never enter project truth.
 
 ## Domain Scope Declaration
 
@@ -223,26 +267,38 @@ python3 run.py --dry-run --target https://t.example --authz "demo"
 Only after the user provides scope and fresh human-obtained credentials:
 
 ```bash
-python3 run.py --target https://授权目标 --authz "已授权说明" --cookie 'session=…'
+python3 run.py --target https://授权目标 --authz "已授权说明" --cookie 'session=…' \
+  --allow-unrestricted-egress
 ```
+
+The current Codex backend cannot prove pre-exec egress enforcement. Live runs
+therefore fail closed unless `--allow-unrestricted-egress` is explicitly
+accepted; this downgrade is recorded and cannot produce an
+`authorization_assurance=preexec_enforced` claim.
 
 For Bearer auth use:
 
 ```bash
-python3 run.py --target https://授权目标 --authz "已授权说明" --bearer 'eyJ…' --auth-scheme bearer
+python3 run.py --target https://授权目标 --authz "已授权说明" --bearer 'eyJ…' \
+  --auth-scheme bearer --allow-unrestricted-egress
 ```
 
 If deterministic IDOR replay is requested, require at least two authorized identities and a safe victim marker, then use `--identity` and `--victim-marker` as documented in `run.py`.
 
 ### 4. Run Skill Mode session (QoderWork / any agent)
 
-1. Read project-root `AGENTS.md`, `SKILL.md`, `authz.md`, and `hint.md`.
-2. Create the pre-network manifest with the full `engine.runtime_manifest init-manifest` command in Startup sequence.
-3. Restore `project_state.json`, then execute incremental Phase 0 per `skill/recon-checklist.md`.
-4. Run the per-surface loop with self-check and write canonical findings + negative records.
-5. Run `python3 -m engine.reporting.cli <run_dir> --output finding_validation.json`.
-6. Only validation `normalized_findings` may enter summary/project registry; rejected items remain candidates.
-7. Run `python3 -m engine.runtime_manifest receipt --run-dir <run_dir>` and the termination self-check.
+1. From an external host terminal, invoke `python3 -m engine.skill_wrapper`
+   with run/project/authority directories and the `codex exec` command.
+2. The wrapper creates manifest and frozen run plan before the agent starts.
+3. The agent restores the supplied project projection, executes incremental
+   Phase 0, and writes canonical JSON ledgers/findings/evidence in its run root.
+4. The wrapper waits for agent termination, snapshots inputs, evaluates proof
+   and closure, anchors/verifies the session receipt, then writes delivery
+   status. It performs the exactly-once project commit only when an external
+   containment backend has supplied a verified attestation; the bundled local
+   backend deliberately refuses that promotion.
+5. Direct agent invocation of reporting/receipt remains diagnostic and exits
+   incomplete when it cannot prove an external authority boundary.
 
 ## Skill Mode Finding Schema
 
