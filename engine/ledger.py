@@ -30,14 +30,9 @@ STATUS_CONFIRMED = "confirmed"
 STATUS_NOT_VULNERABLE = "not_vulnerable"
 STATUS_BLOCKED = "blocked"
 STATUS_NOT_APPLICABLE = "not_applicable"
-
-# "shallow_negative" is the matrix/legacy state for a negative that lacks
-# sufficient evidence. normalize_status collapses it onto STATUS_NOT_TESTED
-# (see LEGACY_STATUS_MAP), which would make a shallow negative indistinguishable
-# from a genuinely untested surface in the ledger. The raw token is kept as a
-# named constant so normalize_surface can tag such surfaces with a
-# `negative_depth="shallow"` marker that the session-gate reads.
-SHALLOW_NEGATIVE = "shallow_negative"
+STATUS_SHALLOW_NEGATIVE = "shallow_negative"
+STATUS_EXPLORING = "exploring"
+SHALLOW_NEGATIVE = STATUS_SHALLOW_NEGATIVE
 
 VALID_STATUSES = {
     STATUS_NOT_TESTED,
@@ -45,13 +40,16 @@ VALID_STATUSES = {
     STATUS_NOT_VULNERABLE,
     STATUS_BLOCKED,
     STATUS_NOT_APPLICABLE,
+    STATUS_SHALLOW_NEGATIVE,
+    STATUS_EXPLORING,
 }
 
 LEGACY_STATUS_MAP = {
     "untested": STATUS_NOT_TESTED,
     "positive": STATUS_CONFIRMED,
     "negative_with_evidence": STATUS_NOT_VULNERABLE,
-    "shallow_negative": STATUS_NOT_TESTED,
+    "shallow_negative": STATUS_SHALLOW_NEGATIVE,
+    "exploring": STATUS_EXPLORING,
     "skipped": STATUS_NOT_APPLICABLE,
     "negative": STATUS_NOT_VULNERABLE,
     "confirmed": STATUS_CONFIRMED,
@@ -347,7 +345,10 @@ class CoverageLedger:
         for surface in self.surfaces:
             status = normalize_status(surface.get("status", STATUS_NOT_TESTED))
             counts[status] = counts.get(status, 0) + 1
-            if is_high_value(surface) and status in {STATUS_NOT_TESTED, STATUS_BLOCKED}:
+            if is_high_value(surface) and status in {
+                STATUS_NOT_TESTED, STATUS_SHALLOW_NEGATIVE,
+                STATUS_BLOCKED, STATUS_EXPLORING,
+            }:
                 high_value_open += 1
             if surface.get("in_run_scope") is False:
                 out_of_run += 1
@@ -355,11 +356,17 @@ class CoverageLedger:
                 in_scope_total += 1
                 if status in {STATUS_CONFIRMED, STATUS_NOT_VULNERABLE, STATUS_NOT_APPLICABLE}:
                     in_scope_closed += 1
-                elif status in {STATUS_NOT_TESTED, STATUS_BLOCKED}:
+                elif status in {
+                    STATUS_NOT_TESTED, STATUS_SHALLOW_NEGATIVE,
+                    STATUS_BLOCKED, STATUS_EXPLORING,
+                }:
                     in_scope_open += 1
         counts["total"] = len(self.surfaces)
         counts["closed"] = counts.get(STATUS_CONFIRMED, 0) + counts.get(STATUS_NOT_VULNERABLE, 0) + counts.get(STATUS_NOT_APPLICABLE, 0)
-        counts["open"] = counts.get(STATUS_NOT_TESTED, 0) + counts.get(STATUS_BLOCKED, 0)
+        counts["open"] = sum(counts.get(status, 0) for status in (
+            STATUS_NOT_TESTED, STATUS_SHALLOW_NEGATIVE,
+            STATUS_BLOCKED, STATUS_EXPLORING,
+        ))
         counts["high_value_open"] = high_value_open
         counts["in_scope_total"] = in_scope_total
         counts["in_scope_closed"] = in_scope_closed
@@ -368,7 +375,13 @@ class CoverageLedger:
         return counts
 
     def next_surfaces(self, n: int = 10, *, high_value_first: bool = True) -> list[dict[str, Any]]:
-        candidates = [s for s in self.surfaces if normalize_status(s.get("status")) in {STATUS_NOT_TESTED, STATUS_BLOCKED}]
+        candidates = [
+            s for s in self.surfaces
+            if normalize_status(s.get("status")) in {
+                STATUS_NOT_TESTED, STATUS_SHALLOW_NEGATIVE,
+                STATUS_BLOCKED, STATUS_EXPLORING,
+            }
+        ]
         if high_value_first:
             def _prio(s: dict[str, Any]) -> tuple:
                 shallow = s.get("negative_depth") == "shallow" or str(s.get("status") or "").lower() == SHALLOW_NEGATIVE
@@ -397,7 +410,15 @@ def normalize_surface(surface: dict[str, Any]) -> dict[str, Any]:
     method = _clean_method(surface.get("method"))
     param = str(surface.get("param") or "").strip()
     roles = _dedupe(_as_list(surface.get("roles"))) or ["unknown"]
-    risk_tags = _dedupe(_as_list(surface.get("risk_tags"))) or infer_risk_tags(param, endpoint, surface.get("feature", ""))
+    risk_tags = infer_risk_tags(
+        param, endpoint, surface.get("feature", ""),
+        declared_tags=_as_list(surface.get("risk_tags")),
+        declared_classes=(
+            _as_list(surface.get("vuln_classes"))
+            + _as_list(surface.get("vuln_class"))
+            + _as_list(surface.get("legacy_vuln"))
+        ),
+    )
     if not risk_tags:
         risk_tags = ["general-review"]
     raw_status = str(surface.get("status") or "").strip().lower()
@@ -425,14 +446,9 @@ def normalize_surface(surface: dict[str, Any]) -> dict[str, Any]:
     for key, value in surface.items():
         if key not in data:
             data[key] = value
-    # Preserve the shallow_negative distinction across normalization. The marker
-    # is set when the raw status literally is shallow_negative, retained while
-    # the surface is still open (STATUS_NOT_TESTED, which is what shallow_negative
-    # normalizes to), and dropped once the surface advances to a closed/blocked
-    # state so a settled cell is not re-opened by the session-gate.
-    if raw_status == SHALLOW_NEGATIVE:
-        data["negative_depth"] = "shallow"
-    elif data.get("negative_depth") == "shallow" and normalized_status == STATUS_NOT_TESTED:
+    # Keep the legacy side marker readable, but status itself is authoritative
+    # in v8.10 and round-trips as shallow_negative.
+    if raw_status == SHALLOW_NEGATIVE or normalized_status == STATUS_SHALLOW_NEGATIVE:
         data["negative_depth"] = "shallow"
     else:
         data.pop("negative_depth", None)
@@ -447,10 +463,12 @@ def merge_surface(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
             dst[key] = src[key]
     status_order = {
         STATUS_NOT_TESTED: 0,
-        STATUS_BLOCKED: 1,
-        STATUS_NOT_APPLICABLE: 2,
-        STATUS_NOT_VULNERABLE: 3,
-        STATUS_CONFIRMED: 4,
+        STATUS_SHALLOW_NEGATIVE: 1,
+        STATUS_EXPLORING: 2,
+        STATUS_BLOCKED: 3,
+        STATUS_NOT_APPLICABLE: 4,
+        STATUS_NOT_VULNERABLE: 5,
+        STATUS_CONFIRMED: 6,
     }
     status_advanced = status_order.get(src.get("status"), 0) > status_order.get(dst.get("status"), 0)
     if status_advanced:
@@ -484,7 +502,7 @@ def merge_surface(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
         src.get("negative_depth_checked", False))
     # A closed surface is no longer a shallow negative: drop a stale marker so
     # the session-gate does not re-open a settled cell after a merge.
-    if normalize_status(dst.get("status")) not in {STATUS_NOT_TESTED, STATUS_BLOCKED}:
+    if normalize_status(dst.get("status")) != STATUS_SHALLOW_NEGATIVE:
         dst.pop("negative_depth", None)
     return dst
 
@@ -515,9 +533,6 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
         next_actions.extend(str(x) for x in _as_list(cell.get("needs")))
     blocker = cell.get("blocker")
     evidence_ref = cell.get("evidence") or cell.get("evidence_ref") or None
-    # surfaces_from_legacy_cell pre-normalizes status (so normalize_surface can
-    # no longer see the raw shallow_negative token). Tag the surface here so the
-    # marker survives the round-trip through add_surface/normalize_surface.
     negative_depth = "shallow" if cell_state == SHALLOW_NEGATIVE else None
     asset_id = canonical_asset(
         cell.get("asset_id") or surface_meta.get("asset_id") or "")

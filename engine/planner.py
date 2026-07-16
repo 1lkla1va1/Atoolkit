@@ -33,6 +33,23 @@ PARAM_RISK_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("status", "discount", "role", "state"), ("enum-tamper", "privilege")),
 )
 
+DECLARED_CLASS_RISK_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("sqli", "sql injection", "sql注入"), ("input-validation", "injection", "sqli")),
+    (("xss", "cross site scripting", "跨站"), ("input-validation", "xss")),
+    (("idor", "object authorization", "越权"), ("object-ownership", "idor")),
+    (("ssrf",), ("ssrf", "input-validation")),
+    (("file", "upload", "文件", "上传"), ("file-upload", "path-traversal")),
+    (("business", "amount", "payment", "业务", "支付"),
+     ("business-logic", "amount-tamper", "accounting")),
+    (("auth", "认证", "登录"), ("auth-flow", "auth-flow-abuse")),
+)
+
+_NON_SCALAR_PARAMS = {"file", "upload", "binary", "blob", "stream"}
+_TEXT_PARAMS = {
+    "name", "title", "description", "content", "comment", "message",
+    "shop_name", "nickname", "review", "feedback", "remark",
+}
+
 AUTH_FLOW_KEYWORDS = (
     "register", "login", "forgot", "password", "reset", "captcha", "sms",
     "verify-code", "verify_code", "audit", "lock", "unlock", "enum", "token",
@@ -174,13 +191,42 @@ def extract_params(endpoint: str, meta: dict[str, Any] | None = None) -> list[st
     return _dedupe(name for name, _location in extract_param_specs(endpoint, meta))
 
 
-def infer_risk_tags(param: str = "", endpoint: str = "", feature: str = "") -> list[str]:
-    """Return deterministic risk tags for a param/endpoint/feature tuple."""
+def infer_risk_tags(
+    param: str = "",
+    endpoint: str = "",
+    feature: str = "",
+    *,
+    declared_tags: Iterable[str] | None = None,
+    declared_classes: Iterable[str] | None = None,
+) -> list[str]:
+    """Return the union of declared and deterministic risk dimensions.
+
+    A declared inventory may add useful context, but it must never suppress a
+    parameter-derived dimension.  Every non-empty user-controlled parameter is
+    independently reviewed for input validation; scalar values also retain an
+    injection dimension even when their primary semantic is IDOR or business
+    logic.  This prevents "endpoint tested" from collapsing unrelated parameter
+    risks.
+    """
     hay = " ".join(_norm_token(x) for x in (param, endpoint, feature))
-    tags: list[str] = []
+    tags: list[str] = list(_dedupe(declared_tags or []))
+    declared_hay = " ".join(str(x or "").strip().lower() for x in (declared_classes or []))
+    for needles, risks in DECLARED_CLASS_RISK_RULES:
+        if any(needle in declared_hay for needle in needles):
+            tags.extend(risks)
     for names, risks in PARAM_RISK_RULES:
         if any(name in hay for name in names):
             tags.extend(risks)
+    normalized_param = _norm_token(param)
+    if normalized_param:
+        tags.append("input-validation")
+        if normalized_param not in _NON_SCALAR_PARAMS:
+            tags.append("injection")
+        if normalized_param in _TEXT_PARAMS or any(
+            normalized_param.endswith("_" + suffix)
+            for suffix in ("name", "title", "description", "content", "comment")
+        ):
+            tags.append("xss")
     if is_auth_flow_endpoint(endpoint, feature):
         tags.extend(["auth-flow", "auth-flow-abuse"])
     if any(word in hay for word in ("pay", "payment", "recharge", "refund", "coupon", "lottery")):
@@ -421,7 +467,20 @@ def plan_surfaces(endpoints: list[str | dict[str, Any]], *, default_roles: list[
             if not method:
                 continue
             for param, param_location in param_specs:
-                risk_tags = infer_risk_tags(param, clean_endpoint, feature)
+                risk_tags = infer_risk_tags(
+                    param,
+                    clean_endpoint,
+                    feature,
+                    declared_tags=(
+                        _as_list(meta.get("risk_tags"))
+                        + _as_list(meta.get("tags"))
+                    ),
+                    declared_classes=(
+                        _as_list(meta.get("vuln_classes"))
+                        + _as_list(meta.get("vuln_class"))
+                        + _as_list(meta.get("vuln"))
+                    ),
+                )
                 if not risk_tags:
                     risk_tags = ["general-review"]
                 tasks: list[PlannedTask] = []

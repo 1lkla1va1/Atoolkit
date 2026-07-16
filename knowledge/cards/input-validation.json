@@ -3,6 +3,7 @@
   "title": "输入校验",
   "description": "覆盖搜索、排序、过滤、分页、类型转换、边界值和服务端错误处理。",
   "match": {
+    "risk_tags": ["input-validation", "injection", "sqli", "xss"],
     "vuln_classes": [
       "SQLi",
       "XSS",

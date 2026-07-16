@@ -3,6 +3,8 @@
   "title": "WAF 绕过",
   "description": "当注入 payload 被 WAF/关键字过滤拦截时，按 6 个绕过家族逐一尝试，不得因单次拦截即判阴性。",
   "match": {
+    "risk_tags": ["waf", "waf-blocked"],
+    "barrier_signals": ["waf_blocked", "waf_bypass_exhausted"],
     "vuln_classes": ["SQLi", "XSS", "命令执行/RCE", "SSRF", "文件读取/穿越"],
     "keywords": ["waf", "firewall", "filter", "blocked", "illegal", "forbidden", "拦截", "非法", "关键字"]
   },

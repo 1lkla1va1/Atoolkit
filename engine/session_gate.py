@@ -21,6 +21,8 @@ try:
         STATUS_NOT_APPLICABLE,
         STATUS_NOT_TESTED,
         STATUS_NOT_VULNERABLE,
+        STATUS_SHALLOW_NEGATIVE,
+        STATUS_EXPLORING,
         CoverageLedger,
         is_high_value,
         normalize_status,
@@ -34,6 +36,8 @@ except ImportError:  # pragma: no cover - script execution fallback
         STATUS_NOT_APPLICABLE,
         STATUS_NOT_TESTED,
         STATUS_NOT_VULNERABLE,
+        STATUS_SHALLOW_NEGATIVE,
+        STATUS_EXPLORING,
         CoverageLedger,
         is_high_value,
         normalize_status,
@@ -107,8 +111,12 @@ def _negative_obj_from_surface(surface: dict[str, Any]) -> dict[str, Any] | None
         "response_count": int(surface.get("response_count", 0) or 0),
         "evidence_types": _as_list(surface.get("evidence_types")),
         "identities": _as_list(surface.get("identities")),
+        "barrier_signals": _as_list(surface.get("barrier_signals")),
+        "preconditions": dict(surface.get("preconditions") or {}),
     }
-    if any(obj[k] for k in ("vectors", "response_count", "evidence_types", "identities")):
+    if any(obj[k] for k in (
+            "vectors", "response_count", "evidence_types", "identities",
+            "barrier_signals", "preconditions")):
         return obj
     return None
 
@@ -220,15 +228,17 @@ def evaluate_session_gate(
         if surface.get("in_run_scope") is False:
             continue
         status = normalize_status(surface.get("status"))
-        if is_high_value(surface) and status == STATUS_NOT_TESTED:
+        if is_high_value(surface) and status in {
+            STATUS_NOT_TESTED, STATUS_SHALLOW_NEGATIVE,
+            STATUS_BLOCKED, STATUS_EXPLORING,
+        }:
             reasons.append(_reason("high_value_not_tested", surface, "test_or_mark_not_applicable_with_reason"))
             result = INCOMPLETE
 
         # shallow_negative_open (v4.1 P0-2): a shallow negative must not slip
         # through just because it is neither high-value nor carrying
-        # next_actions. normalize_status collapses "shallow_negative" onto
-        # STATUS_NOT_TESTED, so the ledger carries a `negative_depth="shallow"`
-        # marker (see engine/ledger.py) to keep the distinction. We also re-run
+        # next_actions. v8.10 preserves shallow_negative as a first-class state;
+        # the legacy `negative_depth="shallow"` marker remains readable. We also re-run
         # knowledge.negative_sufficient when the surface exposes negative
         # evidence, so a not_vulnerable surface whose vectors/responses are
         # below threshold is re-opened. Placed after high_value_not_tested and
@@ -236,7 +246,11 @@ def evaluate_session_gate(
         # swallowed by the blocked/needs predicates below.
         if status not in {STATUS_CONFIRMED, STATUS_NOT_APPLICABLE, STATUS_BLOCKED}:
             raw_status = str(surface.get("status") or "").strip().lower()
-            shallow = surface.get("negative_depth") == "shallow" or raw_status == "shallow_negative"
+            shallow = (
+                status == STATUS_SHALLOW_NEGATIVE
+                or surface.get("negative_depth") == "shallow"
+                or raw_status == "shallow_negative"
+            )
             neg_obj = _negative_obj_from_surface(surface)
             insufficient = False
             if neg_obj is not None:
@@ -251,6 +265,15 @@ def evaluate_session_gate(
                 ))
                 if result == PASS:
                     result = INCOMPLETE
+
+        if status == STATUS_EXPLORING:
+            reasons.append(_reason(
+                "exploring_open", surface,
+                "resolve conflicting observations or complete the current experiment",
+                detail="surface remains exploring",
+            ))
+            if result == PASS:
+                result = INCOMPLETE
 
         # v6.1 §6.2: negative_depth_not_checked — a not_vulnerable surface whose
         # negative depth floor has not been closed-loop verified must not pass.
@@ -300,7 +323,10 @@ def evaluate_session_gate(
 
         next_actions = [str(x) for x in _as_list(surface.get("next_actions")) if str(x).strip()]
         has_needs = any("NEED" in action.upper() for action in next_actions) or bool(surface.get("needs"))
-        if next_actions and status in {STATUS_NOT_TESTED, STATUS_BLOCKED}:
+        if next_actions and status in {
+            STATUS_NOT_TESTED, STATUS_SHALLOW_NEGATIVE,
+            STATUS_BLOCKED, STATUS_EXPLORING,
+        }:
             reasons.append(_reason("open_next_actions", surface, next_actions[0]))
             if result == PASS:
                 result = INCOMPLETE

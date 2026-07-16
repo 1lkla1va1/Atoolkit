@@ -1750,7 +1750,7 @@ def main():
     ap.add_argument("--allow-unrestricted-egress", action="store_true",
                     help="危险降级：允许当前 Codex backend 的非受控网络；不会标记为 preexec_enforced")
     ap.add_argument("--target-fingerprint", default="",
-                    help="显式部署 fingerprint；v8.9 只保存/比较，不自动把历史 cell 标 stale")
+                    help="显式部署 fingerprint；v8.10 只保存/比较，不自动把历史 cell 标 stale")
     ap.add_argument("--target-fingerprint-file", default="",
                     help="从文件读取显式部署 fingerprint（与 --target-fingerprint 二选一）")
     ap.add_argument("--identity", action="append", default=[],

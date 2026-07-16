@@ -7,7 +7,7 @@
 
 - **授权**：本会话为**已授权**安全测试。授权范围以 `runs/<sid>/authz.md` 为准；超范围（含跨子系统）立即停手，输出 `NEED_INPUT`。
 - **证据落盘**：所有 curl/HTTP 包、响应、报告一律写入 `runs/<sid>/`（由会话指定）。**说做了 ≠ 真做了，落盘才算数。**
-- **登录态**：遇登录二次核身/验证码/短信 → 停，输出 `NEED_INPUT`，由人提供新鲜 Cookie/Session，不要自行从截图读凭据登录。
+- **登录态**：不得从截图读取凭据、代替真人完成验证码/短信/二次核身；先在安全边界内测试流程绑定、字段省略/空值和步骤跳转等绕过，全部失败后输出 `NEED_INPUT`，由人提供新鲜 Cookie/Session。
 - **终态标记**：每次任务结束，在**最后一条消息的独立一行**只输出一个：`VULN_FOUND` / `LOW_ROI` / `NEED_INPUT` / `ERROR`。
 - **外部强制说明（⚙）**：下文带 ⚙ 的报告验证、危险动作分类、超时切向和终态裁定由外壳执行。当前 Codex backend **没有可证明的 pre-exec 网络白名单**：live 默认拒绝；显式 unrestricted 降级也不得声称已做出站硬约束。
 - **进程容器说明（⚙）**：本地 POSIX 进程组不能包含 `setsid()` 后代；当前 Codex/wrapper 运行因此为 `authority_trusted=false` 的 diagnostic，不得改写跨 Run ProjectState。
@@ -28,9 +28,9 @@
 
 ---
 
-## 0.0 运行身份与跨 Run 真值（v8.9）
+## 0.0 运行身份与跨 Run 真值（v8.10）
 
-- **首个网络动作之前**必须已有 host-owned `run_manifest.json` 与 frozen `run_plan.json`。Engine Mode 由父进程创建；Skill Mode 由外部 `engine.skill_wrapper` 创建。只有能证明全部后代已容器/cgroup/job 隔离并静默的后端才可设置 `authority_trusted=true`；当前内置 Codex/wrapper 与 Direct Skill 均为 diagnostic。
+- **首个网络动作之前**，authority-eligible Run 必须已有 host-owned `run_manifest.json` 与 frozen `run_plan.json`。Engine Mode 由父进程创建；Wrapped Skill 由外部 `engine.skill_wrapper` 创建。Direct/Qoder 模式无法建立独立 authority，必须先用 `engine.skill_runtime init` 生成 `authority_trusted=false` 的 diagnostic ledger/queue；它不得改写 ProjectState 或声称 verified delivery。
 - `<project>/project_state.json`（schema 2）是跨 Run 唯一权威。`blackboard.json`、`business_graph.json`、`run_scope.json` 和摘要均为派生视图，禁止反向覆盖项目真值。
 - 继承闭格必须精确匹配 `origin + namespace + METHOD/path + param/location + actor/subject/object + vuln_class`；unknown role 不是通配符。未知 method 的新路径进入 unresolved queue，不得默认 GET。
 - 项目 Finding 注册表只接收确定性校验后的 `accepted + proof_status=confirmed + claim.kind=root_finding`。标题、散文和链式假设均不能作为去重或闭格依据。
@@ -170,6 +170,8 @@ Phase 0 侦察应优先覆盖本轮域内的端点——其他域的端点记录
 先覆盖，再收口。每个发现的攻击面都必须拆成 `endpoint / method / param / role / risk_tag`，并维护覆盖格状态：`not_tested`、`confirmed`、`not_vulnerable`、`shallow_negative`、`blocked`、`not_applicable`、`exploring`。
 
 **Skill Mode 覆盖台账**：authoritative 输入是 `coverage-ledger.json`；Markdown 表格只是派生视图。`status` 只允许上述七种值。终态时 frozen run scope 内仍有 `not_tested` 高价值 cell → `incomplete`。`exploring` 有明确结论后转为 `confirmed` / `not_vulnerable` / `shallow_negative`。
+
+**实验有效性门（v8.10）**：WAF/关键字拦截、会话过期、对象不存在、空数据集、缺角色、验证码未解和请求格式未解析都只是 barrier，不能计入 `not_vulnerable`。Skill/Engine negative 应记录 `barrier_signals` 与 `preconditions`；可恢复 barrier 转 `blocked + next_actions`，WAF 穷尽仍保留 `shallow_negative`。
 
 **跨 Run dead-end 合同（Engine Mode）**：普通 `SKIP`、预算不足、缺账号和模型自行放弃都不能跨 Run 关闭覆盖格。只有确实“不适用”的精确单元才写入会话根目录 `dead_ends.json`，格式为 `{"schema_version":"1.0","dead_ends":[...]}`；每项必须包含 `status=not_applicable`、精确 `asset/method/endpoint/param/role_scope/vuln_class`，并显式提供 `namespace/param_location/subject_role/object_kind`（无值时写空字符串）、`reason_code`、`refutation` 和可读取的 `evidence_refs`。`reason_code` 只允许：`endpoint_removed`、`feature_disabled`、`method_not_supported`、`parameter_not_consumed`、`role_not_applicable`、`vulnerability_class_not_applicable`。缺字段或证据校验失败时只作为本轮提示，不进入项目真值。
 
@@ -362,7 +364,7 @@ Phase 0 侦察应优先覆盖本轮域内的端点——其他域的端点记录
 
 **恢复协议**：如果发现自己不确定之前测试过什么（长对话记忆模糊），**先读 `state/` 目录下的所有文件**再继续测试。以磁盘状态为准，不依赖工作记忆。
 
-**定期快照**：每测试 10 个 surface，更新 `coverage-ledger.json`；可额外生成 `state/coverage_snapshot.md` 人类视图。
+**定期快照**：每测试 10 个 surface 及每个 phase 结束时更新 `coverage-ledger.json`；Direct/Qoder 模式必须运行 `python3 -m engine.skill_runtime checkpoint --run-dir <run>` 合并所有 agent observation。可额外生成 `state/coverage_snapshot.md` 人类视图，但 Markdown 不得反向覆盖机器真值。
 
 ---
 

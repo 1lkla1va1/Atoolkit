@@ -3,6 +3,7 @@
   "title": "多身份 IDOR",
   "description": "覆盖对象级授权、跨账户读取、跨账户修改、角色边界和对象归属校验。",
   "match": {
+    "risk_tags": ["idor", "object-ownership"],
     "vuln_classes": [
       "越权/IDOR",
       "未授权访问"
@@ -11,9 +12,14 @@
       "id",
       "uid",
       "user_id",
+      "user_hash",
       "order_id",
+      "order_no",
       "bug_id",
       "project_id",
+      "product_id",
+      "product_no",
+      "merchant_id",
       "address_id",
       "owner_id",
       "account_id"

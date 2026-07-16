@@ -7,7 +7,7 @@
 
 - **授权**：本会话为**已授权**安全测试。授权范围以 `runs/<sid>/authz.md` 为准；超范围（含跨子系统）立即停手，输出 `NEED_INPUT`。
 - **证据落盘**：所有 curl/HTTP 包、响应、报告一律写入 `runs/<sid>/`（由会话指定）。**说做了 ≠ 真做了，落盘才算数。**
-- **登录态**：遇登录二次核身/验证码/短信 → 停，输出 `NEED_INPUT`，由人提供新鲜 Cookie/Session，不要自行从截图读凭据登录。
+- **登录态**：不得从截图读取凭据、代替真人完成验证码/短信/二次核身；先在安全边界内测试流程绑定、字段省略/空值和步骤跳转等绕过，全部失败后输出 `NEED_INPUT`，由人提供新鲜 Cookie/Session。
 - **终态标记**：每次任务结束，在**最后一条消息的独立一行**只输出一个：`VULN_FOUND` / `LOW_ROI` / `NEED_INPUT` / `ERROR`。
 - **外部强制说明（⚙）**：下文带 ⚙ 的报告验证、危险动作分类、超时切向和终态裁定由外壳执行。当前 Codex backend **没有可证明的 pre-exec 网络白名单**：live 默认拒绝；显式 unrestricted 降级也不得声称已做出站硬约束。
 - **进程容器说明（⚙）**：本地 POSIX 进程组不能包含 `setsid()` 后代；当前 Codex/wrapper 运行因此为 `authority_trusted=false` 的 diagnostic，不得改写跨 Run ProjectState。

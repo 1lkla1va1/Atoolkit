@@ -1,5 +1,16 @@
 # Changelog
 
+## 8.10.0 - 2026-07-16
+
+- 新增 Direct/QoderWork diagnostic `engine.skill_runtime`，提供 init/observe/checkpoint，按 append-only observation 确定性归并多 agent 状态；不伪造 authority、不改 ProjectState。
+- Planner 改为显式风险与参数语义风险并集；每个非空参数独立保留 input-validation/injection，修复对象编号只测 IDOR 而漏注入维。
+- 知识卡匹配接通单值 param、risk_tags 与 barrier_signals；当前 cell 只注入命中的紧凑卡提示。
+- WAF、会话失效、对象不存在、空数据、角色缺失和格式未解析进入统一实验有效性门；向量数再多也不能闭成 not_vulnerable。
+- Coverage ledger 对齐七态合同，`shallow_negative` / `exploring` 成为一等 open 状态，不再折叠为 not_tested 旁路标记。
+- Canonical negative evidence envelope 与 Direct checkpoint 共用 barrier/precondition 语义；响应中明确 WAF/登录失效信号会 fail closed。
+- 新增 `skill/runtime-hot-path.md`，修正验证码“立即停”与“先测流程绕过”的指令冲突，并要求每 phase/每 10 cell checkpoint。
+- 修复 Direct 实测中暴露的 Markdown findings summary 与最终 score/report 分叉：Markdown 保持人类视图，最终报告仍只来自 canonical validation projection。
+
 ## 8.9.0 - 2026-07-14
 
 - 修复真实 shop recon 暴露的 phantom GET、三元 URL、fetch body/FormData 参数和 auth-flow 角色错误；不确定 method 保持 unresolved，不再制造覆盖分母。

@@ -646,8 +646,8 @@ def test_manifest_receipt_and_doctor_record_provenance_without_claiming_foreign_
     _write(repo / "skill/核心技能文件.v3.md", "# core\nbody\n")
     _write(repo / "AGENTS.md", "header\nbody\n")
     _write(repo / "codex/AGENTS.md", "header\nbody\n")
-    _write(repo / "SKILL.md", "---\nversion: 8.9.0\n---\n")
-    _write(repo / "CHANGELOG.md", "# Changelog\n\n## 8.9.0 - 2026-07-13\n")
+    _write(repo / "SKILL.md", f"---\nversion: {__version__}\n---\n")
+    _write(repo / "CHANGELOG.md", f"# Changelog\n\n## {__version__} - 2026-07-16\n")
     foreign = tmp_path / "foreign/src.md"
     _write(foreign, "foreign")
     (codex_home / "prompts").mkdir(parents=True)

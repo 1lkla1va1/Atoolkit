@@ -36,7 +36,7 @@ Skill Mode 的 authoritative 台账是 `coverage-ledger.json`。下列 Markdown
 | S05 | GET /balance-records | shallow_negative | NF-005 | ✗ 数据为空 | 需创建余额记录后重测 |
 ```
 
-`status` 列只允许：`not_tested / confirmed / not_vulnerable / shallow_negative / blocked / exploring`。
+`status` 列只允许：`not_tested / confirmed / not_vulnerable / shallow_negative / blocked / not_applicable / exploring`。
 `depth` 列只允许：`✓`（达到 depth floor）或 `✗ <原因>`。
 终态时 `not_tested` 的高价值 surface → 终态标 `incomplete`。
 
@@ -68,6 +68,12 @@ actor/subject/object、请求响应证据及 hash。以下 Markdown 是可选派
 - 建议包含 `vectors tested` 描述（已测试的向量类型和数量），便于审计深度
 - 建议包含 `depth_floor_met: yes/no`（声明测试深度是否充分）
 - 测试深度不充分的标 `status: shallow_negative` + `next_actions`
+
+v8.10 negative 还应携带 `barrier_signals` 与 `preconditions`。以下 barrier
+永远不能闭为 `not_vulnerable`：`waf_blocked`、`waf_bypass_exhausted`、
+`session_expired`、`auth_required`、`object_absent`、`empty_dataset`、
+`missing_role`、`challenge_unsolved`、`format_unresolved`。向量数量不能弥补
+实验前置条件无效；Direct/Qoder 的完整最小格式见 `runtime-hot-path.md`。
 
 ---
 

@@ -47,6 +47,18 @@ BLOCKER_RULES: dict[str, dict[str, Any]] = {
         "next_actions": ["create the object with the owner account", "enumerate owned objects", "retry with fresh object evidence"],
         "patterns": ("object absent", "not found", "missing object", "no such", "empty list", "no order", "no product"),
     },
+    "session_expired": {
+        "category": RECOVERABLE,
+        "status": BLOCKED_STATUS,
+        "next_actions": ["refresh the authorized session", "verify the fresh session baseline", "retest the same exact cell"],
+        "patterns": ("session expired", "expired session", "login expired", "stale cookie", "auth expired"),
+    },
+    "format_unresolved": {
+        "category": RECOVERABLE,
+        "status": BLOCKED_STATUS,
+        "next_actions": ["resolve the request content type and parameter location", "capture a valid baseline request", "retest after request shape is confirmed"],
+        "patterns": ("format unresolved", "request shape unresolved", "content type unresolved", "parameter format unknown"),
+    },
     "missing_role": {
         "category": NEEDS_INPUT,
         "status": BLOCKED_STATUS,

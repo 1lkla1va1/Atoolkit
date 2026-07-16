@@ -1,7 +1,7 @@
 ---
 name: Atoolkit
 description: Authorized AI-assisted SRC/bug-bounty vulnerability research toolkit. Use whenever the user wants to read, install, configure, or run this Atoolkit package; mentions SRC 漏洞挖掘, 授权靶场, bug bounty, Codex AGENTS.md, /src, Guardian 质检, PoC 复验, or model-independent security testing automation. Only proceed for clearly authorized defensive testing or educational lab contexts.
-version: 8.9.0
+version: 8.10.0
 ---
 
 # Atoolkit Skill
@@ -29,6 +29,7 @@ Paths in this skill are relative to the skill package root.
 - For deterministic replay verification: read `engine/verify.py`.
 - For Phase 0 recon: read `skill/recon-checklist.md`.
 - For Skill Mode runtime (without `run.py`): read [Skill Mode Runtime](#skill-mode-runtime) below.
+- For QoderWork/Direct execution: read `skill/runtime-hot-path.md` first; load the full core/reference only when the current cell needs it.
 - For Fact-Intent architecture: read `engine/graph.py`, then [Fact-Intent Protocol](#fact-intent-protocol) below.
 - For SRC real-world workflow: read [SRC Workflow](#src-workflow) below.
 
@@ -51,6 +52,10 @@ There are two Skill trust levels, plus a backend capability gate:
   finalizer returns untrusted/incomplete and must never claim tamper-resistant
   delivery.
 
+Direct/QoderWork should use `engine.skill_runtime` for deterministic session
+state even though it remains untrusted. This closes execution feedback and
+multi-agent synchronization; it does not weaken the authority boundary.
+
 Use Engine Mode or the wrapper for canonical session diagnostics. Do not claim
 trusted cross-run delivery with the bundled Codex backends until an attested
 cgroup/job/container supervisor is integrated.
@@ -63,7 +68,7 @@ cgroup/job/container supervisor is integrated.
    is a hard stop. Running `init-manifest` from Direct Skill Mode is diagnostic,
    not an independent trust anchor.
 3. Load `<project>/project_state.json` when present. It is the cross-run authority; `blackboard.json`, `business_graph.json`, and summaries are derived views only.
-4. Read `hint.md`, then execute Phase 0 recon per `skill/recon-checklist.md` and initialize authoritative JSON `inventory.json` plus `coverage-ledger.json`. `attack_surface_list.md` is a derived human view, not the closure source.
+4. Read `hint.md`, then execute Phase 0 recon per `skill/recon-checklist.md` and initialize JSON `inventory.json` plus `coverage-ledger.json`. In Direct/Qoder mode run `python3 -m engine.skill_runtime init ...`; its files are session-authoritative diagnostics but not cross-Run authority. `attack_surface_list.md` is a derived human view, not the closure source.
 5. Merge new inventory into project inventory by asset + method + path. Unknown methods stay unresolved and must not default to GET.
 6. Restore coverage only for an exact asset + method/path + param + role + vuln-class cell, then schedule pending Intents and still-open cells.
 
@@ -75,7 +80,7 @@ For each surface in the queue:
 2. Look up the corresponding knowledge card summary for the risk_tags.
 3. Execute testing; for each risk dimension respond: `CANDIDATE` / `NONE:<reason>`.
 4. Write evidence (finding package or negative record).
-4.5 Write state to disk per compression anchor protocol (§10 of core skill file).
+4.5 Write an immutable per-agent observation and run `engine.skill_runtime checkpoint` at each phase boundary and every 10 cells in Direct/Qoder mode.
 5. Update coverage ledger status.
 6. Run the termination self-check (see §9 of `skill/核心技能文件.v3.md`): depth floor met? Time to pivot?
 
@@ -98,6 +103,18 @@ python3 -m engine.skill_wrapper \
 
 Finalizer exit codes are `0=verified complete`, `1=invalid/conflict`,
 `2=incomplete, uncontained, or direct-self-authorized`, `3=operational error`.
+
+Direct diagnostic commands:
+
+```bash
+python3 -m engine.skill_runtime init --run-dir <session> --target <url> \
+  --inventory <inventory.json> --recon-dir <recon>
+python3 -m engine.skill_runtime observe --run-dir <session> \
+  --agent-id <agent> --input <observation.json>
+python3 -m engine.skill_runtime checkpoint --run-dir <session>
+```
+
+The observation/barrier contract is documented in `skill/runtime-hot-path.md`.
 
 ## Fact-Intent Protocol
 

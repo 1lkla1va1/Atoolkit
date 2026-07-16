@@ -22,6 +22,28 @@ NEGATIVE_WITH_EVIDENCE = "negative_with_evidence"
 SHALLOW_NEGATIVE = "shallow_negative"
 
 _DEFAULT_MISSING = "补足至少 3 个独立探测向量，并保留响应证据"
+
+_BARRIER_PRECONDITIONS = {
+    "auth_valid": "session_expired",
+    "data_ready": "empty_dataset",
+    "object_exists": "object_absent",
+    "ownership_known": "ownership_unproven",
+    "roles_ready": "missing_role",
+    "request_shape_resolved": "format_unresolved",
+}
+
+_BARRIER_ALIASES = {
+    "waf": "waf_blocked",
+    "blocked": "waf_blocked",
+    "illegal_keyword": "waf_blocked",
+    "auth_expired": "session_expired",
+    "expired_session": "session_expired",
+    "empty": "empty_dataset",
+    "not_found": "object_absent",
+    "object_missing": "object_absent",
+    "captcha": "challenge_unsolved",
+    "request_format_unknown": "format_unresolved",
+}
 def _get_card_dir() -> pathlib.Path:
     """Resolve knowledge/cards directory, with fallback when __file__ is unavailable."""
     try:
@@ -117,6 +139,30 @@ def _expand_evidence_types(values: list) -> set[str]:
     return out
 
 
+def negative_barrier_signals(negative_obj: dict | None) -> list[str]:
+    """Return normalized experiment barriers that invalidate a negative.
+
+    Vector counts cannot compensate for an invalid experiment.  Callers may use
+    the returned signals to choose ``blocked`` versus ``shallow_negative``;
+    ``negative_sufficient`` always keeps such evidence open.
+    """
+    obj = negative_obj if isinstance(negative_obj, dict) else {}
+    values = _as_list(obj.get("barrier_signals")) + _as_list(obj.get("barriers"))
+    signals: list[str] = []
+    for value in values:
+        normalized = re.sub(r"[^a-z0-9_]+", "_", _norm_text(value)).strip("_")
+        normalized = _BARRIER_ALIASES.get(normalized, normalized)
+        if normalized and normalized not in signals:
+            signals.append(normalized)
+    preconditions = obj.get("preconditions")
+    if isinstance(preconditions, dict):
+        for field, signal in _BARRIER_PRECONDITIONS.items():
+            if field in preconditions and preconditions[field] is not True:
+                if signal not in signals:
+                    signals.append(signal)
+    return signals
+
+
 def _string_values(obj: Any) -> list[str]:
     if isinstance(obj, dict):
         out: list[str] = []
@@ -143,10 +189,10 @@ def _surface(cell_or_surface: dict) -> dict:
 def _haystack(cell_or_surface: dict) -> str:
     surface = _surface(cell_or_surface)
     chunks: list[str] = []
-    for key in ("endpoint", "vuln", "feature", "method", "source"):
+    for key in ("endpoint", "vuln", "vuln_class", "feature", "method", "source", "param"):
         chunks.append(str(cell_or_surface.get(key, "")))
         chunks.append(str(surface.get(key, "")))
-    for key in ("params", "needed_roles", "needs"):
+    for key in ("params", "risk_tags", "barrier_signals", "needed_roles", "needs"):
         chunks.extend(str(x) for x in _as_list(cell_or_surface.get(key)))
         chunks.extend(str(x) for x in _as_list(surface.get(key)))
     identity_meta = cell_or_surface.get("identity_meta") or surface.get("identity_meta")
@@ -170,14 +216,29 @@ def _match_context(cell_or_surface: dict) -> dict[str, set[str] | str]:
             surface.get("source"),
         )
     ).lower()
-    params = _unique_norm(_as_list(cell_or_surface.get("params")) + _as_list(surface.get("params")))
-    vuln = _norm_text(cell_or_surface.get("vuln") or surface.get("vuln"))
+    params = _unique_norm(
+        _as_list(cell_or_surface.get("params"))
+        + _as_list(cell_or_surface.get("param"))
+        + _as_list(surface.get("params"))
+        + _as_list(surface.get("param"))
+    )
+    vuln = _norm_text(
+        cell_or_surface.get("vuln") or cell_or_surface.get("vuln_class")
+        or surface.get("vuln") or surface.get("vuln_class"))
     roles = _unique_norm(_as_list(cell_or_surface.get("needed_roles")) + _as_list(surface.get("needed_roles")))
+    risk_tags = _unique_norm(
+        _as_list(cell_or_surface.get("risk_tags")) + _as_list(surface.get("risk_tags")))
+    barriers = _unique_norm(
+        _as_list(cell_or_surface.get("barrier_signals"))
+        + _as_list(surface.get("barrier_signals")))
     identity_meta = cell_or_surface.get("identity_meta") or surface.get("identity_meta")
     if isinstance(identity_meta, dict):
         roles.update(_norm_text(x) for x in identity_meta.values() if _norm_text(x))
     tokens = set(re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]+", _haystack(cell_or_surface)))
-    return {"endpoint": endpoint, "params": params, "vuln": vuln, "roles": roles, "tokens": tokens}
+    return {
+        "endpoint": endpoint, "params": params, "vuln": vuln, "roles": roles,
+        "risk_tags": risk_tags, "barriers": barriers, "tokens": tokens,
+    }
 
 
 def _has_match(match: dict, ctx: dict[str, set[str] | str]) -> bool:
@@ -185,6 +246,8 @@ def _has_match(match: dict, ctx: dict[str, set[str] | str]) -> bool:
     params = ctx["params"]
     vuln = str(ctx["vuln"])
     roles = ctx["roles"]
+    risk_tags = ctx["risk_tags"]
+    barriers = ctx["barriers"]
     tokens = ctx["tokens"]
 
     if any(_norm_text(x) and _norm_text(x) in endpoint for x in _as_list(match.get("endpoints"))):
@@ -198,6 +261,10 @@ def _has_match(match: dict, ctx: dict[str, set[str] | str]) -> bool:
     if any(_norm_text(x) in tokens for x in _as_list(match.get("keywords"))):
         return True
     if any(_norm_text(x) in roles for x in _as_list(match.get("roles"))):
+        return True
+    if any(_norm_text(x) in risk_tags for x in _as_list(match.get("risk_tags"))):
+        return True
+    if any(_norm_text(x) in barriers for x in _as_list(match.get("barrier_signals"))):
         return True
     return False
 
@@ -295,12 +362,15 @@ def negative_sufficient(
     evidence_types = _expand_evidence_types(_as_list(negative_obj.get("evidence_types")))
     identities = _unique_norm(_as_list(negative_obj.get("identities")))
     roles = _unique_norm(_as_list(negative_obj.get("roles")))
+    barriers = negative_barrier_signals(negative_obj)
 
     min_vectors, min_response_count, required_evidence_types, min_identities, required_roles, labels = _requirements(
         cell or {}, cards
     )
 
     missing: list[str] = []
+    for signal in barriers:
+        missing.append(f"实验前置条件未满足: {signal}")
     if len(vectors) < min_vectors:
         missing.append(f"补足至少 {min_vectors} 个独立探测向量")
     if response_count < min_response_count:
@@ -450,6 +520,7 @@ __all__ = [
     "SHALLOW_NEGATIVE",
     "load_cards",
     "match_cards",
+    "negative_barrier_signals",
     "negative_sufficient",
     "resolve_negative_state",
     "positive_depth_floor_for",

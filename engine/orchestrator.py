@@ -1028,6 +1028,10 @@ class CognitiveState:
                                     "identities": list(neg.get("identities") or []),
                                     "roles": [role] if role else [],
                                     "asset_id": asset_id,
+                                    "barrier_signals": list(
+                                        neg.get("barrier_signals") or []),
+                                    "preconditions": dict(
+                                        neg.get("preconditions") or {}),
                                 }
                             notes.append(f"[NEG] {msg}")
         # 3) 模型对单格的显式声明（PASS/NEG/SKIP）：文本 SKIP 仅 deferred；PASS/NEG 仍需证据撑腰
@@ -1462,6 +1466,19 @@ def _parse_negative(txt: str, path: str) -> dict:
     roles = fm.get("roles") or []
     if isinstance(roles, str):
         roles = [x.strip() for x in re.split(r"[,，;；]", roles) if x.strip()]
+    barrier_signals = fm.get("barrier_signals") or fm.get("barriers") or []
+    if isinstance(barrier_signals, str):
+        barrier_signals = [
+            x.strip() for x in re.split(r"[,，;；]", barrier_signals) if x.strip()
+        ]
+    preconditions = fm.get("preconditions") or {}
+    if isinstance(preconditions, str):
+        try:
+            preconditions = json.loads(preconditions)
+        except json.JSONDecodeError:
+            preconditions = {}
+    if not isinstance(preconditions, dict):
+        preconditions = {}
     body = _body(txt)
     vector_hits = re.findall(r"\b(?:curl|probe|payload|vector)\b", body, re.I)
     response_hits = re.findall(r"\b(?:HTTP/1\.1|HTTP/2|status)\b|响应", body, re.I)
@@ -1483,6 +1500,8 @@ def _parse_negative(txt: str, path: str) -> dict:
         "evidence_types": evidence_types,
         "identities": identities,
         "roles": roles,
+        "barrier_signals": barrier_signals,
+        "preconditions": preconditions,
         "response_count": response_count,
     }
 
@@ -1956,8 +1975,12 @@ def _surface_neg_obj(surface: dict) -> dict | None:
         "response_count": int(surface.get("response_count", 0) or 0),
         "evidence_types": _listify(surface.get("evidence_types")),
         "identities": _listify(surface.get("identities")),
+        "barrier_signals": _listify(surface.get("barrier_signals")),
+        "preconditions": dict(surface.get("preconditions") or {}),
     }
-    if any(obj[k] for k in ("vectors", "response_count", "evidence_types", "identities")):
+    if any(obj[k] for k in (
+            "vectors", "response_count", "evidence_types", "identities",
+            "barrier_signals", "preconditions")):
         return obj
     return None
 
@@ -4071,6 +4094,8 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
             "evidence_types": neg.get("evidence_types", []),
             "identities": neg.get("identities", []),
             "roles": _negative_roles,
+            "barrier_signals": list(neg.get("barrier_signals") or []),
+            "preconditions": dict(neg.get("preconditions") or {}),
         })
 
     # v8.5 compatibility path.  v8.8 runtime runs use project_state.json below

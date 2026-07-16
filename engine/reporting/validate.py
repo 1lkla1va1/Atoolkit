@@ -2024,6 +2024,15 @@ def _validate_evidence_envelope(
     request_hashes: set[str] = set()
     response_hashes: set[str] = set()
     artifacts: dict[str, str] = {}
+    barrier_signals = {
+        str(value or "").strip().lower()
+        for value in (envelope.get("barrier_signals") or [])
+        if str(value or "").strip()
+    }
+    preconditions = (
+        dict(envelope.get("preconditions"))
+        if isinstance(envelope.get("preconditions"), dict) else {}
+    )
     try:
         relative_envelope = envelope_path.resolve().relative_to(
             allowed_root.resolve()).as_posix()
@@ -2078,6 +2087,19 @@ def _validate_evidence_envelope(
                 exact_cell, identity_assertions, request_text, response_text):
             return False, {}, {}
         vectors.add(vector)
+        response_lower = response_text.lower()
+        if re.search(
+            r"(?:\bwaf\b|blocked\s+by|illegal\s+keyword|"
+            r"检测到非法关键字|请求被拦截|非法关键字)",
+            response_lower,
+        ):
+            barrier_signals.add("waf_blocked")
+        if re.search(
+            r"(?:session\s+expired|login\s+required|auth(?:entication)?\s+required|"
+            r"请先登录|登录已过期|会话已过期)",
+            response_lower,
+        ):
+            barrier_signals.add("session_expired")
         request_hashes.add(request_hash)
         response_hashes.add(response_hash)
         for physical in (request_path, response_path):
@@ -2093,6 +2115,8 @@ def _validate_evidence_envelope(
         "evidence_types": list(envelope.get("evidence_types") or []),
         "identities": list(envelope.get("identities") or []),
         "roles": list(envelope.get("roles") or []),
+        "barrier_signals": sorted(barrier_signals),
+        "preconditions": preconditions,
     }, artifacts
 
 
@@ -2139,6 +2163,8 @@ def _validate_project_evidence_envelopes(
     evidence_types: set[str] = set()
     identities: set[str] = set()
     roles: set[str] = set()
+    barrier_signals: set[str] = set()
+    preconditions: dict[str, bool] = {}
     if not refs:
         return False, {}
     for ref in refs:
@@ -2156,10 +2182,17 @@ def _validate_project_evidence_envelopes(
             str(value) for value in derived.get("evidence_types") or [])
         identities.update(str(value) for value in derived.get("identities") or [])
         roles.update(str(value) for value in derived.get("roles") or [])
+        barrier_signals.update(
+            str(value) for value in derived.get("barrier_signals") or [])
+        for key, value in (derived.get("preconditions") or {}).items():
+            preconditions[str(key)] = (
+                value is True and preconditions.get(str(key), True))
     return True, {
         "vectors": sorted(vectors), "response_count": response_count,
         "evidence_types": sorted(evidence_types),
         "identities": sorted(identities), "roles": sorted(roles),
+        "barrier_signals": sorted(barrier_signals),
+        "preconditions": preconditions,
     }
 
 
@@ -2506,6 +2539,7 @@ def _run_closure_gate(
                                 combined = {
                                     "vectors": [], "response_count": 0,
                                     "evidence_types": [], "identities": [], "roles": [],
+                                    "barrier_signals": [], "preconditions": {},
                                 }
                                 valid_historical = bool(surface_keys)
                                 for key in surface_keys:
@@ -2526,13 +2560,18 @@ def _run_closure_gate(
                                         break
                                     for field in (
                                             "vectors", "evidence_types",
-                                            "identities", "roles"):
+                                            "identities", "roles", "barrier_signals"):
                                         combined[field] = list(dict.fromkeys([
                                             *combined[field],
                                             *list(derived.get(field) or []),
                                         ]))
                                     combined["response_count"] += int(
                                         derived.get("response_count", 0) or 0)
+                                    for key, value in (derived.get("preconditions") or {}).items():
+                                        combined["preconditions"][str(key)] = (
+                                            value is True
+                                            and combined["preconditions"].get(str(key), True)
+                                        )
                                 if valid_historical:
                                     historical_negative = combined
                             except (OSError, ValueError, json.JSONDecodeError):
