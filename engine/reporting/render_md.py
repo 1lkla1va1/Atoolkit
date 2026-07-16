@@ -139,6 +139,16 @@ def render_final_report(
             lines.append(f"- 未闭合：{cell.get('endpoint', '')} × {cell.get('vuln', '')} ({cell.get('state', '')})")
         lines.append("")
 
+    if not findings:
+        lines.extend([
+            "## 结论",
+            "",
+            "本轮 Canonical 验证未发现满足证明合同、可进入正式报告的漏洞。",
+            "",
+            "> 此结论仅在覆盖闭合且验证门通过时表示本轮无可报告发现；不等同于目标绝对安全。",
+            "",
+        ])
+
     for index, item in enumerate(findings, start=1):
         finding, finding_path = _finding_and_path(item)
         finding_dir = finding_path.parent

@@ -1,7 +1,7 @@
 ---
 name: Atoolkit
 description: Authorized AI-assisted SRC/bug-bounty vulnerability research toolkit. Use whenever the user wants to read, install, configure, or run this Atoolkit package; mentions SRC 漏洞挖掘, 授权靶场, bug bounty, Codex AGENTS.md, /src, Guardian 质检, PoC 复验, or model-independent security testing automation. Only proceed for clearly authorized defensive testing or educational lab contexts.
-version: 8.10.0
+version: 8.11.0
 ---
 
 # Atoolkit Skill
@@ -56,6 +56,11 @@ Direct/QoderWork should use `engine.skill_runtime` for deterministic session
 state even though it remains untrusted. This closes execution feedback and
 multi-agent synchronization; it does not weaken the authority boundary.
 
+v8.11 threat mode starts from a validated business feature graph and explicit
+security invariants. Risk tags route knowledge; they do not create the coverage
+denominator. Direct runs without both threat artifacts remain compatible but
+are marked `legacy_risk/planning_degraded=true` and can never be report-ready.
+
 Use Engine Mode or the wrapper for canonical session diagnostics. Do not claim
 trusted cross-run delivery with the bundled Codex backends until an attested
 cgroup/job/container supervisor is integrated.
@@ -97,7 +102,9 @@ diagnostic receipt.
 python3 -m engine.skill_wrapper \
   --run-dir <session> --project-dir <project> \
   --authority-dir <outside-agent-writable-root> \
-  --target <url> --inventory <inventory.json> -- \
+  --target <url> --inventory <inventory.json> \
+  --feature-graph <feature-graph.json> --threat-model <threat-model.json> \
+  --provider <provider> --model-name <model> -- \
   codex exec <task>
 ```
 
@@ -108,13 +115,17 @@ Direct diagnostic commands:
 
 ```bash
 python3 -m engine.skill_runtime init --run-dir <session> --target <url> \
-  --inventory <inventory.json> --recon-dir <recon>
+  --inventory <inventory.json> --recon-dir <recon> \
+  --feature-graph <feature-graph.json> --threat-model <threat-model.json>
 python3 -m engine.skill_runtime observe --run-dir <session> \
   --agent-id <agent> --input <observation.json>
 python3 -m engine.skill_runtime checkpoint --run-dir <session>
 ```
 
 The observation/barrier contract is documented in `skill/runtime-hot-path.md`.
+Use `--legacy-risk-plan` on the wrapper only for an intentional degraded
+compatibility run. A threat-mode Finding additionally requires
+`feature_point.feature_id` and `claim.threat_id`.
 
 ## Fact-Intent Protocol
 
@@ -333,6 +344,8 @@ Skill Mode and Engine Mode now use one proof contract. The former streamlined sc
 | 6 | `target` | Endpoint + method (e.g. `POST /api/user/refund.php`) |
 | 7 | `risk.proven_impact` | Proven business impact (never "possible" / "suspected") |
 | 8 | `poc` | Object with `file` (e.g. `poc.sh`) and `steps` (list of curl commands) |
+| 8.1 | `feature_point.feature_id` | Required in threat-model mode; exact feature compiler identity |
+| 8.2 | `claim.threat_id` | Required in threat-model mode; exact threat compiler identity |
 | -- | `proof_packets` | Named request/response pairs with a machine-meaningful `phase` |
 | -- | `verification` | Evidence profile, observed effect, raw assertions, and class-specific controls |
 | -- | `claim` | `kind=root_finding`, invariant/profile, and referenced proof packet IDs |

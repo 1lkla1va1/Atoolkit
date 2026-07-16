@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover
 
 try:  # Support both ``python -m engine.finalize`` and direct repo CLI use.
     from .project_state import ProjectStateError, ProjectStateStore, _default_state
+    from .reporting.render_md import render_final_report
     from .reporting.validate import validate_run_artifacts
     from .run_authority import (
         canonical_digest,
@@ -44,6 +45,7 @@ try:  # Support both ``python -m engine.finalize`` and direct repo CLI use.
     from .version import __version__
 except ImportError:  # pragma: no cover - exercised by subprocess CLI tests
     from project_state import ProjectStateError, ProjectStateStore, _default_state
+    from reporting.render_md import render_final_report
     from reporting.validate import validate_run_artifacts
     from run_authority import (
         canonical_digest,
@@ -91,6 +93,8 @@ _DERIVED_RUN_FILES = {
     "project_state_commit.json",
     "run_receipt.json",
     "delivery_status.json",
+    "final_report.md",
+    "draft_report.md",
 }
 
 
@@ -213,6 +217,9 @@ def _snapshot_inputs(
     records: dict[str, dict[str, Any]] = {}
     for source in sorted(run_dir.rglob("*"), key=lambda item: item.as_posix()):
         relative = source.relative_to(run_dir)
+        if (relative.parts
+                and relative.parts[0] in {"final_report.md", "draft_report.md"}):
+            continue
         try:
             info = source.lstat()
         except OSError as exc:
@@ -751,6 +758,73 @@ def _gate_pass(validation: dict[str, Any], key: str, fallback: bool) -> bool:
     return fallback
 
 
+def _canonical_report_items(
+    validation: dict[str, Any],
+    *,
+    snapshot_run: pathlib.Path,
+    authority: pathlib.Path,
+) -> list[dict[str, Any]]:
+    """Reload only proof-confirmed raw Finding packages from frozen inputs."""
+    items: list[dict[str, Any]] = []
+    for record in validation.get("proof_confirmed") or []:
+        if not isinstance(record, dict):
+            raise FinalizationError("proof-confirmed report record is invalid")
+        path = pathlib.Path(str(record.get("path") or "")).resolve(strict=False)
+        try:
+            path.relative_to(snapshot_run)
+        except ValueError as exc:
+            raise FinalizationError(
+                f"proof-confirmed report path escapes snapshot: {path}") from exc
+        try:
+            finding = json.loads(
+                _read_regular_bytes(path, trusted_root=authority).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FinalizationError(
+                f"proof-confirmed finding is invalid JSON: {path}: {exc}") from exc
+        if not isinstance(finding, dict):
+            raise FinalizationError(f"proof-confirmed finding is not an object: {path}")
+        items.append({"id": record.get("id"), "path": str(path), "finding": finding})
+    return items
+
+
+def _remove_report_projection(path: pathlib.Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise FinalizationError(f"cannot remove stale report projection {path}: {exc}") from exc
+
+
+def _restore_canonical_report(
+    *,
+    run: pathlib.Path,
+    authority: pathlib.Path,
+    summary: dict[str, Any],
+) -> bool:
+    """Restore the journal-bound report and reject any changed authority copy."""
+    status = str(summary.get("canonical_report_status") or "not_generated")
+    report_path_text = str(summary.get("canonical_report_authority_path") or "")
+    expected = str(summary.get("canonical_report_sha256") or "")
+    _remove_report_projection(run / "final_report.md")
+    _remove_report_projection(run / "draft_report.md")
+    if status not in {"complete", "draft_incomplete"}:
+        return False
+    report_path = pathlib.Path(report_path_text)
+    try:
+        report_path.relative_to(authority)
+    except ValueError as exc:
+        raise FinalizationError("canonical report authority path escapes authority") from exc
+    payload = _read_regular_bytes(report_path, trusted_root=authority)
+    actual = hashlib.sha256(payload).hexdigest()
+    if not expected or actual != expected:
+        raise FinalizationError("canonical report differs from frozen summary")
+    destination = run / (
+        "final_report.md" if status == "complete" else "draft_report.md")
+    atomic_write_bytes(destination, payload, root=run)
+    return status == "complete"
+
+
 def finalize_run(
     *,
     run_dir: str | pathlib.Path,
@@ -988,6 +1062,34 @@ def finalize_run(
             # Session copies are projections only.  Their bytes always come
             # from the frozen authority inputs/journal.
             summary_status = str(validation.get("status") or "invalid")
+            report_items = _canonical_report_items(
+                validation, snapshot_run=snapshot_run, authority=authority)
+            canonical_report_status = "not_generated"
+            canonical_report_path: pathlib.Path | None = None
+            if (proof_pass and closure_pass
+                    and int(validation.get("exit_code", 3)) == 0):
+                canonical_report_status = "complete"
+                canonical_report_path = snapshot_run / "final_report.md"
+                render_final_report(
+                    report_items,
+                    canonical_report_path,
+                    target_name=str(manifest_value.get("primary_target") or "目标"),
+                    status="complete",
+                )
+            elif proof_pass and report_items:
+                canonical_report_status = "draft_incomplete"
+                canonical_report_path = snapshot_run / "draft_report.md"
+                render_final_report(
+                    report_items,
+                    canonical_report_path,
+                    target_name=str(manifest_value.get("primary_target") or "目标"),
+                    status="draft_incomplete",
+                    session_gate=validation.get("closure_gate") or {},
+                )
+            canonical_report_sha256 = (
+                hashlib.sha256(_read_regular_bytes(
+                    canonical_report_path, trusted_root=authority)).hexdigest()
+                if canonical_report_path is not None else "")
             summary = {
                 "schema_version": 2,
                 "atoolkit_version": __version__,
@@ -1018,6 +1120,26 @@ def finalize_run(
                 "run_plan_path": str(manifest_value.get("run_plan_path") or ""),
                 "run_plan_sha256": str(
                     manifest_value.get("run_plan_sha256") or ""),
+                "planning_mode": str(
+                    manifest_value.get("planning_mode") or "legacy_risk"),
+                "planning_degraded": bool(manifest_value.get(
+                    "planning_degraded",
+                    str(manifest_value.get("planning_mode") or "legacy_risk")
+                    != "threat_model",
+                )),
+                "execution_provenance": dict(
+                    manifest_value.get("execution_provenance") or {}),
+                "canonical_report_required": bool(
+                    manifest_value.get("canonical_report_required")),
+                "canonical_report_status": canonical_report_status,
+                "canonical_report_authority_path": (
+                    str(canonical_report_path) if canonical_report_path else ""),
+                "canonical_report_projection_path": (
+                    str(run / "final_report.md")
+                    if canonical_report_status == "complete" else
+                    str(run / "draft_report.md")
+                    if canonical_report_status == "draft_incomplete" else ""),
+                "canonical_report_sha256": canonical_report_sha256,
             }
             atomic_write_json(run / "finding_validation.json", validation, root=run)
             atomic_write_json(commit_projection, commit, root=run)
@@ -1040,6 +1162,8 @@ def finalize_run(
         atomic_write_json(run / "finding_validation.json", validation, root=run)
         atomic_write_json(commit_projection, commit, root=run)
         atomic_write_json(run / "summary.json", summary, root=run)
+        canonical_report_complete = _restore_canonical_report(
+            run=run, authority=authority, summary=summary)
 
         receipt_path = run / "run_receipt.json"
         anchor_path = authority / "receipts" / f"{session_id}.json"
@@ -1053,6 +1177,9 @@ def finalize_run(
                 if (snapshot_run / name).is_file():
                     artifacts[name.removesuffix(".json").replace("-", "_")] = (
                         snapshot_run / name)
+            if canonical_report_complete:
+                artifacts["final_report"] = pathlib.Path(str(
+                    summary.get("canonical_report_authority_path") or ""))
             receipt = write_run_receipt(
                 receipt_path,
                 manifest_path=snapshot_manifest,
@@ -1080,11 +1207,19 @@ def finalize_run(
                 receipt_path, run_dir=run, authority_dir=authority,
             )
             integrity_valid = bool(verification.get("integrity_valid"))
+            canonical_report_verified = bool(
+                canonical_report_complete
+                and "final_report" in (receipt.get("artifacts") or {})
+                and "final_report" not in (
+                    verification.get("missing_mandatory_artifacts") or [])
+                and integrity_valid
+            )
             assurance_eligible = frozen_assurance in {
                 "preexec_enforced", "dry_run_no_network",
             }
             delivery_complete = bool(
                 integrity_valid
+                and verification.get("delivery_complete")
                 and frozen_trusted
                 and assurance_eligible
                 and proof_pass
@@ -1111,6 +1246,7 @@ def finalize_run(
                 "closure_pass": closure_pass,
                 "receipt_verification": verification,
                 "receipt_anchor_path": str(anchor_path),
+                "canonical_report_verified": canonical_report_verified,
             }
             atomic_write_json(run / "delivery_status.json", delivery, root=run)
             advance("DELIVERY_WRITTEN", delivery=delivery)
@@ -1126,7 +1262,7 @@ def finalize_run(
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Atoolkit v8.9 exactly-once finalizer")
+    parser = argparse.ArgumentParser(description="Atoolkit exactly-once finalizer")
     parser.add_argument("--run-dir", required=True, type=pathlib.Path)
     parser.add_argument("--project-dir", required=True, type=pathlib.Path)
     parser.add_argument("--authority-dir", required=True, type=pathlib.Path)

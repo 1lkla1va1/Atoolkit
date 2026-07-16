@@ -290,6 +290,9 @@ def normalize_finding(
     ]) or finding_assets
 
     claim = finding.get("claim") if isinstance(finding.get("claim"), dict) else {}
+    feature_point = (
+        finding.get("feature_point")
+        if isinstance(finding.get("feature_point"), dict) else {})
     root_cause = str(
         finding.get("root_cause")
         or finding.get("root_cause_invariant")
@@ -336,6 +339,8 @@ def normalize_finding(
         "claim_kind": claim.get("kind", ""),
         "claim_profile": claim.get("profile", ""),
         "claim_invariant": claim.get("invariant", ""),
+        "feature_id": str(feature_point.get("feature_id") or "").strip(),
+        "threat_id": str(claim.get("threat_id") or finding.get("threat_id") or "").strip(),
         "source_candidate_id": claim.get("source_candidate_id", ""),
         "authorization_context": access_expectation,
         "proven_impact_claims": proven_impacts,

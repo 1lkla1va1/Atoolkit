@@ -2773,7 +2773,8 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                 allow_paths: list[str] | None = None,
                 deny_paths: list[str] | None = None,
                 authorization_assurance: str = "unverified",
-                target_fingerprint: str = "") -> dict:
+                target_fingerprint: str = "",
+                execution_provenance: dict | None = None) -> dict:
     """verify_fn(report_md) -> verify.VerifyResult，可选：对 accepted 报告做确定性重放复验。
     owned_ids：本会话自有对象 id，改删类命中其中则自动放行。
     confirm_policy："halt"=改删他人/未知 id 时熔断停手交人工(默认)；"allow"=放行(信任场景)。
@@ -3160,6 +3161,14 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         target_fingerprint=target_fingerprint,
         target_fingerprint_status=str(fingerprint_record.get("status") or "unknown"),
         run_plan_path=plan_file,
+        execution_provenance=(execution_provenance or {
+            "provider": "unknown",
+            "model": str(getattr(adapter, "model", "unknown") or "unknown"),
+            "adapter": str(getattr(adapter, "name", "unknown") or "unknown"),
+        }),
+        planning_mode="legacy_risk",
+        planning_degraded=True,
+        canonical_report_required=True,
     )
 
     # v8.8: an exact, fully terminal project matrix with no pending Intent is

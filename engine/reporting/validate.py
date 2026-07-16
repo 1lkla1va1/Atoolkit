@@ -12,12 +12,12 @@ try:
     from ..host_policy import is_authorized_url, normalize_authorized_scopes
     from ..run_authority import canonical_method_resolution_key
     from ..runtime_manifest import validate_manifest_binding
-    from ..safe_io import atomic_write_json, safe_read_text
+    from ..safe_io import atomic_write_json, safe_read_bytes, safe_read_text
 except ImportError:  # pragma: no cover - direct package fallback
     from host_policy import is_authorized_url, normalize_authorized_scopes
     from run_authority import canonical_method_resolution_key
     from runtime_manifest import validate_manifest_binding
-    from safe_io import atomic_write_json, safe_read_text
+    from safe_io import atomic_write_json, safe_read_bytes, safe_read_text
 
 from .schema import normalize_finding, resolve_finding_file
 
@@ -1227,6 +1227,14 @@ def validate_finding(
     source_proof = finding.get("source_proof")
     if not feature_point and not source_proof:
         reasons.append("feature_point or source_proof required")
+    if str(((context.manifest if context else {}) or {}).get(
+            "planning_mode") or "") == "threat_model":
+        if not isinstance(feature_point, dict) or not str(
+                feature_point.get("feature_id") or "").strip():
+            reasons.append("threat-model finding requires feature_point.feature_id")
+        claim = finding.get("claim") if isinstance(finding.get("claim"), dict) else {}
+        if not str(claim.get("threat_id") or "").strip():
+            reasons.append("threat-model finding requires claim.threat_id")
 
     apis = finding.get("apis")
     if not isinstance(apis, list) or not apis:
@@ -1434,6 +1442,8 @@ def _surface_has_current_finding(
     }
     surface_class = str(
         surface.get("vuln_class") or surface.get("legacy_vuln") or "").strip().lower()
+    surface_feature_id = str(surface.get("feature_id") or "").strip()
+    surface_threat_id = str(surface.get("threat_id") or "").strip()
     for finding in findings:
         proof_refs = {str(ref) for ref in finding.get("proof_files") or []}
         if evidence_relative not in proof_refs:
@@ -1441,6 +1451,12 @@ def _surface_has_current_finding(
         finding_class = str(
             finding.get("vuln_class") or finding.get("class") or "").strip().lower()
         if surface_class and finding_class and surface_class != finding_class:
+            continue
+        if (surface_feature_id
+                and str(finding.get("feature_id") or "").strip() != surface_feature_id):
+            continue
+        if (surface_threat_id
+                and str(finding.get("threat_id") or "").strip() != surface_threat_id):
             continue
 
         rows = [row for row in finding.get("exact_cells") or []
@@ -2313,6 +2329,156 @@ def _validated_dead_end_keys(
     return valid_keys, reasons, artifact_hashes
 
 
+def _threat_model_closure_gate(
+    run_dir: pathlib.Path,
+    *,
+    context: ValidationContext | None,
+    inventory_rows: list[Any],
+    surfaces: list[Any],
+    normalized_findings: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, str], dict[str, Any]]:
+    manifest = (context.manifest if context else None) or {}
+    if str(manifest.get("planning_mode") or "legacy_risk") != "threat_model":
+        return [], {}, {}
+    reasons: list[str] = []
+    hashes: dict[str, str] = {}
+    stats: dict[str, Any] = {}
+    graph_path = run_dir / "feature-graph.json"
+    model_path = run_dir / "threat-model.json"
+    coverage_path = run_dir / "threat-coverage.json"
+    values: dict[str, dict[str, Any]] = {}
+    for name, path in (
+        ("feature-graph.json", graph_path),
+        ("threat-model.json", model_path),
+        ("threat-coverage.json", coverage_path),
+    ):
+        try:
+            payload = safe_read_bytes(path, root=run_dir)
+            value = json.loads(payload.decode("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("must be an object")
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            reasons.append(f"threat_artifact_missing_or_invalid:{name}:{exc}")
+            continue
+        values[name] = value
+        hashes[name] = hashlib.sha256(payload).hexdigest()
+    if set(values) != {
+            "feature-graph.json", "threat-model.json", "threat-coverage.json"}:
+        return reasons, hashes, stats
+    try:
+        try:
+            from ..threat_model import (
+                compile_threat_model,
+                derive_threat_coverage,
+                validate_threat_plan,
+            )
+        except ImportError:  # pragma: no cover
+            from threat_model import (compile_threat_model,
+                                      derive_threat_coverage,
+                                      validate_threat_plan)
+        plan = validate_threat_plan(
+            values["feature-graph.json"],
+            values["threat-model.json"],
+            inventory_rows,
+            run_dir=run_dir,
+        )
+        expected = compile_threat_model(
+            plan,
+            inventory_rows,
+            target=str(manifest.get("primary_target") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001 - gate converts all plan errors
+        reasons.append(f"threat_plan_invalid:{type(exc).__name__}:{exc}")
+        return reasons, hashes, stats
+
+    actual = [row for row in surfaces if isinstance(row, dict)]
+    expected_by_id = {str(row.get("surface_id") or ""): row for row in expected}
+    actual_by_id = {str(row.get("surface_id") or ""): row for row in actual}
+    if (len(expected_by_id) != len(expected)
+            or len(actual_by_id) != len(actual)
+            or set(expected_by_id) != set(actual_by_id)):
+        reasons.append("threat_compiled_cell_set_mismatch")
+    dimensions = (
+        "feature_id", "threat_id", "endpoint", "method", "param",
+        "param_location", "actor_role", "vuln_class", "security_invariant",
+        "observable_violation",
+    )
+    for surface_id in sorted(set(expected_by_id) & set(actual_by_id)):
+        expected_row = expected_by_id[surface_id]
+        actual_row = actual_by_id[surface_id]
+        if any(
+            str(actual_row.get(key) or "").strip().lower()
+            != str(expected_row.get(key) or "").strip().lower()
+            for key in dimensions
+        ):
+            reasons.append("threat_compiled_cell_identity_mismatch")
+            break
+
+    plan_path = pathlib.Path(str(manifest.get("run_plan_path") or ""))
+    try:
+        plan_payload = safe_read_bytes(
+            plan_path, root=plan_path.parent.parent)
+        run_plan = json.loads(plan_payload.decode("utf-8"))
+        admitted = run_plan.get("admitted_cells") if isinstance(run_plan, dict) else None
+        if not isinstance(admitted, list):
+            raise ValueError("admitted_cells must be a list")
+        frozen_identities = {
+            (
+                str(row.get("surface_id") or ""),
+                str(row.get("feature_id") or ""),
+                str(row.get("threat_id") or ""),
+            )
+            for row in admitted if isinstance(row, dict)
+        }
+        expected_identities = {
+            (
+                str(row.get("surface_id") or ""),
+                str(row.get("feature_id") or ""),
+                str(row.get("threat_id") or ""),
+            )
+            for row in expected
+        }
+        if frozen_identities != expected_identities:
+            reasons.append("threat_run_plan_mismatch")
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        reasons.append(f"threat_run_plan_invalid:{exc}")
+
+    derived = derive_threat_coverage(actual, values["threat-model.json"])
+    stats = dict(derived.get("stats") or {})
+    if derived != values["threat-coverage.json"]:
+        reasons.append("threat_coverage_projection_mismatch")
+    if (int(stats.get("open_threats", 0) or 0) != 0
+            or int(stats.get("open_features", 0) or 0) != 0):
+        reasons.append("threat_coverage_open")
+    if int(stats.get("threats", 0) or 0) != sum(
+        len(item.get("threats") or [])
+        for item in values["threat-model.json"].get("features") or []
+        if isinstance(item, dict)
+    ):
+        reasons.append("threat_coverage_count_mismatch")
+
+    declared_pairs = {
+        (str(feature.get("feature_id") or ""), str(threat.get("threat_id") or ""))
+        for feature in values["threat-model.json"].get("features") or []
+        if isinstance(feature, dict)
+        for threat in feature.get("threats") or []
+        if isinstance(threat, dict)
+    }
+    confirmed_pairs = {
+        (str(row.get("feature_id") or ""), str(row.get("threat_id") or ""))
+        for row in actual if str(row.get("status") or "") == "confirmed"
+    }
+    for finding in normalized_findings:
+        pair = (
+            str(finding.get("feature_id") or ""),
+            str(finding.get("threat_id") or ""),
+        )
+        if pair not in declared_pairs or pair not in confirmed_pairs:
+            reasons.append("finding_threat_binding_mismatch")
+            break
+    return reasons, hashes, stats
+
+
 def _run_closure_gate(
     run_dir: pathlib.Path,
     context: ValidationContext | None = None,
@@ -2742,6 +2908,17 @@ def _run_closure_gate(
                     reasons.append("inventory_exact_cell_coverage_mismatch")
         except (TypeError, ValueError):
             reasons.append("inventory_coverage_invalid")
+    threat_reasons, threat_hashes, threat_stats = _threat_model_closure_gate(
+        run_dir,
+        context=context,
+        inventory_rows=(endpoints if isinstance(endpoints, list) else []),
+        surfaces=surfaces,
+        normalized_findings=[
+            row for row in (normalized_findings or []) if isinstance(row, dict)
+        ],
+    )
+    reasons.extend(threat_reasons)
+    closure_artifact_hashes.update(threat_hashes)
     reasons.extend(_authority_method_resolution_gate(
         context,
         endpoints if isinstance(endpoints, list) else [],
@@ -2805,6 +2982,7 @@ def _run_closure_gate(
         "reasons": reasons,
         "session_gate": session_gate,
         "authority_plan": plan_stats,
+        "threat_coverage": threat_stats,
         "artifact_hashes": closure_artifact_hashes,
     }
 

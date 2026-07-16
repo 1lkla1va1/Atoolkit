@@ -2109,6 +2109,11 @@ def main():
         "deny_paths": deny_paths,
         "authorization_assurance": authorization_assurance,
         "target_fingerprint": target_fingerprint,
+        "execution_provenance": {
+            "provider": "internal" if args.dry_run else "openai",
+            "model": "mock" if args.dry_run else args.model,
+            "adapter": str(getattr(adapter, "name", "unknown") or "unknown"),
+        },
     }
     run_parameters = inspect.signature(run_session).parameters
     for key, value in optional_runtime_args.items():

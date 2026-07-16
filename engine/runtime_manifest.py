@@ -184,6 +184,13 @@ _MANIFEST_V2_IDENTITY_FIELDS = _MANIFEST_BASE_IDENTITY_FIELDS + (
     "run_plan_path",
     "run_plan_sha256",
 )
+_MANIFEST_V3_IDENTITY_FIELDS = _MANIFEST_V2_IDENTITY_FIELDS + (
+    "execution_provenance",
+    "planning_mode",
+    "planning_degraded",
+    "planning_artifacts",
+    "canonical_report_required",
+)
 
 
 def _assert_manifest_request_identity(
@@ -201,6 +208,8 @@ def _assert_manifest_request_identity(
     except (TypeError, ValueError):
         schema_version = 0
     fields = (
+        _MANIFEST_V3_IDENTITY_FIELDS
+        if schema_version >= 3 else
         _MANIFEST_V2_IDENTITY_FIELDS
         if schema_version >= 2 else
         tuple(
@@ -450,6 +459,54 @@ def validate_manifest_binding(
             "reason": "run_plan_sha256 exists without run_plan_path",
         })
 
+    planning_artifacts = manifest.get("planning_artifacts") or {}
+    if not isinstance(planning_artifacts, dict):
+        errors.append({
+            "code": "planning_artifacts_invalid",
+            "reason": "planning_artifacts must be an object",
+        })
+    else:
+        for name, raw_record in sorted(planning_artifacts.items()):
+            if not isinstance(raw_record, dict):
+                errors.append({
+                    "code": "planning_artifact_invalid",
+                    "artifact": str(name),
+                    "reason": "planning artifact record must be an object",
+                })
+                continue
+            relative = pathlib.Path(str(raw_record.get("path") or ""))
+            expected_digest = str(raw_record.get("sha256") or "")
+            if (not relative.parts or relative.is_absolute()
+                    or ".." in relative.parts):
+                errors.append({
+                    "code": "planning_artifact_path_invalid",
+                    "artifact": str(name),
+                    "path": str(relative),
+                    "reason": "planning artifact must stay inside the run directory",
+                })
+                continue
+            path = run_base / relative
+            try:
+                payload = safe_read_bytes(path, root=run_base)
+            except (OSError, ValueError) as exc:
+                errors.append({
+                    "code": "planning_artifact_missing",
+                    "artifact": str(name),
+                    "path": str(path),
+                    "reason": str(exc),
+                })
+                continue
+            actual_digest = sha256_bytes(payload)
+            if not expected_digest or actual_digest != expected_digest:
+                errors.append({
+                    "code": "planning_artifact_digest_mismatch",
+                    "artifact": str(name),
+                    "path": str(path),
+                    "expected": expected_digest,
+                    "actual": actual_digest,
+                    "reason": "planning artifact differs from the frozen manifest",
+                })
+
     return {
         "ok": not errors,
         "errors": errors,
@@ -458,6 +515,70 @@ def validate_manifest_binding(
         "authority_id": authority_id,
         "authority_identity_path": str(identity_path) if identity_path else "",
     }
+
+
+_PROVENANCE_FIELDS = frozenset({"provider", "model", "adapter", "settings"})
+_PROVENANCE_SETTING_FIELDS = frozenset({
+    "temperature", "top_p", "seed", "reasoning_effort", "max_tokens",
+})
+
+
+def _normalize_execution_provenance(value: dict[str, Any] | None) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("execution_provenance must be an object")
+    unknown = set(value) - _PROVENANCE_FIELDS
+    if unknown:
+        raise ValueError(
+            f"execution_provenance contains forbidden fields: {sorted(unknown)}")
+    settings = value.get("settings") or {}
+    if not isinstance(settings, dict):
+        raise ValueError("execution_provenance.settings must be an object")
+    unknown_settings = set(settings) - _PROVENANCE_SETTING_FIELDS
+    if unknown_settings:
+        raise ValueError(
+            "execution_provenance.settings contains forbidden fields: "
+            f"{sorted(unknown_settings)}")
+    normalized_settings: dict[str, Any] = {}
+    for key, raw in sorted(settings.items()):
+        if raw is not None and not isinstance(raw, (str, int, float, bool)):
+            raise ValueError(
+                f"execution_provenance.settings.{key} must be a scalar or null")
+        normalized_settings[str(key)] = raw
+    return {
+        key: str(value.get(key) or "").strip()
+        for key in ("provider", "model", "adapter")
+        if str(value.get(key) or "").strip()
+    } | ({"settings": normalized_settings} if settings else {})
+
+
+def _planning_artifact_records(
+    run_base: pathlib.Path,
+    artifacts: dict[str, str | pathlib.Path],
+) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_path in sorted(artifacts.items()):
+        name = str(raw_name or "").strip()
+        if (not name or pathlib.Path(name).name != name
+                or name in {".", ".."}):
+            raise ValueError(f"invalid planning artifact name: {name!r}")
+        path = _absolute_lexical(raw_path)
+        try:
+            relative = path.relative_to(run_base)
+        except ValueError as exc:
+            raise ValueError(
+                f"planning artifact must stay inside run directory: {path}") from exc
+        try:
+            payload = safe_read_bytes(path, root=run_base)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"invalid planning artifact {path}: {exc}") from exc
+        records[name] = {
+            "path": relative.as_posix(),
+            "sha256": sha256_bytes(payload),
+            "size": len(payload),
+        }
+    return records
 
 
 def create_run_manifest(
@@ -481,6 +602,11 @@ def create_run_manifest(
     target_fingerprint: str = "",
     target_fingerprint_status: str = "",
     run_plan_path: str | pathlib.Path | None = None,
+    execution_provenance: dict[str, Any] | None = None,
+    planning_mode: str = "legacy_risk",
+    planning_degraded: bool | None = None,
+    planning_artifacts: dict[str, str | pathlib.Path] | None = None,
+    canonical_report_required: bool = False,
 ) -> dict[str, Any]:
     """Create the immutable-start provenance record and write it atomically."""
     run_base = _absolute_lexical(run_dir)
@@ -498,6 +624,22 @@ def create_run_manifest(
     ])
     if not scopes:
         raise ValueError("authorized_scopes must contain at least the primary target")
+    provenance = _normalize_execution_provenance(execution_provenance)
+    normalized_planning_mode = str(planning_mode or "legacy_risk").strip()
+    if normalized_planning_mode not in {"legacy_risk", "threat_model"}:
+        raise ValueError(f"invalid planning_mode: {normalized_planning_mode!r}")
+    artifact_bindings = _planning_artifact_records(
+        run_base, planning_artifacts or {})
+    degraded = (
+        normalized_planning_mode != "threat_model"
+        if planning_degraded is None else bool(planning_degraded))
+    if normalized_planning_mode == "threat_model" and degraded:
+        raise ValueError("threat_model planning cannot be marked degraded")
+    if normalized_planning_mode == "threat_model":
+        missing_plan = {"feature-graph.json", "threat-model.json"} - set(artifact_bindings)
+        if missing_plan:
+            raise ValueError(
+                f"threat_model planning requires frozen artifacts: {sorted(missing_plan)}")
     requested_plan = (
         str(_absolute_lexical(run_plan_path)) if run_plan_path else "")
     requested: dict[str, Any] = {
@@ -521,6 +663,11 @@ def create_run_manifest(
         "run_plan_path": requested_plan,
         "run_plan_sha256": (
             sha256_file(requested_plan) if requested_plan else ""),
+        "execution_provenance": provenance,
+        "planning_mode": normalized_planning_mode,
+        "planning_degraded": degraded,
+        "planning_artifacts": artifact_bindings,
+        "canonical_report_required": bool(canonical_report_required),
         "authz_sha256": sha256_text(authz),
     }
     manifest_path = run_base / "run_manifest.json"
@@ -565,7 +712,7 @@ def create_run_manifest(
     else:
         raise ValueError("authority manifest must be outside the model-writable run directory")
     manifest: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "atoolkit_version": __version__,
         "source_revision": revision,
         "source_dirty": bool(git_status),
@@ -615,6 +762,13 @@ MANDATORY_DELIVERY_ARTIFACTS = frozenset({
     "candidate_ledger",
     "project_state_commit",
 })
+
+
+def mandatory_delivery_artifacts(manifest: dict[str, Any] | None = None) -> frozenset[str]:
+    required = set(MANDATORY_DELIVERY_ARTIFACTS)
+    if bool((manifest or {}).get("canonical_report_required")):
+        required.add("final_report")
+    return frozenset(required)
 
 
 def _canonical_self_hash(value: dict[str, Any], field: str) -> str:
@@ -796,7 +950,8 @@ def write_run_receipt(
             "size": len(payload),
         }
 
-    missing = sorted(MANDATORY_DELIVERY_ARTIFACTS - set(artifact_records))
+    mandatory = mandatory_delivery_artifacts(manifest)
+    missing = sorted(mandatory - set(artifact_records))
     outcome = _validation_outcome(artifact_records)
     commit_snapshot_complete = False
     commit_integrity_valid = False
@@ -916,7 +1071,7 @@ def write_run_receipt(
         "authority_head_path": (
             str(authority_head_path) if authority_chain_required else ""),
         "artifacts": artifact_records,
-        "mandatory_artifacts": sorted(MANDATORY_DELIVERY_ARTIFACTS),
+        "mandatory_artifacts": sorted(mandatory),
         "missing_mandatory_artifacts": missing,
         "validation_outcome": outcome,
         "project_state_delta_sha256": (
@@ -1675,7 +1830,7 @@ def verify_run_receipt(
                         "reason": "receipt_anchor_authority_missing",
                     })
 
-    mandatory = set(MANDATORY_DELIVERY_ARTIFACTS)
+    mandatory = set(mandatory_delivery_artifacts(manifest))
     missing = sorted(mandatory - set(artifact_records))
     validation_value: dict[str, Any] = {}
     validation_record = artifact_records.get("finding_validation")

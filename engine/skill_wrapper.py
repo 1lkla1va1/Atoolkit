@@ -19,6 +19,7 @@ from typing import Any
 
 try:  # Support both package import and ``python engine/skill_wrapper.py``.
     from .finalize import finalize_run
+    from .ledger import CoverageLedger
     from .run_authority import (
         create_run_plan,
         ensure_project_identity,
@@ -26,8 +27,16 @@ try:  # Support both package import and ``python engine/skill_wrapper.py``.
         validate_session_id,
     )
     from .runtime_manifest import create_run_manifest
+    from .safe_io import atomic_write_json, safe_read_bytes
+    from .threat_model import (
+        ThreatModelError,
+        compile_threat_model,
+        derive_threat_coverage,
+        validate_threat_plan,
+    )
 except ImportError:  # pragma: no cover - exercised by subprocess CLI tests
     from finalize import finalize_run
+    from ledger import CoverageLedger
     from run_authority import (
         create_run_plan,
         ensure_project_identity,
@@ -35,6 +44,9 @@ except ImportError:  # pragma: no cover - exercised by subprocess CLI tests
         validate_session_id,
     )
     from runtime_manifest import create_run_manifest
+    from safe_io import atomic_write_json, safe_read_bytes
+    from threat_model import (ThreatModelError, compile_threat_model,
+                              derive_threat_coverage, validate_threat_plan)
 
 
 class SkillWrapperError(RuntimeError):
@@ -192,7 +204,7 @@ def _run_agent_process(command: list[str], *, cwd: pathlib.Path) -> int:
 def _load_admitted_cells(path: pathlib.Path | None) -> list[dict[str, Any] | str]:
     if path is None:
         return []
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = json.loads(safe_read_bytes(path, root=path.resolve().parent).decode("utf-8"))
     rows = value.get("surfaces") or value.get("endpoints") if isinstance(value, dict) else value
     if not isinstance(rows, list):
         raise SkillWrapperError("--inventory must contain a surfaces/endpoints list")
@@ -216,6 +228,10 @@ def run_wrapped_skill(
     project_name: str,
     command: list[str],
     inventory_path: pathlib.Path | None = None,
+    feature_graph_path: pathlib.Path | None = None,
+    threat_model_path: pathlib.Path | None = None,
+    legacy_risk_plan: bool = True,
+    execution_provenance: dict[str, Any] | None = None,
     base_path: str = "/",
     base_path_explicit: bool = False,
     authorized_scopes: list[str] | None = None,
@@ -244,7 +260,69 @@ def run_wrapped_skill(
         base_path=base_path,
         base_path_explicit=base_path_explicit,
     )
-    cells = _load_admitted_cells(inventory_path)
+    rows = _load_admitted_cells(inventory_path)
+    if (feature_graph_path is None) != (threat_model_path is None):
+        raise SkillWrapperError(
+            "--feature-graph and --threat-model must be provided together")
+    planning_mode = "legacy_risk"
+    planning_degraded = True
+    planning_artifacts: dict[str, pathlib.Path] = {}
+    if feature_graph_path is not None and threat_model_path is not None:
+        if not rows:
+            raise SkillWrapperError("threat-model wrapper requires --inventory")
+        try:
+            feature_graph = json.loads(safe_read_bytes(
+                feature_graph_path,
+                root=feature_graph_path.resolve().parent,
+            ).decode("utf-8"))
+            threat_model = json.loads(safe_read_bytes(
+                threat_model_path,
+                root=threat_model_path.resolve().parent,
+            ).decode("utf-8"))
+            plan = validate_threat_plan(
+                feature_graph, threat_model, rows, run_dir=run)
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError,
+                ThreatModelError) as exc:
+            raise SkillWrapperError(f"invalid threat plan: {exc}") from exc
+        cells = compile_threat_model(plan, rows, target=target)
+        if not cells:
+            raise SkillWrapperError("threat plan compiled no executable cells")
+        planning_mode = "threat_model"
+        planning_degraded = False
+        atomic_write_json(
+            run / "feature-graph.json", plan["feature_graph"], root=run,
+            reject_leaf_symlink=True)
+        atomic_write_json(
+            run / "threat-model.json", plan["threat_model"], root=run,
+            reject_leaf_symlink=True)
+        atomic_write_json(run / "inventory.json", {
+            "schema_version": "2.0", "target": target,
+            "endpoints": rows, "unresolved": [],
+        }, root=run, reject_leaf_symlink=True)
+        ledger = CoverageLedger(cells, metadata={
+            "sid": session_id, "target": target,
+            "source": "wrapped-threat-model",
+            "authority_trusted": False,
+            "planning_mode": planning_mode,
+            "planning_degraded": False,
+        })
+        ledger.save(run / "coverage-ledger.json")
+        atomic_write_json(run / "candidate-ledger.json", {
+            "schema_version": "1.1", "candidates": [],
+        }, root=run, reject_leaf_symlink=True)
+        atomic_write_json(
+            run / "threat-coverage.json",
+            derive_threat_coverage(ledger.surfaces, plan["threat_model"]),
+            root=run, reject_leaf_symlink=True)
+        planning_artifacts = {
+            "feature-graph.json": run / "feature-graph.json",
+            "threat-model.json": run / "threat-model.json",
+        }
+    else:
+        if not legacy_risk_plan:
+            raise SkillWrapperError(
+                "missing threat plan; pass --legacy-risk-plan for explicit degraded mode")
+        cells = rows
     create_run_plan(
         authority,
         project_id=identity["project_id"],
@@ -261,6 +339,13 @@ def run_wrapped_skill(
         "authz": authz,
         "authority_dir": authority,
         "run_plan_path": plan_path,
+        "execution_provenance": execution_provenance or {
+            "provider": "unknown", "model": "unknown", "adapter": "codex",
+        },
+        "planning_mode": planning_mode,
+        "planning_degraded": planning_degraded,
+        "planning_artifacts": planning_artifacts,
+        "canonical_report_required": True,
     }
     containment_verified = _process_containment_verified()
     optional = {
@@ -328,6 +413,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--target", required=True)
     parser.add_argument("--project-name", default="target")
     parser.add_argument("--inventory", type=pathlib.Path)
+    parser.add_argument("--feature-graph", type=pathlib.Path)
+    parser.add_argument("--threat-model", type=pathlib.Path)
+    parser.add_argument("--legacy-risk-plan", action="store_true")
+    parser.add_argument("--provider", default="unknown")
+    parser.add_argument("--model-name", default="unknown")
+    parser.add_argument("--adapter-name", default="codex")
     parser.add_argument("--base-path", default="/")
     parser.add_argument("--base-path-explicit", action="store_true")
     parser.add_argument("--allow", action="append", default=[])
@@ -351,6 +442,14 @@ def main(argv: list[str] | None = None) -> int:
             project_name=args.project_name,
             command=command,
             inventory_path=args.inventory,
+            feature_graph_path=args.feature_graph,
+            threat_model_path=args.threat_model,
+            legacy_risk_plan=args.legacy_risk_plan,
+            execution_provenance={
+                "provider": args.provider,
+                "model": args.model_name,
+                "adapter": args.adapter_name,
+            },
             base_path=args.base_path,
             base_path_explicit=args.base_path_explicit,
             authorized_scopes=[args.target, *args.allow],

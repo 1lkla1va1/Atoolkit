@@ -1,5 +1,16 @@
 # Changelog
 
+## 8.11.0 - 2026-07-17
+
+- 新增结构化 `feature-graph.json` / `threat-model.json` 校验与编译器：模型声明业务不变量和可观察突破，机器只把经 inventory/证据校验的 threat 编译为精确 cell；risk tag 降为知识路由。
+- 六类 discovery channel 必须绑定 run 内物理证据，resolved endpoint 必须归属 feature；无 threat 的 feature 必须说明理由，target method/param/role 必须与 inventory 一致。
+- Direct runtime 支持 threat plan init、observation 的 feature/threat 强绑定、计划漂移检测和 `threat-coverage.json`；旧 planner 显式标为 degraded 且永不 report-ready。
+- Wrapped Skill 在 agent 启动前验证 threat artifacts、冻结编译后的 authority run plan；缺少威胁计划时 CLI 仅允许显式 `--legacy-risk-plan` 降级运行。
+- Manifest schema 3 冻结 provider/model/adapter 的安全 allowlist、planning mode/artifact hash 与 Canonical 报告要求；Engine v8.11 明确记录仍为 legacy risk 计划。
+- Threat Mode Finding 强制绑定 `feature_point.feature_id` 与 `claim.threat_id`；closure gate 重编译计划并核对 frozen plan、ledger、threat coverage 和 Finding 证据映射。
+- Shared finalizer 独占报告生成权：完整闭合生成 `final_report.md`，未闭合已证结果生成 `draft_report.md`，无效运行移除两者；正式报告哈希进入 summary、receipt 和 delivery 验证。
+- 新增 v8.11 威胁计划、provenance、wrapper freeze、串格防护、invalid/empty Canonical 收口测试，并保持 v8.8/v8.9 authority/finalizer 兼容。
+
 ## 8.10.0 - 2026-07-16
 
 - 新增 Direct/QoderWork diagnostic `engine.skill_runtime`，提供 init/observe/checkpoint，按 append-only observation 确定性归并多 agent 状态；不伪造 authority、不改 ProjectState。

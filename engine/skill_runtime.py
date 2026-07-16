@@ -10,6 +10,7 @@ work queue.  Every artifact produced here remains diagnostic:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import re
@@ -47,6 +48,12 @@ try:
         safe_read_text,
     )
     from .surface import bootstrap as bootstrap_recon
+    from .threat_model import (
+        ThreatModelError,
+        compile_threat_model,
+        derive_threat_coverage,
+        validate_threat_plan,
+    )
     from .vuln_classes import norm_vc
 except ImportError:  # pragma: no cover - script execution fallback
     from blocker import RECOVERABLE, resolve_blocker
@@ -63,6 +70,8 @@ except ImportError:  # pragma: no cover - script execution fallback
     from safe_io import (atomic_write_json, create_json_exclusive,
                          ensure_directory, safe_read_bytes, safe_read_text)
     from surface import bootstrap as bootstrap_recon
+    from threat_model import (ThreatModelError, compile_threat_model,
+                              derive_threat_coverage, validate_threat_plan)
     from vuln_classes import norm_vc
 
 
@@ -180,6 +189,11 @@ def _queue_from_ledger(ledger: CoverageLedger, cards: list[dict]) -> list[dict[s
             "param": surface.get("param", ""),
             "roles": list(surface.get("roles") or []),
             "vuln_class": surface.get("vuln_class", ""),
+            "feature_id": surface.get("feature_id", ""),
+            "threat_id": surface.get("threat_id", ""),
+            "security_invariant": surface.get("security_invariant", ""),
+            "observable_violation": surface.get("observable_violation", ""),
+            "evidence_required": list(surface.get("evidence_required") or []),
             "status": surface.get("status", STATUS_NOT_TESTED),
             "next_actions": list(surface.get("next_actions") or []),
             "knowledge_card_ids": [card.get("id") for card in matched if card.get("id")],
@@ -196,21 +210,34 @@ def _runtime_status(
     rejected_findings: int = 0,
     projection_stale: bool = False,
     observation_errors: int = 0,
+    threat_coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stats = ledger.stats()
+    planning_mode = str(ledger.metadata.get("planning_mode") or "legacy_risk")
+    planning_degraded = bool(
+        ledger.metadata.get("planning_degraded", planning_mode != "threat_model"))
+    threat_stats = (threat_coverage or {}).get("stats") or {}
+    threat_closed = (
+        planning_mode == "threat_model"
+        and int(threat_stats.get("open_threats", 1) or 0) == 0
+        and int(threat_stats.get("open_features", 1) or 0) == 0
+    )
     return {
         "schema_version": 1,
         "mode": "direct_diagnostic",
         "run_dir": str(run),
         "authority_trusted": False,
         "delivery_eligible": False,
+        "planning_mode": planning_mode,
+        "planning_degraded": planning_degraded,
         "coverage": stats,
         "accepted_findings": accepted_findings,
         "rejected_findings": rejected_findings,
         "projection_stale": projection_stale,
         "observation_errors": observation_errors,
         "report_ready": bool(
-            stats.get("total") and not stats.get("open")
+            not planning_degraded and threat_closed
+            and stats.get("total") and not stats.get("open")
             and not projection_stale and not rejected_findings
             and not observation_errors),
     }
@@ -222,6 +249,8 @@ def initialize_direct_run(
     target: str,
     inventory_path: pathlib.Path | None = None,
     recon_dir: pathlib.Path | None = None,
+    feature_graph_path: pathlib.Path | None = None,
+    threat_model_path: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     """Initialize a diagnostic Direct-Skill ledger and bounded work queue."""
     run = run_dir.resolve()
@@ -233,16 +262,58 @@ def initialize_direct_run(
     if not rows:
         raise SkillRuntimeError("Direct runtime needs inventory or recon observations")
 
-    planned = plan_surfaces(rows)
+    if (feature_graph_path is None) != (threat_model_path is None):
+        raise SkillRuntimeError(
+            "feature_graph_path and threat_model_path must be provided together")
+    planning_mode = "legacy_risk"
+    planning_degraded = True
+    normalized_threat_model: dict[str, Any] | None = None
+    planning_artifact_hashes: dict[str, str] = {}
+    if feature_graph_path is not None and threat_model_path is not None:
+        feature_graph = _load_json(feature_graph_path)
+        threat_model = _load_json(threat_model_path)
+        try:
+            plan = validate_threat_plan(
+                feature_graph, threat_model, rows, run_dir=run)
+        except ThreatModelError as exc:
+            raise SkillRuntimeError(str(exc)) from exc
+        planned = compile_threat_model(plan, rows, target=target)
+        if not planned:
+            raise SkillRuntimeError("threat plan compiled no executable threat cells")
+        planning_mode = "threat_model"
+        planning_degraded = False
+        normalized_threat_model = plan["threat_model"]
+        atomic_write_json(
+            run / "feature-graph.json", plan["feature_graph"], root=run,
+            reject_leaf_symlink=True)
+        atomic_write_json(
+            run / "threat-model.json", normalized_threat_model, root=run,
+            reject_leaf_symlink=True)
+        planning_artifact_hashes = {
+            name: hashlib.sha256(safe_read_bytes(run / name, root=run)).hexdigest()
+            for name in ("feature-graph.json", "threat-model.json")
+        }
+        ledger = CoverageLedger(planned, metadata={
+            "sid": run.name,
+            "target": target,
+            "source": "direct-skill-runtime",
+            "authority_trusted": False,
+            "planning_mode": planning_mode,
+            "planning_degraded": planning_degraded,
+        })
+    else:
+        planned = plan_surfaces(rows)
+        if not planned:
+            raise SkillRuntimeError("inventory has no method-resolved surface")
+        state = CognitiveState(run.name, target)
+        state.seed_matrix(planned)
+        ledger = CoverageLedger.from_state({
+            "sid": run.name,
+            "target": target,
+            "matrix": state.matrix,
+        })
     if not planned:
         raise SkillRuntimeError("inventory has no method-resolved surface")
-    state = CognitiveState(run.name, target)
-    state.seed_matrix(planned)
-    ledger = CoverageLedger.from_state({
-        "sid": run.name,
-        "target": target,
-        "matrix": state.matrix,
-    })
     cards = load_cards()
     for surface in ledger.surfaces:
         surface["in_run_scope"] = True
@@ -262,6 +333,9 @@ def initialize_direct_run(
         "target": target,
         "source": "direct-skill-runtime",
         "authority_trusted": False,
+        "planning_mode": planning_mode,
+        "planning_degraded": planning_degraded,
+        "planning_artifact_hashes": planning_artifact_hashes,
     })
     ledger.save(run / "coverage-ledger.json")
     atomic_write_json(run / "candidate-ledger.json", {
@@ -271,7 +345,14 @@ def initialize_direct_run(
     atomic_write_json(run / "execution-queue.json", {
         "schema_version": 1, "queue": queue,
     }, root=run, reject_leaf_symlink=True)
-    status = _runtime_status(run, ledger)
+    threat_coverage = None
+    if normalized_threat_model is not None:
+        threat_coverage = derive_threat_coverage(
+            ledger.surfaces, normalized_threat_model)
+        atomic_write_json(
+            run / "threat-coverage.json", threat_coverage, root=run,
+            reject_leaf_symlink=True)
+    status = _runtime_status(run, ledger, threat_coverage=threat_coverage)
     atomic_write_json(run / "runtime-status.json", status, root=run, reject_leaf_symlink=True)
     return {**status, "execution_queue": queue}
 
@@ -309,8 +390,15 @@ def record_observation(
         raise SkillRuntimeError(f"invalid observation outcome: {outcome}")
     ledger = CoverageLedger.load(run / "coverage-ledger.json")
     surface_id = str(observation.get("surface_id") or "")
-    if not ledger.get(surface_id):
+    surface = ledger.get(surface_id)
+    if not surface:
         raise SkillRuntimeError(f"observation references unknown surface: {surface_id}")
+    for key in ("feature_id", "threat_id"):
+        expected = str(surface.get(key) or "")
+        supplied = str(observation.get(key) or "")
+        if supplied and supplied != expected:
+            raise SkillRuntimeError(
+                f"observation {key} mismatch: expected {expected!r}, got {supplied!r}")
 
     refs = [_validate_ref(run, str(ref)) for ref in _as_list(observation.get("evidence_refs"))]
     normalized = {
@@ -321,6 +409,8 @@ def record_observation(
         "surface_id": surface_id,
         "outcome": outcome,
         "evidence_refs": refs,
+        **({"feature_id": surface["feature_id"]} if surface.get("feature_id") else {}),
+        **({"threat_id": surface["threat_id"]} if surface.get("threat_id") else {}),
     }
     destination = run / "state" / "observations" / f"{agent_id}--{observation_id}.json"
     ensure_directory(destination.parent, root=run)
@@ -464,6 +554,17 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     """Reduce all immutable observations into ledger/status/queue projections."""
     run = run_dir.resolve()
     ledger = CoverageLedger.load(run / "coverage-ledger.json")
+    for name, expected in sorted(
+            (ledger.metadata.get("planning_artifact_hashes") or {}).items()):
+        try:
+            actual = hashlib.sha256(
+                safe_read_bytes(run / str(name), root=run)).hexdigest()
+        except (OSError, ValueError) as exc:
+            raise SkillRuntimeError(
+                f"planning artifact is missing or unsafe: {name}: {exc}") from exc
+        if actual != str(expected or ""):
+            raise SkillRuntimeError(
+                f"planning artifact digest mismatch: {name}")
     cards = load_cards()
     observations, observation_errors = _read_observations(run)
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -645,6 +746,13 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         "schema_version": 1, "queue": queue,
     }, root=run, reject_leaf_symlink=True)
     stale = _projection_stale(run, len(collected.get("accepted") or []))
+    threat_coverage = None
+    if str(ledger.metadata.get("planning_mode") or "") == "threat_model":
+        threat_model = _load_json(run / "threat-model.json", root=run)
+        threat_coverage = derive_threat_coverage(ledger.surfaces, threat_model)
+        atomic_write_json(
+            run / "threat-coverage.json", threat_coverage, root=run,
+            reject_leaf_symlink=True)
     status = _runtime_status(
         run,
         ledger,
@@ -654,6 +762,7 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
             + len(collected.get("ingestion_errors") or [])),
         projection_stale=stale,
         observation_errors=len(observation_errors),
+        threat_coverage=threat_coverage,
     )
     checkpoint = {
         "schema_version": 1,
@@ -667,6 +776,7 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
             "rejected": len(collected.get("rejected") or []),
             "ingestion_errors": collected.get("ingestion_errors") or [],
         },
+        **({"threat_coverage": threat_coverage} if threat_coverage is not None else {}),
     }
     atomic_write_json(run / "state" / "checkpoint.json", checkpoint, root=run,
                       reject_leaf_symlink=True)
@@ -684,6 +794,8 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--target", required=True)
     init.add_argument("--inventory", type=pathlib.Path)
     init.add_argument("--recon-dir", type=pathlib.Path)
+    init.add_argument("--feature-graph", type=pathlib.Path)
+    init.add_argument("--threat-model", type=pathlib.Path)
     observe = sub.add_parser("observe")
     observe.add_argument("--run-dir", required=True, type=pathlib.Path)
     observe.add_argument("--agent-id", required=True)
@@ -699,7 +811,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "init":
             result = initialize_direct_run(
                 run_dir=args.run_dir, target=args.target,
-                inventory_path=args.inventory, recon_dir=args.recon_dir)
+                inventory_path=args.inventory, recon_dir=args.recon_dir,
+                feature_graph_path=args.feature_graph,
+                threat_model_path=args.threat_model)
         elif args.command == "observe":
             if args.input == "-":
                 observation = json.load(sys.stdin)

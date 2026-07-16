@@ -28,8 +28,9 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _negative_fixture(tmp_path):
-    _manifest(tmp_path)
+def _negative_fixture(tmp_path, *, create_manifest: bool = True):
+    if create_manifest:
+        _manifest(tmp_path)
     exact_cell = {
         "asset_id": "https://t.example:443",
         "endpoint": "/api/search",

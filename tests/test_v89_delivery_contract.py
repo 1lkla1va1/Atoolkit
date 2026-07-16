@@ -37,6 +37,7 @@ def _manifest(
     run_dir: pathlib.Path, *, authority_dir: pathlib.Path | None = None,
     authorization_assurance: str = "dry_run_no_network",
     admitted_cells=(),
+    canonical_report_required: bool = False,
 ) -> dict:
     source = run_dir.parent / "source"
     _write(source / "SKILL.md", "---\nversion: 8.9.0\n---\n")
@@ -75,18 +76,21 @@ def _manifest(
         project_id=identity["project_id"],
         run_plan_path=run_plan_path(authority, run_dir.name),
         authorization_assurance=authorization_assurance,
+        canonical_report_required=canonical_report_required,
     )
 
 
 def _complete_finding_run(
     run_dir: pathlib.Path,
     *, authorization_assurance: str = "dry_run_no_network",
+    canonical_report_required: bool = False,
 ) -> dict:
     run_dir.mkdir(parents=True, exist_ok=True)
     _idor_fixture(run_dir)
     _manifest(
         run_dir,
         authorization_assurance=authorization_assurance,
+        canonical_report_required=canonical_report_required,
         admitted_cells=[{
             "asset_id": "https://t.example:443",
             "endpoint": "/api/orders/{id}",
