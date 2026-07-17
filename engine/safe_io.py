@@ -198,6 +198,7 @@ def safe_read_bytes(
     path: str | os.PathLike[str],
     *,
     root: str | os.PathLike[str] | None = None,
+    max_bytes: int | None = None,
 ) -> bytes:
     """Read a regular, singly-linked file without following any symlink."""
     with _open_parent(path, root=root, create_parents=False) as (parent_fd, leaf, target):
@@ -218,10 +219,15 @@ def safe_read_bytes(
             if info.st_nlink != 1:
                 raise UnsafePathError(f"read source has multiple hard links: {target}")
             chunks: list[bytes] = []
+            total = 0
             while True:
                 chunk = os.read(descriptor, 1024 * 1024)
                 if not chunk:
                     return b"".join(chunks)
+                total += len(chunk)
+                if max_bytes is not None and total > int(max_bytes):
+                    raise ValueError(
+                        f"read source exceeds max_bytes={int(max_bytes)}: {target}")
                 chunks.append(chunk)
         finally:
             os.close(descriptor)

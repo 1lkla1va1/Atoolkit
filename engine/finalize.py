@@ -1127,6 +1127,8 @@ def finalize_run(
                     str(manifest_value.get("planning_mode") or "legacy_risk")
                     != "threat_model",
                 )),
+                "run_phase": str(manifest_value.get("run_phase") or "single"),
+                "phase_parent": dict(manifest_value.get("phase_parent") or {}),
                 "execution_provenance": dict(
                     manifest_value.get("execution_provenance") or {}),
                 "canonical_report_required": bool(

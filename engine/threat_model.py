@@ -41,6 +41,15 @@ REQUIRED_DISCOVERY_CHANNELS = (
     "response_body",
 )
 DISCOVERY_STATUSES = {"covered", "blocked", "not_applicable"}
+CODE_DISCOVERY_CHANNELS = {"js_ref", "inline_script", "asset_ref"}
+RUNTIME_DISCOVERY_CHANNELS = {"page_link", "path_inference", "response_body"}
+IDENTITY_MODES = {
+    "single",
+    "anonymous_plus_authenticated",
+    "peer_pair",
+    "role_pair",
+    "stateful_owner",
+}
 TERMINAL_STATUSES = {
     STATUS_CONFIRMED,
     STATUS_NOT_VULNERABLE,
@@ -78,6 +87,97 @@ def _endpoint(value: Any) -> str:
     return parsed.path or text.split("?", 1)[0]
 
 
+def _normalized_prefix(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "/"
+    if not text.startswith("/"):
+        text = "/" + text
+    return text if text == "/" else text.rstrip("/") + "/"
+
+
+def _path_in_scope(
+    endpoint: str,
+    *,
+    base_path: str,
+    base_path_explicit: bool,
+    allow_paths: Iterable[str] | None,
+    deny_paths: Iterable[str] | None,
+) -> bool:
+    path = _endpoint(endpoint)
+    normalized = path if path == "/" else path.rstrip("/") + "/"
+    denied = [_normalized_prefix(value) for value in (deny_paths or [])]
+    if any(normalized.startswith(prefix) for prefix in denied):
+        return False
+    allowed = [_normalized_prefix(value) for value in (allow_paths or [])]
+    if allowed:
+        return any(normalized.startswith(prefix) for prefix in allowed)
+    if base_path_explicit and _normalized_prefix(base_path) != "/":
+        return normalized.startswith(_normalized_prefix(base_path))
+    return True
+
+
+def _default_identity_requirement(threat: dict[str, Any]) -> dict[str, Any]:
+    vuln = str(threat.get("vuln_class") or "").lower()
+    attacker = str(threat.get("attacker") or "").lower()
+    hay = f"{vuln} {attacker}"
+    if any(value in hay for value in (
+        "idor", "越权", "authorization", "access-control", "access control",
+    )):
+        mode = "peer_pair"
+    elif any(value in hay for value in (
+        "unauth", "未授权", "anonymous", "认证绕过", "auth-bypass",
+    )):
+        mode = "anonymous_plus_authenticated"
+    else:
+        mode = "single"
+    minimum = 2 if mode in {"peer_pair", "role_pair"} else (
+        1 if mode in {"anonymous_plus_authenticated", "stateful_owner"} else 0)
+    return {
+        "mode": mode,
+        "roles": [],
+        "minimum_distinct_credentials": minimum,
+        "reason": "host-derived conservative default",
+    }
+
+
+def _normalize_identity_requirement(
+    threat: dict[str, Any], context: str, errors: list[str],
+) -> dict[str, Any]:
+    raw = threat.get("identity_requirement")
+    if raw in (None, ""):
+        return _default_identity_requirement(threat)
+    if not isinstance(raw, dict):
+        errors.append(f"{context}.identity_requirement must be an object")
+        return _default_identity_requirement(threat)
+    mode = str(raw.get("mode") or "").strip().lower()
+    if mode not in IDENTITY_MODES:
+        errors.append(f"{context}.identity_requirement.mode is invalid: {mode!r}")
+    roles = _strings(raw.get("roles"))
+    default_minimum = 2 if mode in {"peer_pair", "role_pair"} else (
+        1 if mode in {"anonymous_plus_authenticated", "stateful_owner"} else 0)
+    try:
+        minimum = int(raw.get("minimum_distinct_credentials", default_minimum))
+    except (TypeError, ValueError):
+        minimum = -1
+    if minimum < default_minimum:
+        errors.append(
+            f"{context}.identity_requirement.minimum_distinct_credentials "
+            f"must be >= {default_minimum} for {mode}")
+    if mode == "role_pair" and len(set(role.lower() for role in roles)) < 2:
+        errors.append(f"{context}.identity_requirement.role_pair requires two roles")
+    reason = str(raw.get("reason") or "").strip()
+    if not reason:
+        errors.append(f"{context}.identity_requirement.reason is required")
+    return {
+        **raw,
+        "mode": mode,
+        "roles": roles,
+        "minimum_distinct_credentials": max(minimum, 0),
+        "reason": reason,
+    }
+
+
 def _inventory_index(
     inventory_rows: Iterable[dict[str, Any] | str],
 ) -> dict[tuple[str, str], dict[str, Any]]:
@@ -98,11 +198,20 @@ def _inventory_index(
         if not endpoint or not method:
             continue
         specs = extract_param_specs(endpoint, row)
-        index[(endpoint, method)] = {
-            "row": row,
-            "params": {name: location for name, location in specs},
-            "roles": _strings(row.get("roles") or row.get("role")),
-        }
+        key = (endpoint, method)
+        current = index.get(key)
+        if current is None:
+            index[key] = {
+                "row": row,
+                "params": {name: location for name, location in specs},
+                "roles": _strings(row.get("roles") or row.get("role")),
+            }
+        else:
+            current["params"].update({name: location for name, location in specs})
+            current["roles"] = _strings([
+                *current.get("roles", []),
+                *_strings(row.get("roles") or row.get("role")),
+            ])
     return index
 
 
@@ -132,6 +241,11 @@ def validate_threat_plan(
     inventory_rows: Iterable[dict[str, Any] | str],
     *,
     run_dir: str | pathlib.Path,
+    base_path: str = "/",
+    base_path_explicit: bool = False,
+    allow_paths: Iterable[str] | None = None,
+    deny_paths: Iterable[str] | None = None,
+    require_discovery_adequacy: bool = True,
 ) -> dict[str, Any]:
     """Validate model reasoning against inventory and physical discovery evidence."""
     if not isinstance(feature_graph, dict) or not isinstance(threat_model, dict):
@@ -167,6 +281,17 @@ def validate_threat_plan(
             "evidence_refs": refs,
             **({"reason": reason} if reason else {}),
         }
+    if require_discovery_adequacy:
+        covered = {
+            name for name, item in normalized_channels.items()
+            if item.get("status") == "covered"
+        }
+        if len(covered) < 2:
+            errors.append("discovery adequacy requires at least two covered channels")
+        if not (covered & CODE_DISCOVERY_CHANNELS):
+            errors.append("discovery adequacy requires a code/asset channel")
+        if not (covered & RUNTIME_DISCOVERY_CHANNELS):
+            errors.append("discovery adequacy requires a navigation/runtime channel")
 
     raw_features = feature_graph.get("features")
     if not isinstance(raw_features, list) or not raw_features:
@@ -209,6 +334,12 @@ def validate_threat_plan(
                 errors.append(f"{api_context} requires endpoint and method")
             elif observed is None:
                 errors.append(f"{api_context} {method} {endpoint} is not in inventory")
+            elif not _path_in_scope(
+                    endpoint, base_path=base_path,
+                    base_path_explicit=base_path_explicit,
+                    allow_paths=allow_paths, deny_paths=deny_paths):
+                errors.append(
+                    f"{api_context} {method} {endpoint} is outside frozen path scope")
             params = _strings(raw_api.get("params"))
             if observed is not None:
                 missing = sorted(set(params) - set(observed["params"]))
@@ -358,6 +489,8 @@ def validate_threat_plan(
             threat["threat_id"] = threat_id
             threat["targets"] = normalized_targets
             threat["evidence_required"] = evidence_required
+            threat["identity_requirement"] = _normalize_identity_requirement(
+                threat, threat_context, errors)
             normalized_threats.append(threat)
         item["feature_id"] = feature_id
         item["coverage_note"] = dict(note)
@@ -404,6 +537,7 @@ def compile_threat_model(
     }
     surfaces: list[dict[str, Any]] = []
     seen: set[str] = set()
+    exact_identities: dict[tuple[str, ...], tuple[str, str]] = {}
     for threat_feature in plan.get("threat_model", {}).get("features", []):
         feature_id = str(threat_feature.get("feature_id") or "")
         feature = feature_by_id.get(feature_id, {})
@@ -428,6 +562,18 @@ def compile_threat_model(
                             continue
                         seen.add(sid)
                         location = str(observed.get("params", {}).get(param, ""))
+                        exact_identity = (
+                            str(target).strip().lower(), endpoint.lower(), method.lower(),
+                            param.lower(), role.lower(), location.lower(),
+                            vuln_class.strip().lower(),
+                        )
+                        prior = exact_identities.get(exact_identity)
+                        if prior is not None and prior != (feature_id, threat_id):
+                            raise ThreatModelError(
+                                "two threats compile to the same runtime cell; "
+                                "use distinct vuln_class values or target dimensions: "
+                                f"{prior[0]}/{prior[1]} and {feature_id}/{threat_id}")
+                        exact_identities[exact_identity] = (feature_id, threat_id)
                         surfaces.append({
                             "surface_id": sid,
                             "asset_id": str(
@@ -454,6 +600,8 @@ def compile_threat_model(
                                 threat.get("expected_secure_result") or ""),
                             "observable_violation": str(threat.get("observable_violation") or ""),
                             "evidence_required": _strings(threat.get("evidence_required")),
+                            "identity_requirement": dict(
+                                threat.get("identity_requirement") or {"mode": "single"}),
                             "coverage_note": dict(threat_feature.get("coverage_note") or {}),
                             "status": "not_tested",
                             "source": "threat-model-compiler",

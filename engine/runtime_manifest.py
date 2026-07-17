@@ -14,6 +14,7 @@ import pathlib
 import re
 import secrets
 import subprocess
+import time
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
@@ -25,6 +26,7 @@ try:
         ensure_directory,
         exclusive_file_lock,
         safe_read_bytes,
+        UnsafePathError,
     )
     from .run_authority import validate_session_id
     from .version import __version__
@@ -36,6 +38,7 @@ except ImportError:  # pragma: no cover - direct script fallback
         ensure_directory,
         exclusive_file_lock,
         safe_read_bytes,
+        UnsafePathError,
     )
     from run_authority import validate_session_id
     from version import __version__
@@ -85,10 +88,22 @@ def _absolute_lexical(path: str | pathlib.Path) -> pathlib.Path:
 
 def load_manifest(path: str | pathlib.Path) -> dict[str, Any]:
     manifest_path = pathlib.Path(path)
-    try:
-        value = json.loads(safe_read_bytes(manifest_path).decode("utf-8"))
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid runtime manifest {manifest_path}: {exc}") from exc
+    value: Any = None
+    for attempt in range(51):
+        try:
+            value = json.loads(safe_read_bytes(manifest_path).decode("utf-8"))
+            break
+        except UnsafePathError as exc:
+            # Atomic no-clobber publication briefly has link count 2, while a
+            # concurrent atomic replacement can leave an already-open inode at
+            # link count 0.  Retry only this bounded publication window;
+            # persistent hard links remain a hard failure.
+            if "multiple hard links" not in str(exc) or attempt >= 50:
+                raise ValueError(
+                    f"invalid runtime manifest {manifest_path}: {exc}") from exc
+            time.sleep(0.002)
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid runtime manifest {manifest_path}: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"runtime manifest must be an object: {manifest_path}")
     return value
@@ -191,6 +206,10 @@ _MANIFEST_V3_IDENTITY_FIELDS = _MANIFEST_V2_IDENTITY_FIELDS + (
     "planning_artifacts",
     "canonical_report_required",
 )
+_MANIFEST_V4_IDENTITY_FIELDS = _MANIFEST_V3_IDENTITY_FIELDS + (
+    "run_phase",
+    "phase_parent",
+)
 
 
 def _assert_manifest_request_identity(
@@ -208,6 +227,8 @@ def _assert_manifest_request_identity(
     except (TypeError, ValueError):
         schema_version = 0
     fields = (
+        _MANIFEST_V4_IDENTITY_FIELDS
+        if schema_version >= 4 else
         _MANIFEST_V3_IDENTITY_FIELDS
         if schema_version >= 3 else
         _MANIFEST_V2_IDENTITY_FIELDS
@@ -507,6 +528,131 @@ def validate_manifest_binding(
                     "reason": "planning artifact differs from the frozen manifest",
                 })
 
+    run_phase = str(manifest.get("run_phase") or "single").strip().lower()
+    planning_mode = str(
+        manifest.get("planning_mode") or "legacy_risk").strip().lower()
+    phase_parent = manifest.get("phase_parent") or {}
+    if run_phase not in {"single", "planning", "attack"}:
+        errors.append({
+            "code": "run_phase_invalid",
+            "reason": f"unsupported run_phase: {run_phase!r}",
+        })
+    if run_phase == "planning" and planning_mode != "threat_discovery":
+        errors.append({
+            "code": "planning_phase_mode_mismatch",
+            "reason": "planning phase requires threat_discovery mode",
+        })
+    if planning_mode == "threat_discovery" and run_phase != "planning":
+        errors.append({
+            "code": "planning_phase_mode_mismatch",
+            "reason": "threat_discovery mode requires planning phase",
+        })
+    parent_required = run_phase == "attack" and planning_mode == "threat_model"
+    if parent_required and not isinstance(phase_parent, dict):
+        errors.append({
+            "code": "phase_parent_invalid",
+            "reason": "two-stage attack requires a phase_parent object",
+        })
+        phase_parent = {}
+    if parent_required:
+        parent_session = str(phase_parent.get("session_id") or "").strip()
+        parent_path_text = str(phase_parent.get("manifest_path") or "").strip()
+        parent_digest = str(phase_parent.get("manifest_sha256") or "").strip()
+        expected_session = f"{session_id}.planning"
+        if parent_session != expected_session:
+            errors.append({
+                "code": "phase_parent_session_mismatch",
+                "expected": expected_session,
+                "actual": parent_session,
+            })
+        parent_path = _absolute_lexical(parent_path_text) if parent_path_text else None
+        expected_parent = (
+            authority_path.parent / f"{expected_session}.json"
+            if authority_path is not None and session_id else None)
+        if parent_path is None or expected_parent is None or parent_path != expected_parent:
+            errors.append({
+                "code": "phase_parent_path_mismatch",
+                "expected": str(expected_parent or ""),
+                "actual": str(parent_path or ""),
+            })
+        elif not parent_path.is_file() or parent_path.is_symlink():
+            errors.append({
+                "code": "phase_parent_missing",
+                "path": str(parent_path),
+            })
+        else:
+            try:
+                payload = safe_read_bytes(
+                    parent_path, root=parent_path.parent.parent)
+                parent = json.loads(payload.decode("utf-8"))
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+                errors.append({
+                    "code": "phase_parent_invalid",
+                    "path": str(parent_path),
+                    "reason": str(exc),
+                })
+            else:
+                actual = sha256_bytes(payload)
+                if not parent_digest or parent_digest != actual:
+                    errors.append({
+                        "code": "phase_parent_digest_mismatch",
+                        "expected": parent_digest,
+                        "actual": actual,
+                    })
+                comparisons = {
+                    "project_id": manifest.get("project_id"),
+                    "primary_target": manifest.get("primary_target"),
+                    "authorized_scopes": manifest.get("authorized_scopes"),
+                    "base_path": manifest.get("base_path"),
+                    "base_path_explicit": manifest.get("base_path_explicit"),
+                    "allow_paths": manifest.get("allow_paths"),
+                    "deny_paths": manifest.get("deny_paths"),
+                    "authority_id": manifest.get("authority_id"),
+                    "execution_provenance": manifest.get("execution_provenance"),
+                }
+                for field, expected in comparisons.items():
+                    if parent.get(field) != expected:
+                        errors.append({
+                            "code": "phase_parent_identity_mismatch",
+                            "field": field,
+                        })
+                if str(parent.get("run_phase") or "") != "planning":
+                    errors.append({
+                        "code": "phase_parent_not_planning",
+                        "reason": "parent manifest is not a planning phase",
+                    })
+                if str(parent.get("planning_mode") or "") != "threat_discovery":
+                    errors.append({
+                        "code": "phase_parent_not_planning",
+                        "reason": "parent manifest is not threat_discovery mode",
+                    })
+                if str(parent.get("authority_path") or "") != str(parent_path):
+                    errors.append({
+                        "code": "phase_parent_authority_mismatch",
+                    })
+                if (str(parent.get("run_phase") or "") == "planning"
+                        and str(parent.get("planning_mode") or "")
+                        == "threat_discovery"):
+                    # Finalizer validates an immutable snapshot of the Attack
+                    # run, where the Planning sibling is intentionally absent.
+                    # Derive the live Planning session from the authority root,
+                    # never from the caller-controlled snapshot location.
+                    planning_run = (
+                        authority_path.parent.parent.parent
+                        / "sessions" / expected_session)
+                    parent_binding = validate_manifest_binding(
+                        parent, run_dir=planning_run)
+                    for parent_error in parent_binding.get("errors") or []:
+                        errors.append({
+                            "code": "phase_parent_binding_invalid",
+                            "parent_error": parent_error,
+                        })
+    elif phase_parent:
+        errors.append({
+            "code": "phase_parent_unexpected",
+            "reason": "phase_parent is only valid for two-stage threat attacks",
+        })
+
     return {
         "ok": not errors,
         "errors": errors,
@@ -607,6 +753,8 @@ def create_run_manifest(
     planning_degraded: bool | None = None,
     planning_artifacts: dict[str, str | pathlib.Path] | None = None,
     canonical_report_required: bool = False,
+    run_phase: str = "single",
+    phase_parent: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create the immutable-start provenance record and write it atomically."""
     run_base = _absolute_lexical(run_dir)
@@ -626,8 +774,16 @@ def create_run_manifest(
         raise ValueError("authorized_scopes must contain at least the primary target")
     provenance = _normalize_execution_provenance(execution_provenance)
     normalized_planning_mode = str(planning_mode or "legacy_risk").strip()
-    if normalized_planning_mode not in {"legacy_risk", "threat_model"}:
+    if normalized_planning_mode not in {
+            "legacy_risk", "threat_model", "threat_discovery"}:
         raise ValueError(f"invalid planning_mode: {normalized_planning_mode!r}")
+    normalized_phase = str(run_phase or "single").strip().lower()
+    if normalized_phase not in {"single", "planning", "attack"}:
+        raise ValueError(f"invalid run_phase: {normalized_phase!r}")
+    if normalized_phase == "planning" and normalized_planning_mode != "threat_discovery":
+        raise ValueError("planning phase requires planning_mode=threat_discovery")
+    if normalized_planning_mode == "threat_discovery" and normalized_phase != "planning":
+        raise ValueError("threat_discovery planning requires run_phase=planning")
     artifact_bindings = _planning_artifact_records(
         run_base, planning_artifacts or {})
     degraded = (
@@ -640,6 +796,33 @@ def create_run_manifest(
         if missing_plan:
             raise ValueError(
                 f"threat_model planning requires frozen artifacts: {sorted(missing_plan)}")
+    normalized_parent: dict[str, Any] = {}
+    if phase_parent:
+        if not isinstance(phase_parent, dict):
+            raise ValueError("phase_parent must be an object")
+        parent_session = str(phase_parent.get("session_id") or "").strip()
+        parent_path_text = str(phase_parent.get("manifest_path") or "").strip()
+        requested_parent_digest = str(
+            phase_parent.get("manifest_sha256") or "").strip()
+        if not parent_session or not parent_path_text:
+            raise ValueError("phase_parent requires session_id and manifest_path")
+        parent_path = _absolute_lexical(parent_path_text)
+        if not parent_path.is_file() or parent_path.is_symlink():
+            raise ValueError("phase_parent manifest is missing or unsafe")
+        actual_parent_digest = sha256_file(parent_path)
+        if (requested_parent_digest
+                and requested_parent_digest != actual_parent_digest):
+            raise ValueError("phase_parent manifest digest mismatch")
+        normalized_parent = {
+            "session_id": parent_session,
+            "manifest_path": str(parent_path),
+            "manifest_sha256": actual_parent_digest,
+        }
+    if normalized_phase == "attack" and normalized_planning_mode == "threat_model":
+        if not normalized_parent:
+            raise ValueError("two-stage threat attack requires phase_parent")
+    elif normalized_parent:
+        raise ValueError("phase_parent is only valid for a threat-model attack phase")
     requested_plan = (
         str(_absolute_lexical(run_plan_path)) if run_plan_path else "")
     requested: dict[str, Any] = {
@@ -668,6 +851,8 @@ def create_run_manifest(
         "planning_degraded": degraded,
         "planning_artifacts": artifact_bindings,
         "canonical_report_required": bool(canonical_report_required),
+        "run_phase": normalized_phase,
+        "phase_parent": normalized_parent,
         "authz_sha256": sha256_text(authz),
     }
     manifest_path = run_base / "run_manifest.json"
@@ -712,7 +897,7 @@ def create_run_manifest(
     else:
         raise ValueError("authority manifest must be outside the model-writable run directory")
     manifest: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "atoolkit_version": __version__,
         "source_revision": revision,
         "source_dirty": bool(git_status),

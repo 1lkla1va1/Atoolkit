@@ -49,11 +49,14 @@ try:                                  # 支持「脚本直跑」与「包内导�
     from cell_identity import (CellIdentity, runtime_cell_key, surface_actor_roles,
                                surface_assets)
     from runtime_manifest import create_run_manifest, sha256_text
+    from threat_model import (compile_threat_model, derive_threat_coverage,
+                              validate_threat_plan)
     from run_authority import (append_monotonic_event,
                                canonical_method_resolution_key, create_run_plan,
                                ensure_project_identity, record_target_fingerprint,
                                run_plan_path)
-    from safe_io import atomic_write_json, atomic_write_text, safe_append_text
+    from safe_io import (atomic_write_json, atomic_write_text, safe_append_text,
+                         safe_read_bytes)
     from candidate import (CandidateLedger, parse_candidate_lines, parse_triage_lines,
                            parse_reprobe_lines, parse_spread_lines, compute_depth_score,
                            recompute_depth_score, compute_coverage_gaps, coverage_gaps_nonempty,
@@ -84,11 +87,14 @@ except ImportError:
     from engine.cell_identity import (CellIdentity, runtime_cell_key,
                                       surface_actor_roles, surface_assets)
     from engine.runtime_manifest import create_run_manifest, sha256_text
+    from engine.threat_model import (compile_threat_model, derive_threat_coverage,
+                                     validate_threat_plan)
     from engine.run_authority import (append_monotonic_event,
                                       canonical_method_resolution_key, create_run_plan,
                                       ensure_project_identity,
                                       record_target_fingerprint, run_plan_path)
-    from engine.safe_io import atomic_write_json, atomic_write_text, safe_append_text
+    from engine.safe_io import (atomic_write_json, atomic_write_text,
+                                safe_append_text, safe_read_bytes)
     from engine.candidate import (CandidateLedger, parse_candidate_lines, parse_triage_lines,
                                   parse_reprobe_lines, parse_spread_lines, compute_depth_score,
                                   recompute_depth_score, compute_coverage_gaps, coverage_gaps_nonempty,
@@ -564,6 +570,78 @@ class CognitiveState:
                                     cell["feature"] = feat
                                 cell["surface"] = _merge_surface(
                                     cell.get("surface"), param_surface)
+
+    def seed_threat_cells(
+        self,
+        surfaces: list[dict],
+        *,
+        identity_readiness: dict | None = None,
+    ) -> None:
+        """Seed one exact runtime cell per compiler row, without class fan-out."""
+        readiness = {
+            (str(item.get("feature_id") or ""), str(item.get("threat_id") or "")): item
+            for item in (identity_readiness or {}).get("threats", [])
+            if isinstance(item, dict)
+        }
+        for raw in surfaces:
+            if not isinstance(raw, dict):
+                continue
+            surface = dict(raw)
+            endpoint = str(surface.get("endpoint") or "").strip()
+            method = str(surface.get("method") or "").strip().upper()
+            vuln_class = str(surface.get("vuln_class") or "").strip()
+            param = str(surface.get("param") or "").strip()
+            actor_role = str(
+                surface.get("actor_role") or surface.get("role_scope")
+                or next(iter(_listify(surface.get("roles"))), "unknown")
+            ).strip().lower() or "unknown"
+            asset_id = canonical_asset(
+                surface.get("asset_id") or self.target.splitlines()[0].strip())
+            if not endpoint or not method or not vuln_class or not asset_id:
+                continue
+            surface["roles"] = [actor_role]
+            surface["actor_role"] = actor_role
+            surface["param"] = param
+            surface["params"] = [param] if param else []
+            surface["asset_id"] = asset_id
+            key = self._key(
+                endpoint, vuln_class, method, param,
+                asset=asset_id, actor_role=actor_role,
+                namespace=surface.get("namespace", ""),
+                param_location=surface.get("param_location", ""),
+                subject_role=surface.get("subject_role", ""),
+                object_kind=surface.get("object_kind", ""),
+            )
+            if key not in self.matrix:
+                self.matrix[key] = _cell_schema(
+                    endpoint, vuln_class,
+                    str(surface.get("feature") or surface.get("feature_id") or ""),
+                    surface, method, param,
+                    asset_id=asset_id, actor_role=actor_role,
+                )
+            else:
+                self.matrix[key]["surface"] = _merge_surface(
+                    self.matrix[key].get("surface"), surface)
+            cell = self.matrix[key]
+            item = readiness.get((
+                str(surface.get("feature_id") or ""),
+                str(surface.get("threat_id") or ""),
+            ))
+            if item is not None:
+                cell["surface"]["identity_ready"] = bool(item.get("ready"))
+                cell["surface"]["identity_reason_code"] = str(
+                    item.get("reason_code") or "")
+                if not item.get("ready"):
+                    reason = str(item.get("reason_code") or "identity_not_ready")
+                    cell["needs"] = _listify(cell.get("needs"))
+                    if reason not in cell["needs"]:
+                        cell["needs"].append(reason)
+                    cell["blocker"] = {
+                        "kind": "missing_role",
+                        "recoverable": True,
+                        "reason_code": reason,
+                    }
+                    cell["reason"] = "identity prerequisite is not ready"
 
     @staticmethod
     def _key(ep: str, vc: str, method: str = "", param: str = "", *,
@@ -1609,6 +1687,18 @@ def _sync_coverage_ledger(state: CognitiveState, wd: pathlib.Path,
         "updated_at": round(time.time(), 3),
     })
     ledger.save(path)
+    threat_model_path = pathlib.Path(wd) / "threat-model.json"
+    if threat_model_path.is_file():
+        try:
+            model = json.loads(threat_model_path.read_text(encoding="utf-8"))
+            atomic_write_json(
+                pathlib.Path(wd) / "threat-coverage.json",
+                derive_threat_coverage(ledger.surfaces, model),
+                root=pathlib.Path(wd),
+                reject_leaf_symlink=True,
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
     return ledger
 
 
@@ -1622,6 +1712,7 @@ def _discover_and_register_endpoints(
     namespace: str = "",
     admitted_method_resolution_keys: set[str] | None = None,
     method_resolution_fallback_asset: str = "",
+    allow_matrix_expansion: bool = True,
 ) -> list[dict]:
     """P1-3: 从模型回复抽 endpoint 路径，与 inventory/state.matrix 比对；新 endpoint
     只有文本中同时观察到唯一 HTTP method 时才经 ``plan_surfaces`` 补风险格；
@@ -1764,7 +1855,7 @@ def _discover_and_register_endpoints(
         return []
     resolved = [record for record in new_records if record.get("method")]
     before_cell_keys = set(state.matrix)
-    if resolved:
+    if resolved and allow_matrix_expansion:
         if namespace:
             resolved = [{**record, "namespace": namespace} for record in resolved]
         state.seed_matrix(
@@ -2774,7 +2865,10 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                 deny_paths: list[str] | None = None,
                 authorization_assurance: str = "unverified",
                 target_fingerprint: str = "",
-                execution_provenance: dict | None = None) -> dict:
+                execution_provenance: dict | None = None,
+                planning_mode: str = "legacy_risk",
+                planning_lineage: dict | None = None,
+                identity_readiness: dict | None = None) -> dict:
     """verify_fn(report_md) -> verify.VerifyResult，可选：对 accepted 报告做确定性重放复验。
     owned_ids：本会话自有对象 id，改删类命中其中则自动放行。
     confirm_policy："halt"=改删他人/未知 id 时熔断停手交人工(默认)；"allow"=放行(信任场景)。
@@ -2810,6 +2904,26 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         fingerprint=target_fingerprint,
     )
     primary_asset = canonical_asset(primary_target)
+    if (resume and inventory_path.is_file() and not endpoints
+            and not unresolved_endpoints):
+        try:
+            frozen_inventory = json.loads(safe_read_bytes(
+                inventory_path, root=wd).decode("utf-8"))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"resume inventory is unavailable: {exc}") from exc
+        frozen_rows = (
+            frozen_inventory.get("endpoints")
+            if isinstance(frozen_inventory, dict) else frozen_inventory)
+        frozen_unresolved = (
+            frozen_inventory.get("unresolved") or []
+            if isinstance(frozen_inventory, dict) else [])
+        if not isinstance(frozen_rows, list) or not isinstance(
+                frozen_unresolved, list):
+            raise ValueError("resume inventory has an invalid structure")
+        endpoints = [item for item in frozen_rows
+                     if isinstance(item, (str, dict))]
+        unresolved_endpoints = [dict(item) for item in frozen_unresolved
+                                if isinstance(item, dict)]
     # Direct API callers can provide rich endpoint dictionaries.  Preserve an
     # explicitly unknown method by routing that record to the same frozen
     # resolution denominator used by CLI/recon inputs; never let the generic
@@ -2869,6 +2983,59 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
             for item in (unresolved_endpoints or []) if isinstance(item, dict)
         ]
     _write_session_inventory(inventory_path, endpoints, unresolved_endpoints)
+    normalized_planning_mode = str(
+        planning_mode or "legacy_risk").strip().lower()
+    if normalized_planning_mode not in {"legacy_risk", "threat_model"}:
+        raise ValueError(f"unsupported Engine planning_mode: {planning_mode!r}")
+    matrix_inputs: list[dict | str] = list(endpoints or [])
+    normalized_threat_plan: dict | None = None
+    if normalized_planning_mode == "threat_model":
+        try:
+            feature_graph = json.loads(
+                (wd / "feature-graph.json").read_text(encoding="utf-8"))
+            threat_model = json.loads(
+                (wd / "threat-model.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"threat planning artifacts are unavailable: {exc}") from exc
+        normalized_threat_plan = validate_threat_plan(
+            feature_graph, threat_model, endpoints or [], run_dir=wd,
+            base_path=base_path, base_path_explicit=base_path_explicit,
+            allow_paths=allow_paths, deny_paths=deny_paths,
+            require_discovery_adequacy=True,
+        )
+        matrix_inputs = compile_threat_model(
+            normalized_threat_plan, endpoints or [], target=primary_target)
+        if not matrix_inputs:
+            raise ValueError("validated threat model compiled to zero attack cells")
+        atomic_write_json(
+            wd / "feature-graph.json", normalized_threat_plan["feature_graph"],
+            root=wd, reject_leaf_symlink=True)
+        atomic_write_json(
+            wd / "threat-model.json", normalized_threat_plan["threat_model"],
+            root=wd, reject_leaf_symlink=True)
+        readiness_path = wd / "identity-readiness.json"
+        requested_readiness = identity_readiness or {
+                "schema_version": 1,
+                "identities": [],
+                "distinct_credentials": 0,
+                "threats": [],
+            }
+        if resume and readiness_path.is_file():
+            try:
+                frozen_readiness = json.loads(safe_read_bytes(
+                    readiness_path, root=wd).decode("utf-8"))
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"resume identity readiness is unavailable: {exc}") from exc
+            if identity_readiness is not None and frozen_readiness != requested_readiness:
+                raise ValueError(
+                    "resume identity contexts differ from the frozen run")
+            requested_readiness = frozen_readiness
+            identity_readiness = frozen_readiness
+        else:
+            atomic_write_json(
+                readiness_path, requested_readiness,
+                root=wd, reject_leaf_symlink=True)
     resumed = bool(resume and state_path.exists())
     auth_flow_enabled = (vuln_classes is None) if enable_auth_flow_column is None else enable_auth_flow_column
     # v8.6 product contract: explicit target domains win; otherwise choose
@@ -2888,16 +3055,35 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
     if resumed:                                           # 断点续测：载回上次状态，承接覆盖进度
         state = CognitiveState.load(state_path)
         state.target = target
-        state.vuln_classes = list(vuln_classes or state.vuln_classes or DEFAULT_VULN_CLASSES)
-        state.seed_matrix(endpoints or [], enable_auth_flow_column=auth_flow_enabled)  # 幂等：保留已闭格，仅补新攻击面
+        state.vuln_classes = sorted(
+            {str(item.get("vuln_class") or "") for item in matrix_inputs
+             if isinstance(item, dict) and item.get("vuln_class")}
+            if normalized_planning_mode == "threat_model"
+            else (vuln_classes or state.vuln_classes or DEFAULT_VULN_CLASSES))
+        if normalized_planning_mode == "threat_model":
+            state.seed_threat_cells(
+                [item for item in matrix_inputs if isinstance(item, dict)],
+                identity_readiness=identity_readiness)
+        else:
+            state.seed_matrix(endpoints or [], enable_auth_flow_column=auth_flow_enabled)  # 幂等：保留已闭格，仅补新攻击面
         start_turn = state.turn + 1                       # 从「最后完成轮」之后继续
         s0 = state.matrix_stats()
         state.inject_directive(
             f"断点续测：已闭 {s0['closed']}/{s0['total']} 格，从未覆盖格继续，勿重测已闭格")
     else:
         state = CognitiveState(sid=sid, target=target,
-                               vuln_classes=list(vuln_classes or DEFAULT_VULN_CLASSES))
-        state.seed_matrix(endpoints or [], enable_auth_flow_column=auth_flow_enabled)
+                               vuln_classes=sorted(
+                                   {str(item.get("vuln_class") or "")
+                                    for item in matrix_inputs
+                                    if isinstance(item, dict) and item.get("vuln_class")}
+                                   if normalized_planning_mode == "threat_model"
+                                   else (vuln_classes or DEFAULT_VULN_CLASSES)))
+        if normalized_planning_mode == "threat_model":
+            state.seed_threat_cells(
+                [item for item in matrix_inputs if isinstance(item, dict)],
+                identity_readiness=identity_readiness)
+        else:
+            state.seed_matrix(endpoints or [], enable_auth_flow_column=auth_flow_enabled)
         start_turn = 0
     state.authority_trusted = bool(getattr(
         adapter, "process_containment_verified", False))
@@ -3093,6 +3279,9 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
             admitted_cells.append({
                 "identity_version": 2,
                 "cell_key": _cell_budget_key(cell),
+                "surface_id": surface.get("surface_id", ""),
+                "feature_id": surface.get("feature_id", ""),
+                "threat_id": surface.get("threat_id", ""),
                 "asset_id": cell.get("asset_id", ""),
                 "method": _surface_method(
                     cell.get("endpoint", ""), surface, cell.get("method", "")),
@@ -3108,6 +3297,11 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                     cell.get("subject_role") or surface.get("subject_role") or ""),
                 "object_kind": (
                     cell.get("object_kind") or surface.get("object_kind") or ""),
+                "security_invariant": surface.get("security_invariant", ""),
+                "observable_violation": surface.get("observable_violation", ""),
+                "identity_requirement": dict(
+                    surface.get("identity_requirement") or {}),
+                "identity_ready": surface.get("identity_ready"),
             })
         admitted_cells.sort(key=lambda item: str(item.get("cell_key") or ""))
         candidate_baseline = [
@@ -3132,6 +3326,27 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
             },
             identity_version=2,
         )
+    planning_artifacts: dict[str, pathlib.Path] = {}
+    if normalized_planning_mode == "threat_model":
+        planning_artifacts = {
+            "feature-graph.json": wd / "feature-graph.json",
+            "threat-model.json": wd / "threat-model.json",
+            "identity-readiness.json": wd / "identity-readiness.json",
+        }
+        if (wd / "discovery-evidence.json").is_file():
+            planning_artifacts["discovery-evidence.json"] = (
+                wd / "discovery-evidence.json")
+            try:
+                discovery_index = json.loads(safe_read_bytes(
+                    wd / "discovery-evidence.json", root=wd).decode("utf-8"))
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(f"invalid promoted discovery evidence: {exc}") from exc
+            for position, item in enumerate(
+                    discovery_index.get("copied") or [], start=1):
+                if not isinstance(item, dict):
+                    raise ValueError("invalid discovery evidence row")
+                relative = pathlib.Path(str(item.get("snapshot_path") or ""))
+                planning_artifacts[f"recon-{position:04d}"] = wd / relative
     create_run_manifest(
         wd,
         mode="engine",
@@ -3166,9 +3381,12 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
             "model": str(getattr(adapter, "model", "unknown") or "unknown"),
             "adapter": str(getattr(adapter, "name", "unknown") or "unknown"),
         }),
-        planning_mode="legacy_risk",
-        planning_degraded=True,
+        planning_mode=normalized_planning_mode,
+        planning_degraded=(normalized_planning_mode != "threat_model"),
+        planning_artifacts=planning_artifacts,
         canonical_report_required=True,
+        run_phase=("attack" if normalized_planning_mode == "threat_model" else "single"),
+        phase_parent=(planning_lineage if normalized_planning_mode == "threat_model" else None),
     )
 
     # v8.8: an exact, fully terminal project matrix with no pending Intent is
@@ -3444,7 +3662,8 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                 admitted_method_resolution_keys=(
                     frozen_method_keys
                     if surface_budget and surface_budget > 0 else None),
-                method_resolution_fallback_asset=primary_target)
+                method_resolution_fallback_asset=primary_target,
+                allow_matrix_expansion=(normalized_planning_mode != "threat_model"))
             if not has_matrix and state.matrix:
                 has_matrix = True
                 knowledge_cards = load_cards()

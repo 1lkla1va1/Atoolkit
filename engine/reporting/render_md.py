@@ -5,8 +5,10 @@ from typing import Any
 
 try:
     from ..safe_io import atomic_write_text
+    from ..data_hygiene import redact_text
 except ImportError:  # pragma: no cover
     from safe_io import atomic_write_text
+    from data_hygiene import redact_text
 
 from .schema import resolve_finding_file
 
@@ -95,9 +97,10 @@ def render_coverage_gaps(
     lines.extend(_render_gaps_appendix(gaps))
     if len(lines) <= 2:
         lines.append("（无缺口：四类清单均为空。）")
+    rendered, _redactions = redact_text("\n".join(lines).rstrip() + "\n")
     atomic_write_text(
         out,
-        "\n".join(lines).rstrip() + "\n",
+        rendered,
         root=out.parent,
         reject_leaf_symlink=True,
     )
@@ -296,9 +299,10 @@ def render_final_report(
     # v6.1 §8.2: 四类缺口附录（发现但没测/测了没深入/阻塞未恢复/漏进报告）
     lines.extend(_render_gaps_appendix(coverage_gaps))
 
+    rendered, _redactions = redact_text("\n".join(lines).rstrip() + "\n")
     atomic_write_text(
         out,
-        "\n".join(lines).rstrip() + "\n",
+        rendered,
         root=out.parent,
         reject_leaf_symlink=True,
     )

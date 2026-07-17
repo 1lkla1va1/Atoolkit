@@ -33,6 +33,7 @@ VERIFICATION_TYPES = {
     "file_write_and_retrieval",
     "file_read_differential",
     "business_state_delta",
+    "cross_site_state_change",
     "response_differential",
 }
 CHAIN_ONLY_TYPE = re.compile(r"(?:^|[-_\s])(attack[-_\s]?chain|chain|利用链|影响升级)(?:$|[-_\s])", re.I)
@@ -182,7 +183,9 @@ def _vuln_family(vuln_type: str) -> str:
                               "access control", "privilege-escalation", "bac", "认证绕过",
                               "auth-bypass", "auth bypass", "authentication bypass")):
         return "authorization"
-    if "xss" in low or "跨站" in low:
+    if "csrf" in low or "cross-site request forgery" in low or "跨站请求伪造" in low:
+        return "csrf"
+    if "xss" in low or "跨站脚本" in low:
         return "xss"
     if any(k in low for k in ("race", "竞态", "concurrency")):
         return "race"
@@ -656,6 +659,7 @@ def _validate_verification(
         "file_write": "file_write_and_retrieval",
         "file_read": "file_read_differential",
         "business": "business_state_delta",
+        "csrf": "cross_site_state_change",
         "generic": "response_differential",
     }[family]
     if evidence_type and evidence_type != expected_type:
@@ -785,6 +789,60 @@ def _validate_verification(
             reasons.append("business finding requires state_before/exploit/state_after packets")
         if not str(verification.get("state_delta") or "").strip():
             reasons.append("business finding requires verification.state_delta")
+    elif family == "csrf":
+        required = {"state_before", "cross_site_request", "state_after"}
+        if not required.issubset(phases):
+            reasons.append(
+                "csrf finding requires state_before/cross_site_request/state_after packets")
+        state_delta = str(verification.get("state_delta") or "").strip()
+        if not state_delta:
+            reasons.append("csrf finding requires verification.state_delta")
+        packet_map = _packet_map(packets, finding_dir, run_base)
+        before = packet_map.get("state_before")
+        after = packet_map.get("state_after")
+        before_marker = str(
+            verification.get("state_before_marker") or "").strip()
+        after_marker = str(
+            verification.get("state_after_marker") or "").strip()
+        if len(before_marker) < 4 or len(after_marker) < 4:
+            reasons.append("csrf finding requires before/after state markers")
+        elif before_marker == after_marker:
+            reasons.append("csrf before/after state markers must differ")
+        else:
+            if before and before_marker not in _read_text(before["response"]):
+                reasons.append("csrf state_before_marker not found in response")
+            if after and after_marker not in _read_text(after["response"]):
+                reasons.append("csrf state_after_marker not found in response")
+        cross_site = packet_map.get("cross_site_request")
+        initiator = _exists(
+            finding_dir, verification.get("cross_site_initiator_file"),
+            run_base, reasons, "verification.cross_site_initiator_file")
+        if initiator:
+            initiator_text = _read_text(initiator)
+            if not re.search(
+                r"<(?:form|img)\b|\bfetch\s*\(|\bXMLHttpRequest\b|"
+                r"\bwindow\.location\b",
+                initiator_text, re.I,
+            ):
+                reasons.append(
+                    "csrf cross_site_initiator_file must contain an executable "
+                    "browser request primitive")
+        if cross_site is not None:
+            request_text = _read_text(cross_site["request"])
+            origin_match = re.search(
+                r"^Origin:\s*(https?://[^\s]+)\s*$", request_text, re.I | re.M)
+            referer_match = re.search(
+                r"^Referer:\s*(https?://[^\s]+)\s*$", request_text, re.I | re.M)
+            host_match = re.search(
+                r"^Host:\s*([^\s]+)\s*$", request_text, re.I | re.M)
+            source_match = origin_match or referer_match
+            if not source_match or not host_match:
+                reasons.append(
+                    "csrf cross-site request requires Origin/Referer and Host headers")
+            elif urlsplit(source_match.group(1)).netloc.lower() == host_match.group(1).lower():
+                reasons.append("csrf Origin/Referer must differ from the target Host")
+            if not re.search(r"^Cookie:\s*\S+", request_text, re.I | re.M):
+                reasons.append("csrf cross-site request must prove victim session cookies were sent")
     else:
         if not _has_any(phases, {"control", "baseline"}) or not _has_any(
                 phases, {"exploit", "test"}):
@@ -2381,6 +2439,11 @@ def _threat_model_closure_gate(
             values["threat-model.json"],
             inventory_rows,
             run_dir=run_dir,
+            base_path=str(manifest.get("base_path") or "/"),
+            base_path_explicit=bool(manifest.get("base_path_explicit")),
+            allow_paths=list(manifest.get("allow_paths") or []),
+            deny_paths=list(manifest.get("deny_paths") or []),
+            require_discovery_adequacy=True,
         )
         expected = compile_threat_model(
             plan,
@@ -2414,6 +2477,45 @@ def _threat_model_closure_gate(
             reasons.append("threat_compiled_cell_identity_mismatch")
             break
 
+    identity_path = run_dir / "identity-readiness.json"
+    identity_required = (
+        str(manifest.get("run_phase") or "single") == "attack"
+        or "identity-readiness.json" in (manifest.get("planning_artifacts") or {})
+    )
+    try:
+        identity_value = json.loads(
+            safe_read_bytes(identity_path, root=run_dir).decode("utf-8"))
+        if not isinstance(identity_value, dict):
+            raise ValueError("identity-readiness must be an object")
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        identity_value = {}
+        if identity_required:
+            reasons.append(f"identity_readiness_missing_or_invalid:{exc}")
+    readiness = {
+        (str(item.get("feature_id") or ""), str(item.get("threat_id") or "")): item
+        for item in identity_value.get("threats", [])
+        if isinstance(item, dict)
+    }
+    terminal = {"confirmed", "not_vulnerable", "not_applicable"}
+    for surface_id, expected_row in expected_by_id.items():
+        pair = (
+            str(expected_row.get("feature_id") or ""),
+            str(expected_row.get("threat_id") or ""),
+        )
+        requirement = expected_row.get("identity_requirement") or {}
+        minimum = int(requirement.get("minimum_distinct_credentials", 0) or 0)
+        mode = str(requirement.get("mode") or "single")
+        readiness_item = readiness.get(pair)
+        if readiness_item is None:
+            if minimum > 0 or mode != "single":
+                reasons.append("identity_readiness_threat_missing")
+            continue
+        actual_row = actual_by_id.get(surface_id) or {}
+        if (not readiness_item.get("ready")
+                and str(actual_row.get("status") or "") in terminal):
+            reasons.append("identity_unready_threat_closed")
+            break
+
     plan_path = pathlib.Path(str(manifest.get("run_plan_path") or ""))
     try:
         plan_payload = safe_read_bytes(
@@ -2440,6 +2542,24 @@ def _threat_model_closure_gate(
         }
         if frozen_identities != expected_identities:
             reasons.append("threat_run_plan_mismatch")
+        admitted_by_surface = {
+            str(row.get("surface_id") or ""): row
+            for row in admitted if isinstance(row, dict)
+        }
+        for surface_id, expected_row in expected_by_id.items():
+            frozen_row = admitted_by_surface.get(surface_id) or {}
+            pair = (
+                str(expected_row.get("feature_id") or ""),
+                str(expected_row.get("threat_id") or ""),
+            )
+            ready_item = readiness.get(pair) or {}
+            if (frozen_row.get("identity_requirement") or {}) != (
+                    expected_row.get("identity_requirement") or {}):
+                reasons.append("threat_run_plan_identity_requirement_mismatch")
+                break
+            if frozen_row.get("identity_ready") is not ready_item.get("ready"):
+                reasons.append("threat_run_plan_identity_readiness_mismatch")
+                break
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         reasons.append(f"threat_run_plan_invalid:{exc}")
 

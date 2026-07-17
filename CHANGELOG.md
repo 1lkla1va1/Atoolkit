@@ -1,5 +1,22 @@
 # Changelog
 
+## 8.12.0 - 2026-07-17
+
+- Engine live+Recon 默认执行 sibling Planning/Attack 两阶段：Planning 固定无目标网络，Attack 只消费 Host 校验和冻结的 threat cells；schema-4 manifest 绑定 parent authority manifest/session/hash。
+- 新增有界、no-follow Recon snapshot 与稳定秘密/PII 脱敏；Planning 输入、Feature/Threat 输出和 Canonical 报告不再复制原始 Cookie、Authorization、API Key、Token、手机号或邮箱。
+- Threat plan 增加 discovery adequacy、frozen path scope 与 identity requirement；至少覆盖代码/资源和导航/运行两组证据，同源跨模块路径不能自动扩大当前 Run。
+- `CognitiveState.seed_threat_cells()` 精确按 compiler row 建格，Threat Mode 不再回退到 endpoint × 默认漏洞类矩阵；运行中新发现只进入下一 Run backlog/Intent。
+- 新增 host-owned `identity-readiness.json`：以 credential hash 判断独立身份；重复 Cookie 不算 peer pair，身份/测试对象不足的 threat 保持 open，不能关闭为安全阴性。
+- CSRF 改用 `cross_site_state_change` 专用证明合同，强制 before/cross-site/after、不同 Origin、受害者 Cookie 和状态 marker/delta；缺 token 或 token 暴露现象不能进入正式 Finding。
+- 多身份原始 header 延迟到 Planning 完成后写入权限收紧的 Attack `identities.json`；readiness 与 Resume 按指纹复算，避免“Host 认为双身份就绪、模型实际拿不到身份”的假就绪。
+- Attack manifest 逐个绑定晋升后的 Recon snapshot，终态递归验证 Planning parent artifact；CSRF 另要求可执行跨站发起载体，阻断手工伪造 Origin/Cookie 的假 PoC。
+- 明确 Resume 边界：仅允许 finalizer 尚未开始的崩溃恢复；存在 finalization journal 的 sid 已冻结，继续测试必须新开 sid，避免新状态伪装成已锚定快照。
+- 新增 v8.12 两阶段 authority、身份去重、scope/adequacy、CSRF 因果门与报告脱敏回归测试；保留显式 legacy/dry-run 兼容并标 degraded。
+
+## 8.11.1 - 2026-07-17
+
+- Patch 版本号 bump 至 8.11.1（version.py 与 SKILL.md frontmatter 同步）。
+
 ## 8.11.0 - 2026-07-17
 
 - 新增结构化 `feature-graph.json` / `threat-model.json` 校验与编译器：模型声明业务不变量和可观察突破，机器只把经 inventory/证据校验的 threat 编译为精确 cell；risk tag 降为知识路由。

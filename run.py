@@ -31,8 +31,15 @@ from engine.host_policy import (authorization_scope_from_url, hostname_from_url,
                                 normalize_authorized_scopes,
                                 parse_authorized_scope)  # noqa: E402
 from engine.runtime_manifest import doctor  # noqa: E402
-from engine.run_authority import validate_session_id as _validate_session_id  # noqa: E402
-from engine.safe_io import atomic_write_text, ensure_directory  # noqa: E402
+from engine.run_authority import (ensure_project_identity,
+                                  validate_session_id as _validate_session_id)  # noqa: E402
+from engine.safe_io import (atomic_write_text, ensure_directory,
+                            safe_read_bytes)  # noqa: E402
+from engine.engine_planning import (EnginePlanningError, accept_prebuilt_plan,
+                                    build_identity_readiness,
+                                    create_planning_session,
+                                    promote_planning_artifacts,
+                                    run_planning_model)  # noqa: E402
 from engine.version import __version__  # noqa: E402
 
 
@@ -1755,6 +1762,10 @@ def main():
                     help="从文件读取显式部署 fingerprint（与 --target-fingerprint 二选一）")
     ap.add_argument("--identity", action="append", default=[],
                     help="复验身份 label:cred（cookie 模式如 owner:session=A；bearer 模式如 owner:eyJ...；可多次）")
+    ap.add_argument("--identity-role", action="append", default=[],
+                    help="身份角色 label:role；只写角色元数据，不写凭据原值")
+    ap.add_argument("--identity-marker", action="append", default=[],
+                    help="身份非秘密标记 label:marker；Host 只保存 SHA-256")
     ap.add_argument("--victim-marker", default="", help="证明越权的受害者数据特征串")
     ap.add_argument("--owner-label", default="owner",
                     help="确定性 IDOR 复验中的属主 identity 标签（默认 owner）")
@@ -1768,6 +1779,13 @@ def main():
     ap.add_argument("--recon-dir", default="",
                     help="recon 产物目录(JS/HTML/JSON/HAR)；由 engine.surface.bootstrap 解析为攻击面，"
                          "喂 planner.plan_surfaces 展开后与 --endpoints 合并")
+    ap.add_argument("--planning-mode", choices=["auto", "threat", "legacy"],
+                    default="auto",
+                    help="v8.12：auto=live+recon 默认两阶段 threat；legacy 为显式降级")
+    ap.add_argument("--feature-graph", default="",
+                    help="预构建 feature-graph.json；必须与 --threat-model 成对")
+    ap.add_argument("--threat-model", default="",
+                    help="预构建 threat-model.json；仍经过 Planning authority/Host 校验")
     ap.add_argument("--exclude-endpoint", action="append", default=[],
                     help="从 inventory/coverage 输入排除 endpoint（glob 或路径片段，可多次；例如 vuln.php）")
     ap.add_argument("--ad-hoc", action="store_true",
@@ -1779,7 +1797,7 @@ def main():
     ap.add_argument("--max-turns", type=int, default=50)
     ap.add_argument("--sid", default="", help="会话 ID（默认按时间生成）")
     ap.add_argument("--resume", action="store_true",
-                    help="断点续测：复用 --sid 的 runs/<sid>/state.json 承接覆盖进度（无则照常新开）")
+                    help="崩溃恢复：仅复用尚未进入 finalizer 的 --sid；已收口 Run 必须新开 sid")
     ap.add_argument("--dry-run", action="store_true", help="用 MockAdapter，不接模型/网络")
     ap.add_argument("--self-check", action="store_true",
                     help="自检门：临时生成 fixture 跑断言（不接模型/网络），全过 exit 0、失败 exit 1；"
@@ -1828,6 +1846,8 @@ def main():
         ap.error("--target 与 --authz 为必填（自检门用 --self-check，可不带这两参数）")
     if args.target_fingerprint and args.target_fingerprint_file:
         ap.error("--target-fingerprint 与 --target-fingerprint-file 不能同时使用")
+    if bool(args.feature_graph) != bool(args.threat_model):
+        ap.error("--feature-graph 与 --threat-model 必须成对提供")
     if not args.dry_run and not args.allow_unrestricted_egress:
         ap.error(
             "当前 Codex backend 无法证明命令执行前的 host/path 出站约束；"
@@ -1891,6 +1911,13 @@ def main():
                         destination.chmod(0o600)
                     except OSError:
                         pass
+    if args.resume and project_dir is not None:
+        finalization_journal = (
+            project_dir / ".atoolkit" / "finalizations" / f"{sid}.json")
+        if finalization_journal.exists() or finalization_journal.is_symlink():
+            ap.error(
+                "该 sid 已进入不可变 finalization，不能继续修改；"
+                "请新开 sid（项目 inventory/真值会按合同继承）")
     # v8.6: parse target-domains
     _target_domains = [d.strip() for d in args.target_domains.split(",") if d.strip()] if args.target_domains else None
     authz = (pathlib.Path(args.authz).read_text(encoding="utf-8")
@@ -1900,8 +1927,6 @@ def main():
     cred = args.bearer or args.cookie
     cred_line = (f"Authorization: Bearer {args.bearer}" if args.bearer
                  else (f"Cookie: {args.cookie}" if args.cookie else ""))
-    if cred:
-        _secure_write_text(wd / "cookies.txt", cred_line)
 
     skill = (ROOT / "skill" / "核心技能文件.v3.md").read_text(encoding="utf-8")
     target_scope = authorization_scope_from_url(args.target)
@@ -1956,6 +1981,7 @@ def main():
                 existing_discovered = []
         inv_records = [
             {
+                **dict(s),
                 "endpoint": s.get("endpoint", ""),
                 "method": s.get("method") or "",
                 "source": s.get("source", "manual"),
@@ -2003,6 +2029,30 @@ def main():
              "saturation_reached": is_saturated(resolved_inventory)},
             root=wd,
         )
+    elif args.resume and (wd / "inventory.json").is_file():
+        try:
+            frozen_inventory = json.loads(safe_read_bytes(
+                wd / "inventory.json", root=wd).decode("utf-8"))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            ap.error(f"无法读取 frozen resume inventory: {exc}")
+        frozen_rows = (
+            frozen_inventory.get("endpoints")
+            if isinstance(frozen_inventory, dict) else frozen_inventory)
+        frozen_unresolved = (
+            frozen_inventory.get("unresolved") or []
+            if isinstance(frozen_inventory, dict) else [])
+        if not isinstance(frozen_rows, list) or not isinstance(
+                frozen_unresolved, list):
+            ap.error("frozen resume inventory 结构无效")
+        inventory = _filter_inventory(
+            [dict(item) if isinstance(item, dict) else item
+             for item in frozen_rows if isinstance(item, (str, dict))],
+            args.exclude_endpoint,
+        )
+        unresolved_inventory = _filter_endpoint_records(
+            [dict(item) for item in frozen_unresolved if isinstance(item, dict)],
+            args.exclude_endpoint,
+        )
 
     # v8.8: subsequent runs may start from authoritative project inventory.
     project_inventory_count = 0
@@ -2017,23 +2067,252 @@ def main():
         except (OSError, json.JSONDecodeError):
             project_inventory_count = 0
     # 硬门：首次正式覆盖跑需输入；后续允许从 project_state 恢复。
-    if (not endpoints and not args.recon_dir and not args.ad_hoc
+    if (not inventory and not args.recon_dir and not args.ad_hoc
             and project_inventory_count == 0):
         print("✗ 拒绝空启动：首次正式覆盖跑需 --endpoints/--recon-dir；"
               "后续 Run 可复用 project_state.json；单点验证用 --ad-hoc",
               file=sys.stderr)
         sys.exit(2)
 
+    existing_manifest = {}
+    if args.resume and (wd / "run_manifest.json").is_file():
+        try:
+            existing_manifest = json.loads(
+                (wd / "run_manifest.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            ap.error(f"无法读取 resume manifest: {exc}")
+    if existing_manifest:
+        existing_mode = str(
+            existing_manifest.get("planning_mode") or "legacy_risk")
+        _planning_mode = "threat" if existing_mode == "threat_model" else "legacy"
+        if args.planning_mode != "auto" and args.planning_mode != _planning_mode:
+            ap.error("--resume 的 planning mode 必须与 frozen manifest 一致")
+    elif args.planning_mode == "auto":
+        if args.dry_run:
+            _planning_mode = "legacy"
+        elif args.recon_dir:
+            _planning_mode = "threat"
+        else:
+            ap.error(
+                "live --planning-mode auto 需要 --recon-dir；"
+                "若明确接受旧漏洞类计划，请显式传 --planning-mode legacy")
+    else:
+        _planning_mode = args.planning_mode
+    if _planning_mode == "threat" and args.ad_hoc:
+        ap.error("--ad-hoc 只能使用显式 legacy 计划")
+    if _planning_mode == "threat" and not args.recon_dir and not existing_manifest:
+        ap.error("两阶段 threat planning 需要 --recon-dir")
+    if (_planning_mode == "threat" and args.dry_run
+            and not (args.feature_graph and args.threat_model)
+            and not existing_manifest):
+        ap.error("dry-run threat mode 需要预构建 --feature-graph/--threat-model")
+
     identities = {}
     for spec in args.identity:
         label, _, val = spec.partition(":")
+        if not label.strip() or not val.strip():
+            ap.error("--identity 必须为非空 label:credential")
         val = val.strip()
         auth = ({"Authorization": f"Bearer {val}"} if args.auth_scheme == "bearer"
                 else {"Cookie": val})
         identities[label.strip()] = auth
 
+    def _label_map(values: list[str], option: str) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for spec in values:
+            label, separator, value = spec.partition(":")
+            if not separator or not label.strip() or not value.strip():
+                ap.error(f"{option} 必须为非空 label:value")
+            result[label.strip()] = value.strip()
+        return result
+
+    identity_roles = _label_map(args.identity_role, "--identity-role")
+    identity_markers = _label_map(args.identity_marker, "--identity-marker")
+
     if identities and args.victim_marker and args.owner_label not in identities:
         ap.error(f"--owner-label {args.owner_label!r} 不在 --identity 标签中")
+
+    planning_lineage = None
+    identity_readiness = None
+    readiness_identities: dict[str, dict[str, str]] = dict(identities)
+    stored_identity_contexts = False
+    identity_context_path = wd / "identities.json"
+    if cred_line:
+        readiness_identities.setdefault("primary", {
+            "Authorization": f"Bearer {args.bearer}"
+        } if args.bearer else {"Cookie": args.cookie})
+        identity_roles.setdefault("primary", "user")
+    if (args.resume and not readiness_identities
+            and identity_context_path.is_file()):
+        try:
+            stored = json.loads(safe_read_bytes(
+                identity_context_path, root=wd).decode("utf-8"))
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            ap.error(f"无法读取 resume identities.json: {exc}")
+        rows = stored.get("identities") if isinstance(stored, dict) else None
+        if not isinstance(rows, list):
+            ap.error("resume identities.json 结构无效")
+        for item in rows:
+            if not isinstance(item, dict):
+                ap.error("resume identities.json 含无效 identity")
+            label = str(item.get("label") or "").strip()
+            headers = item.get("headers")
+            if not label or not isinstance(headers, dict):
+                ap.error("resume identity 缺少 label/headers")
+            readiness_identities[label] = {
+                str(key): str(value) for key, value in headers.items()
+                if str(key).strip() and str(value).strip()
+            }
+            role = str(item.get("role") or "").strip()
+            if role:
+                identity_roles[label] = role
+        stored_identity_contexts = True
+        if not identities:
+            identities = dict(readiness_identities)
+    execution_provenance = {
+        "provider": "internal" if args.dry_run else "openai",
+        "model": "mock" if args.dry_run else args.model,
+        "adapter": "mock" if args.dry_run else "codex",
+    }
+    if _planning_mode == "threat":
+        if existing_manifest:
+            planning_lineage = dict(existing_manifest.get("phase_parent") or {})
+            if not planning_lineage:
+                ap.error("resume threat run 缺少 frozen phase_parent")
+        else:
+            assert project_dir is not None
+            authority_dir = project_dir / ".atoolkit"
+            project_identity = ensure_project_identity(
+                authority_dir,
+                project_dir=project_dir,
+                project_name=project_dir.name,
+                primary_target=args.target,
+                base_path=explicit_base_path,
+                base_path_explicit=bool(args.base_path),
+            )
+            try:
+                planning_wd = safe_session_dir(wd.parent, f"{sid}.planning")
+            except ValueError as exc:
+                ap.error(str(exc))
+            _secure_mkdir(planning_wd)
+            planning_skill_path = ROOT / "skill" / "threat-planning.md"
+            try:
+                create_planning_session(
+                    planning_dir=planning_wd,
+                    project=project_dir.name,
+                    project_id=project_identity["project_id"],
+                    authority_dir=authority_dir,
+                    primary_target=args.target,
+                    authorized_scopes=hosts,
+                    authz=authz,
+                    inventory_rows=[dict(item) for item in inventory
+                                    if isinstance(item, dict)],
+                    recon_dir=args.recon_dir,
+                    instruction_sources=[{
+                        "kind": "threat_planning",
+                        "path": planning_skill_path,
+                        "injected": True,
+                    }],
+                    source_root=ROOT,
+                    base_path=explicit_base_path,
+                    base_path_explicit=bool(args.base_path),
+                    allow_paths=allow_paths,
+                    deny_paths=deny_paths,
+                    execution_provenance=execution_provenance,
+                )
+                if args.feature_graph and args.threat_model:
+                    accept_prebuilt_plan(
+                        planning_dir=planning_wd,
+                        feature_graph_path=args.feature_graph,
+                        threat_model_path=args.threat_model,
+                        inventory_rows=[dict(item) for item in inventory
+                                        if isinstance(item, dict)],
+                        base_path=explicit_base_path,
+                        base_path_explicit=bool(args.base_path),
+                        allow_paths=allow_paths,
+                        deny_paths=deny_paths,
+                    )
+                else:
+                    from codex.codex_adapter import CodexAdapter
+                    planning_adapter = CodexAdapter(
+                        model=args.model,
+                        workdir=str(planning_wd),
+                        allow_hosts=[],
+                        allow_unrestricted_egress=False,
+                    )
+                    scope_contract = json.dumps({
+                        "target": args.target,
+                        "base_path": explicit_base_path,
+                        "allow_paths": allow_paths,
+                        "deny_paths": deny_paths,
+                    }, ensure_ascii=False, indent=2)
+                    prompt = (
+                        planning_skill_path.read_text(encoding="utf-8")
+                        + "\n\n<frozen_scope>\n" + scope_contract
+                        + "\n</frozen_scope>\n")
+                    run_planning_model(
+                        planning_adapter,
+                        planning_dir=planning_wd,
+                        prompt=prompt,
+                        inventory_rows=[dict(item) for item in inventory
+                                        if isinstance(item, dict)],
+                        base_path=explicit_base_path,
+                        base_path_explicit=bool(args.base_path),
+                        allow_paths=allow_paths,
+                        deny_paths=deny_paths,
+                    )
+                planning_lineage = promote_planning_artifacts(planning_wd, wd)
+            except (EnginePlanningError, OSError, ValueError) as exc:
+                print(f"✗ Planning phase 失败，Attack 未启动: {exc}", file=sys.stderr)
+                return 2
+
+        try:
+            threat_value = json.loads(
+                (wd / "threat-model.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            ap.error(f"无法读取 frozen threat model: {exc}")
+        requested_readiness = build_identity_readiness(
+            readiness_identities,
+            threat_value,
+            roles=identity_roles,
+            markers=identity_markers,
+            owned_ids=args.owned_id,
+        )
+        if existing_manifest:
+            try:
+                frozen_readiness = json.loads(safe_read_bytes(
+                    wd / "identity-readiness.json", root=wd).decode("utf-8"))
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+                ap.error(f"无法读取 frozen identity readiness: {exc}")
+            if requested_readiness != frozen_readiness:
+                ap.error(
+                    "resume 身份/角色/marker/owned-id 与 frozen run 不一致；"
+                    "身份条件变化必须新开 sid")
+            identity_readiness = frozen_readiness
+        else:
+            identity_readiness = requested_readiness
+
+    # Materialize this Run's credentials only after Planning.  The current
+    # backend does not attest global read isolation, so Planning also runs with
+    # network disabled and its outputs pass a deterministic secret scanner.
+    if cred:
+        _secure_write_text(wd / "cookies.txt", cred_line)
+    if readiness_identities and not stored_identity_contexts:
+        identity_context = {
+            "schema_version": 1,
+            "warning": "restricted attack credential material; never copy to reports",
+            "identities": [
+                {
+                    "label": label,
+                    "role": identity_roles.get(label, label.lower()),
+                    "headers": headers,
+                }
+                for label, headers in sorted(readiness_identities.items())
+            ],
+        }
+        _secure_write_text(
+            identity_context_path,
+            json.dumps(identity_context, ensure_ascii=False, indent=2) + "\n")
 
     # 适配器：唯一与模型耦合处（换运行时改这里）
     if args.dry_run:
@@ -2049,7 +2328,15 @@ def main():
         verify_fn = build_verify_fn(
             identities, args.victim_marker, hosts, owner_label=args.owner_label)
 
-    target = args.target + (f"\n（本会话凭据见 {wd/'cookies.txt'}，按其中的 header 行原样带上）" if cred else "")
+    credential_notes: list[str] = []
+    if (wd / "cookies.txt").is_file():
+        credential_notes.append(f"主身份 header：{wd/'cookies.txt'}")
+    if identity_context_path.is_file():
+        credential_notes.append(
+            f"隔离多身份 header（按 label 分开使用）：{identity_context_path}")
+    target = args.target + (
+        "\n（本会话受限凭据文件：" + "；".join(credential_notes) + "）"
+        if credential_notes else "")
 
     print(f"▶ 会话 {sid} ｜ 模型 {'mock' if args.dry_run else args.model} ｜ 授权 host {hosts}")
     print(f"  网络保证: {authorization_assurance} ｜ preexec_enforced=false")
@@ -2065,8 +2352,11 @@ def main():
         src_note = f"project-state({project_inventory_count})"
     else:
         src_note = ""
-    print(f"  覆盖矩阵: {len(inventory)} surface × "
-          f"{len(args.vuln_class) or '内置'} 类{auth_flow_note} ({src_note})")
+    if _planning_mode == "threat":
+        print(f"  覆盖分母: Host-frozen threat cells ({src_note}; parent={planning_lineage.get('session_id', '')})")
+    else:
+        print(f"  覆盖矩阵: {len(inventory)} surface × "
+              f"{len(args.vuln_class) or '内置'} 类{auth_flow_note} ({src_note}; degraded)")
     print("─" * 60)
     hint = (pathlib.Path(args.hint).read_text(encoding="utf-8")
             if args.hint and pathlib.Path(args.hint).exists() else args.hint)
@@ -2110,10 +2400,13 @@ def main():
         "authorization_assurance": authorization_assurance,
         "target_fingerprint": target_fingerprint,
         "execution_provenance": {
-            "provider": "internal" if args.dry_run else "openai",
-            "model": "mock" if args.dry_run else args.model,
+            **execution_provenance,
             "adapter": str(getattr(adapter, "name", "unknown") or "unknown"),
         },
+        "planning_mode": (
+            "threat_model" if _planning_mode == "threat" else "legacy_risk"),
+        "planning_lineage": planning_lineage,
+        "identity_readiness": identity_readiness,
     }
     run_parameters = inspect.signature(run_session).parameters
     for key, value in optional_runtime_args.items():

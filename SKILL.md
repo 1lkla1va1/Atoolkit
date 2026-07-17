@@ -1,7 +1,7 @@
 ---
 name: Atoolkit
 description: Authorized AI-assisted SRC/bug-bounty vulnerability research toolkit. Use whenever the user wants to read, install, configure, or run this Atoolkit package; mentions SRC 漏洞挖掘, 授权靶场, bug bounty, Codex AGENTS.md, /src, Guardian 质检, PoC 复验, or model-independent security testing automation. Only proceed for clearly authorized defensive testing or educational lab contexts.
-version: 8.11.0
+version: 8.12.0
 ---
 
 # Atoolkit Skill
@@ -56,10 +56,13 @@ Direct/QoderWork should use `engine.skill_runtime` for deterministic session
 state even though it remains untrusted. This closes execution feedback and
 multi-agent synchronization; it does not weaken the authority boundary.
 
-v8.11 threat mode starts from a validated business feature graph and explicit
+v8.12 threat mode starts from a validated business feature graph and explicit
 security invariants. Risk tags route knowledge; they do not create the coverage
 denominator. Direct runs without both threat artifacts remain compatible but
 are marked `legacy_risk/planning_degraded=true` and can never be report-ready.
+Engine materializes raw multi-identity headers only after Planning in the
+restricted Attack `identities.json`; models must keep labels isolated and must
+never copy that file into a report.
 
 Use Engine Mode or the wrapper for canonical session diagnostics. Do not claim
 trusted cross-run delivery with the bundled Codex backends until an attested

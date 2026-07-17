@@ -543,13 +543,21 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
 
     surfaces: list[dict[str, Any]] = []
     for param in _params_from_cell(cell):
-        risk_tags = _risk_from_vuln(str(cell.get("vuln") or ""), endpoint, param, feature)
+        threat_surface = bool(
+            surface_meta.get("feature_id") and surface_meta.get("threat_id"))
+        risk_tags = (
+            _dedupe(surface_meta.get("risk_tags") or [])
+            if threat_surface else
+            _risk_from_vuln(str(cell.get("vuln") or ""), endpoint, param, feature)
+        )
         vuln_class = str(cell.get("vuln") or "").strip()
         base_surface_id = make_surface_id(endpoint, method, param, roles, risk_tags)
-        surfaces.append({
+        row = {
             # Coverage identity is a cell, not merely a request surface.  Two
             # vuln classes on the same METHOD/path must never merge.
             "surface_id": (
+                str(surface_meta.get("surface_id") or "")
+                if threat_surface else
                 f"{base_surface_id} × {vuln_class or 'general-review'}"
                 f" @ {asset_id or 'unknown-asset'} as {actor_role}"
             ),
@@ -588,7 +596,11 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
             "deferred_by_text_skip": bool(
                 cell.get("deferred_by_text_skip")
                 or (cell_state == "skipped" and not structured_dead_end)),
-        })
+        }
+        for key, value in surface_meta.items():
+            if key not in row:
+                row[key] = value
+        surfaces.append(row)
     return surfaces
 
 
