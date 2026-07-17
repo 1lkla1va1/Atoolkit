@@ -18,9 +18,18 @@ import time
 from typing import Any
 
 try:  # Support both package import and ``python engine/skill_wrapper.py``.
+    from .dynamic_execution import (
+        EXECUTION_CONTRACT_VERSION,
+        DynamicExecutionError,
+        load_authority_execution_events,
+        load_run_execution_events,
+        normalize_execution_event,
+        write_execution_projection,
+    )
     from .finalize import finalize_run
     from .ledger import CoverageLedger
     from .run_authority import (
+        append_monotonic_event,
         create_run_plan,
         ensure_project_identity,
         run_plan_path,
@@ -35,9 +44,16 @@ try:  # Support both package import and ``python engine/skill_wrapper.py``.
         validate_threat_plan,
     )
 except ImportError:  # pragma: no cover - exercised by subprocess CLI tests
+    from dynamic_execution import (EXECUTION_CONTRACT_VERSION,
+                                   DynamicExecutionError,
+                                   load_authority_execution_events,
+                                   load_run_execution_events,
+                                   normalize_execution_event,
+                                   write_execution_projection)
     from finalize import finalize_run
     from ledger import CoverageLedger
     from run_authority import (
+        append_monotonic_event,
         create_run_plan,
         ensure_project_identity,
         run_plan_path,
@@ -305,8 +321,10 @@ def run_wrapped_skill(
             "authority_trusted": False,
             "planning_mode": planning_mode,
             "planning_degraded": False,
+            "execution_contract_version": EXECUTION_CONTRACT_VERSION,
         })
         ledger.save(run / "coverage-ledger.json")
+        write_execution_projection(run, ledger, [])
         atomic_write_json(run / "candidate-ledger.json", {
             "schema_version": "1.1", "candidates": [],
         }, root=run, reject_leaf_symlink=True)
@@ -374,6 +392,44 @@ def run_wrapped_skill(
     if allow_unrestricted_egress:
         child.extend(["-c", "sandbox_workspace_write.network_access=true"])
     agent_exit_code = _run_agent_process(child, cwd=run)
+    if planning_mode == "threat_model":
+        try:
+            current_ledger = CoverageLedger.load(run / "coverage-ledger.json")
+            proposed_events = load_run_execution_events(run)
+            promoted_by_id: dict[str, dict[str, Any]] = {}
+            for proposed in proposed_events:
+                normalized = normalize_execution_event(
+                    run, current_ledger, proposed)
+                event_id = str(normalized.get("event_id") or "")
+                prior = promoted_by_id.get(event_id)
+                if prior is not None and prior != normalized:
+                    raise DynamicExecutionError(
+                        f"conflicting wrapped execution event_id: {event_id}")
+                promoted_by_id[event_id] = normalized
+            authority_events = load_authority_execution_events(
+                authority, session_id)
+            authority_by_id = {
+                str(item.get("event_id") or ""): item
+                for item in authority_events if isinstance(item, dict)
+            }
+            for event_id, normalized in sorted(promoted_by_id.items()):
+                prior = authority_by_id.get(event_id)
+                if prior is not None and prior != normalized:
+                    raise DynamicExecutionError(
+                        f"conflicting authority execution event_id: {event_id}")
+                if prior is None:
+                    append_monotonic_event(
+                        authority, session_id=session_id,
+                        stream="execution", event=normalized)
+            authority_events = load_authority_execution_events(
+                authority, session_id)
+            current_ledger.metadata["execution_contract_version"] = (
+                EXECUTION_CONTRACT_VERSION)
+            current_ledger.save(run / "coverage-ledger.json")
+            write_execution_projection(run, current_ledger, authority_events)
+        except (OSError, ValueError, DynamicExecutionError) as exc:
+            raise SkillWrapperError(
+                f"wrapped execution checkpoint failed: {exc}") from exc
     # subprocess.run waits for the agent process. A nonzero agent exit is still
     # finalized as diagnostics; finalizer decides delivery truth.
     assurance = (

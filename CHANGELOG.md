@@ -1,5 +1,17 @@
 # Changelog
 
+## 8.13.0 - 2026-07-17
+
+- 新增 Threat-driven Experiment Contract：逐项保留模型 `evidence_required`，并按身份、认证、交易、持久化输入、注入、SSRF、跳转和文件结果增加确定性最低深度；只约束 frozen threat 内实验，不恢复 endpoint × 漏洞类笛卡尔积。
+- Engine Threat Mode 每轮接受 evidence-bound `EXECUTION_EVENT`，Host 以 create-only Run 事件、证据 SHA-256 和 authority hash chain 归并 `execution-contracts/progress/queue/backlog` 四个投影；文本“已测/full”不再计执行进展，接受后替换证据会在最终验证失败。
+- 深阴性若仍缺 experiment obligation 会自动回退为 `shallow_negative`；空数据、对象不存在、会话失效、格式未解析、缺角色/挑战和 WAF 进入动态恢复义务，全部恢复证据满足后才确定性解除 active barrier，修复本轮用户枚举、balance records、reset token 与 use_points 的假阴性模式。
+- Host 对 IDOR/BOLA 强制双身份与 ownership marker floor，不信任模型误写的 single identity；XSS/SSRF/文件义务改为记录成功或拒绝结果，避免把“必须利用成功”变成阴性闭格前提。
+- 动态 queue 按 proof repair、可恢复 blocker、浅阴性、高价值未执行 threat 排序；accepted Finding 仍由原 proof contract 确立，Execution Event 不能直接写 terminal 结论。
+- 新 endpoint/param 只进入 `execution-backlog.json` 且固定 `next_run_required`，不修改 v8.12 run plan 或当前 threat denominator。
+- Direct/Qoder 新增 pre-network `skill_runtime preflight`，解决 fresh black-box 尚无 inventory 时无法先 init 的启动矛盾；`init/observe/checkpoint` 接入同一 execution contract，但继续固定 untrusted diagnostic。
+- Final validation 重算 authority execution chain 和四个投影，检查物理 evidence、open contract 与 ledger 一致性；旧 Run 无 execution version 时保持 legacy 可读且不伪装为 v8.13 验证。
+- 新增 v8.12 靶场 35.8% 得分、4 假阴性、11 未测、10/10 proof-invalid Finding 的离线审计，以及 v8.13 设计/反向审核/失败先行回归。
+
 ## 8.12.0 - 2026-07-17
 
 - Engine live+Recon 默认执行 sibling Planning/Attack 两阶段：Planning 固定无目标网络，Attack 只消费 Host 校验和冻结的 threat cells；schema-4 manifest 绑定 parent authority manifest/session/hash。

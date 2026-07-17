@@ -240,7 +240,9 @@ def append_monotonic_event(
 ) -> dict[str, Any]:
     """Append a hash-chained discovery/candidate/scope event."""
     session_id = validate_session_id(session_id)
-    if stream not in {"discovery", "candidate", "scope_amendment", "failure"}:
+    if stream not in {
+        "discovery", "candidate", "scope_amendment", "failure", "execution",
+    }:
         raise ValueError(f"unsupported authority event stream: {stream}")
     authority = pathlib.Path(authority_dir).resolve()
     path = authority / "events" / session_id / f"{stream}.jsonl"

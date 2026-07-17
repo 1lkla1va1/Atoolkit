@@ -34,6 +34,16 @@ try:                                  # 支持「脚本直跑」与「包内导�
                            negative_sufficient, positive_depth_floor_for, risk_dimensions_for)
     from session_gate import evaluate_session_gate
     from dedupe import aggregate_findings
+    from dynamic_execution import (
+        EXECUTION_CONTRACT_VERSION,
+        DynamicExecutionError,
+        load_authority_execution_events,
+        parse_execution_event_lines,
+        rejected_finding_surface_ids,
+        record_execution_event,
+        render_execution_queue,
+        write_execution_projection,
+    )
     from surface import extract_endpoint_paths, is_saturated
     from planner import HIGH_VALUE_TAGS, plan_surfaces, classify_endpoint_domain, filter_surfaces_by_domain
     from vuln_classes import norm_vc, norm_vc_candidates, is_chainable, _squash_ws
@@ -72,6 +82,16 @@ except ImportError:
                                   negative_sufficient, positive_depth_floor_for, risk_dimensions_for)
     from engine.session_gate import evaluate_session_gate
     from engine.dedupe import aggregate_findings
+    from engine.dynamic_execution import (
+        EXECUTION_CONTRACT_VERSION,
+        DynamicExecutionError,
+        load_authority_execution_events,
+        parse_execution_event_lines,
+        rejected_finding_surface_ids,
+        record_execution_event,
+        render_execution_queue,
+        write_execution_projection,
+    )
     from engine.surface import extract_endpoint_paths, is_saturated
     from engine.planner import HIGH_VALUE_TAGS, plan_surfaces, classify_endpoint_domain, filter_surfaces_by_domain
     from engine.vuln_classes import norm_vc, norm_vc_candidates, is_chainable, _squash_ws
@@ -1702,6 +1722,46 @@ def _sync_coverage_ledger(state: CognitiveState, wd: pathlib.Path,
     return ledger
 
 
+def _apply_dynamic_execution_gate(
+    state: CognitiveState,
+    projection: dict,
+) -> list[str]:
+    """Reopen only proof-negative cells whose experiment contract is open.
+
+    Confirmed findings and structured not-applicable cells remain governed by
+    their existing proof contracts.  Execution events are scheduling evidence,
+    never an alternate positive/negative truth source.
+    """
+    progress_by_id = {
+        str(item.get("surface_id") or ""): item
+        for item in projection.get("progress") or []
+        if isinstance(item, dict)
+    }
+    reopened: list[str] = []
+    for cell in state.matrix.values():
+        surface = cell.get("surface") if isinstance(
+            cell.get("surface"), dict) else {}
+        surface_id = str(surface.get("surface_id") or "")
+        progress = progress_by_id.get(surface_id)
+        if not progress or progress.get("closure_allowed"):
+            continue
+        if cell.get("state") != NEGATIVE_WITH_EVIDENCE:
+            continue
+        missing = [
+            str(item.get("description") or item.get("obligation_id") or "")
+            for item in progress.get("missing_obligations") or []
+            if isinstance(item, dict)
+        ]
+        cell["state"] = SHALLOW_NEGATIVE
+        cell["negative_depth_checked"] = False
+        cell["reason"] = (
+            "v8.13 experiment obligations remain open; deep negative reopened")
+        cell["next_actions"] = list(dict.fromkeys(
+            missing or ["complete evidence-bound execution obligations"]))
+        reopened.append(surface_id)
+    return reopened
+
+
 def _discover_and_register_endpoints(
     text: str, state: "CognitiveState", inventory_path: pathlib.Path,
     auth_flow_enabled: bool, verbose: bool,
@@ -3098,6 +3158,18 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
             f"域范围测试：本次聚焦 [{', '.join(target_domains)}] 域，"
             f"优先覆盖域内 surface，域外仅在直觉发现高危时追测")
     coverage_ledger = _sync_coverage_ledger(state, wd)
+    execution_projection: dict | None = None
+    if normalized_planning_mode == "threat_model":
+        coverage_ledger.metadata["execution_contract_version"] = (
+            EXECUTION_CONTRACT_VERSION)
+        coverage_ledger.save(wd / "coverage-ledger.json")
+        try:
+            execution_events = load_authority_execution_events(
+                authority_dir, sid)
+        except DynamicExecutionError as exc:
+            raise ValueError(f"invalid authority execution chain: {exc}") from exc
+        execution_projection = write_execution_projection(
+            wd, coverage_ledger, execution_events)
     knowledge_cards = load_cards() if has_matrix else []
     # v6.1: 候选台账 —— 落盘 candidate-ledger.json，不全在对话里（§4.1）
     candidate_ledger_path = wd / "candidate-ledger.json"
@@ -3392,7 +3464,12 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
     # v8.8: an exact, fully terminal project matrix with no pending Intent is
     # genuine no-work.  Do not spend another model turn merely to rediscover
     # already attested facts.
-    if has_matrix and state.matrix_closed() and not graph.get_pending_intents():
+    execution_closed = (
+        execution_projection is None
+        or int((execution_projection.get("stats") or {}).get("open", 0) or 0) == 0
+    )
+    if (has_matrix and state.matrix_closed() and execution_closed
+            and not graph.get_pending_intents()):
         state.save(state_path)
         if candidate_ledger is not None:
             candidate_ledger.save(candidate_ledger_path)
@@ -3433,6 +3510,10 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         candidate_block = _build_candidate_block(
             state, candidate_ledger, knowledge_cards,
             candidate_top_n=candidate_top_n, must_test=_must_test)
+        if execution_projection is not None:
+            candidate_block = "\n\n".join(x for x in (
+                render_execution_queue(execution_projection), candidate_block,
+            ) if x)
         if historical_fact_context:
             candidate_block = "\n\n".join(
                 x for x in (candidate_block, historical_fact_context) if x)
@@ -3651,6 +3732,53 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         text = "".join(text_parts)
 
         evidence = harvest_evidence(wd, authorized_hosts=authorized_hosts)  # N1：本轮跑模型「之后」采集一次，复用
+        execution_progressed = False
+        execution_event_errors: list[str] = []
+        if execution_projection is not None:
+            raw_execution_events, parse_errors = parse_execution_event_lines(text)
+            execution_event_errors.extend(parse_errors)
+            try:
+                authority_execution_events = load_authority_execution_events(
+                    authority_dir, sid)
+            except DynamicExecutionError as exc:
+                authority_execution_events = []
+                execution_event_errors.append(str(exc))
+            authority_by_id = {
+                str(item.get("event_id") or ""): item
+                for item in authority_execution_events
+                if isinstance(item, dict) and item.get("event_id")
+            }
+            for raw_event in raw_execution_events:
+                try:
+                    saved_event = record_execution_event(
+                        run_dir=wd, ledger=coverage_ledger,
+                        event=raw_event)
+                    normalized_event = saved_event["event"]
+                    event_id = str(normalized_event.get("event_id") or "")
+                    existing_authority = authority_by_id.get(event_id)
+                    if (existing_authority is not None
+                            and existing_authority != normalized_event):
+                        raise DynamicExecutionError(
+                            "authority execution event_id has conflicting content: "
+                            f"{event_id}")
+                    if existing_authority is None:
+                        append_monotonic_event(
+                            authority_dir, session_id=sid,
+                            stream="execution", event=normalized_event)
+                        authority_by_id[event_id] = normalized_event
+                        execution_progressed = True
+                except (DynamicExecutionError, ValueError) as exc:
+                    execution_event_errors.append(str(exc))
+            if execution_event_errors:
+                state.inject_directive(
+                    "EXECUTION_EVENT 未被 Host 接受："
+                    + "；".join(execution_event_errors[:3]))
+            try:
+                execution_events = load_authority_execution_events(
+                    authority_dir, sid)
+            except DynamicExecutionError as exc:
+                execution_events = []
+                execution_event_errors.append(str(exc))
         # P1-3：深测中新发现 endpoint —— 先 seed 进 matrix，使本轮 CELL/报告能闭到新格。
         # 无 inventory（--endpoints-only/ad-hoc）或无矩阵时跳过，保持旧行为。
         if inventory_path.exists():
@@ -3739,7 +3867,43 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         coverage_ledger = _sync_coverage_ledger(
             state, wd,
             candidates=candidate_ledger.candidates if candidate_ledger else None)
-        if made_progress(prev, evidence) or notes:            # 本轮新增证据 or 新闭格 → 进展刷新计时
+        execution_gate_notes: list[str] = []
+        if execution_projection is not None:
+            rejected_execution_surfaces = rejected_finding_surface_ids(
+                wd, coverage_ledger,
+                (evidence.get("finding_validation") or {}).get("rejected") or [])
+            coverage_ledger.metadata["execution_contract_version"] = (
+                EXECUTION_CONTRACT_VERSION)
+            coverage_ledger.save(wd / "coverage-ledger.json")
+            execution_projection = write_execution_projection(
+                wd, coverage_ledger, execution_events,
+                rejected_surface_ids=rejected_execution_surfaces)
+            reopened_execution = _apply_dynamic_execution_gate(
+                state, execution_projection)
+            if reopened_execution:
+                execution_gate_notes.append(
+                    "[EXECUTION] reopened deep negatives with open obligations: "
+                    + ", ".join(reopened_execution[:8]))
+                state.save(wd / "state.json")
+                coverage_ledger = _sync_coverage_ledger(
+                    state, wd,
+                    candidates=(candidate_ledger.candidates
+                                if candidate_ledger else None))
+                coverage_ledger.metadata["execution_contract_version"] = (
+                    EXECUTION_CONTRACT_VERSION)
+                coverage_ledger.save(wd / "coverage-ledger.json")
+                execution_projection = write_execution_projection(
+                    wd, coverage_ledger, execution_events,
+                    rejected_surface_ids=rejected_execution_surfaces)
+            next_execution = (execution_projection.get("queue") or [])[:1]
+            if next_execution:
+                item = next_execution[0]
+                state.inject_directive(
+                    "动态执行下一格："
+                    f"{item.get('surface_id')} {item.get('method')} "
+                    f"{item.get('endpoint')} state={item.get('execution_status')}")
+        notes.extend(execution_gate_notes)
+        if made_progress(prev, evidence) or notes or execution_progressed:  # 物理证据/闭格/accepted event
             last_progress = time.time()
         if verbose:
             st = state.matrix_stats() if has_matrix else None
@@ -3769,14 +3933,25 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         _log_event(wd, {"ev": "turn", "turn": turn, "marker": marker.group(1) if marker else None,
                         "out_chars": len(text), "files": len(evidence["files"]),
                         "loop_phase": loop_phase, "loop_reason": loop_reason,
+                        "execution": (
+                            execution_projection.get("stats")
+                            if execution_projection is not None else None),
+                        "execution_event_errors": execution_event_errors,
                         "notes": notes, "coverage": state.matrix_stats() if has_matrix else None,
                         "coverage_ledger": derive_coverage(coverage_ledger)})
 
         # ① 覆盖矩阵全格闭合 → 收口终止
-        if has_matrix and state.matrix_closed():
+        current_execution_closed = (
+            execution_projection is None
+            or int((execution_projection.get("stats") or {}).get("open", 0) or 0) == 0
+        )
+        if has_matrix and state.matrix_closed() and current_execution_closed:
             if verbose: print(f"  [turn {turn}] ✅ 覆盖矩阵全格闭合 → 收口")
             return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
                              candidate_ledger=candidate_ledger, cards=knowledge_cards, graph=graph, biz_graph=biz_graph, run_scope=run_scope)
+        if has_matrix and state.matrix_closed() and not current_execution_closed:
+            state.inject_directive(
+                "覆盖格表面闭合但 execution contract 仍有 open obligation，继续动态队列")
 
         # v8.6: a surface budget authorizes complete METHOD/path surfaces, not
         # just the first cell on each path.  Stop only after every authorized
@@ -3789,7 +3964,8 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                         and (_c.get("state") in (UNTESTED, SHALLOW_NEGATIVE)
                              or _c.get("needs"))):
                     _open_authorized.append(_cell_key)
-            if state.allowed_cells and not _open_authorized:
+            if (state.allowed_cells and not _open_authorized
+                    and current_execution_closed):
                 if verbose: print(f"  [turn {turn}] ✅ surface_budget={surface_budget} "
                                   f"授权的 {len(state.allowed_cells)} 个 cells 全部闭合 → 收口")
                 return _conclude(last_marker, evidence, wd, state, authorized_hosts, turn, verify_fn,
@@ -4078,6 +4254,41 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
                                 "阴性证据不达 depth floor，补向量")
         coverage_ledger.save(pathlib.Path(wd) / "coverage-ledger.json")
         state.save(pathlib.Path(wd) / "state.json")
+    execution_terminal_projection: dict | None = None
+    execution_terminal_error = ""
+    if int(coverage_ledger.metadata.get(
+            "execution_contract_version", 0) or 0):
+        try:
+            manifest_value = json.loads(safe_read_bytes(
+                pathlib.Path(wd) / "run_manifest.json",
+                root=pathlib.Path(wd)).decode("utf-8"))
+            authority_root = pathlib.Path(str(
+                manifest_value.get("authority_path") or "")).parent.parent
+            execution_events = load_authority_execution_events(
+                authority_root, str(manifest_value.get("session_id") or ""))
+            rejected_execution_surfaces = rejected_finding_surface_ids(
+                wd, coverage_ledger,
+                (evidence.get("finding_validation") or {}).get("rejected") or [])
+            execution_terminal_projection = write_execution_projection(
+                wd, coverage_ledger, execution_events,
+                rejected_surface_ids=rejected_execution_surfaces)
+            reopened_execution = _apply_dynamic_execution_gate(
+                state, execution_terminal_projection)
+            if reopened_execution:
+                state.save(pathlib.Path(wd) / "state.json")
+                coverage_ledger = _sync_coverage_ledger(
+                    state, pathlib.Path(wd), candidates=cand_list)
+                coverage_ledger.metadata["execution_contract_version"] = (
+                    EXECUTION_CONTRACT_VERSION)
+                coverage_ledger.save(pathlib.Path(wd) / "coverage-ledger.json")
+                execution_terminal_projection = write_execution_projection(
+                    wd, coverage_ledger, execution_events,
+                    rejected_surface_ids=rejected_execution_surfaces)
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError,
+                DynamicExecutionError) as exc:
+            execution_terminal_error = f"{type(exc).__name__}:{exc}"
+            if status in {"complete", "low_roi", "vuln_found"}:
+                status = "incomplete"
     # P1-3：discovery 饱和标志（来自 inventory.json，重算以权威；无 inventory → None）
     saturation_reached = None
     inv_path = pathlib.Path(wd) / "inventory.json"
@@ -4239,6 +4450,10 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
         "negatives": len(evidence.get("negatives", [])),
         "coverage": state.matrix_stats() if state.matrix else None,
         "coverage_ledger": derive_coverage(coverage_ledger),
+        "execution": (
+            execution_terminal_projection.get("stats")
+            if execution_terminal_projection is not None else {}),
+        "execution_error": execution_terminal_error,
         "coverage_ledger_path": str((pathlib.Path(wd) / "coverage-ledger.json").resolve()),
         "session_gate": session_gate,
         "open_risk_cells": open_risk_cells,

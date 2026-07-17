@@ -19,6 +19,16 @@ from typing import Any, Iterable
 
 try:
     from .blocker import RECOVERABLE, resolve_blocker
+    from .dynamic_execution import (
+        EXECUTION_CONTRACT_VERSION,
+        DynamicExecutionError,
+        build_execution_projection,
+        compile_execution_contract,
+        normalize_execution_event,
+        record_execution_event,
+        rejected_finding_surface_ids,
+        write_execution_projection,
+    )
     from .knowledge import (
         load_cards,
         match_cards,
@@ -35,6 +45,7 @@ try:
         STATUS_NOT_VULNERABLE,
         STATUS_SHALLOW_NEGATIVE,
         CoverageLedger,
+        normalize_status,
     )
     from .orchestrator import CognitiveState
     from .planner import plan_surfaces
@@ -57,12 +68,20 @@ try:
     from .vuln_classes import norm_vc
 except ImportError:  # pragma: no cover - script execution fallback
     from blocker import RECOVERABLE, resolve_blocker
+    from dynamic_execution import (EXECUTION_CONTRACT_VERSION,
+                                   DynamicExecutionError,
+                                   build_execution_projection,
+                                   compile_execution_contract,
+                                   normalize_execution_event,
+                                   record_execution_event,
+                                   rejected_finding_surface_ids,
+                                   write_execution_projection)
     from knowledge import (load_cards, match_cards, negative_barrier_signals,
                            negative_sufficient, render_skill_hint)
     from ledger import (STATUS_BLOCKED, STATUS_CONFIRMED, STATUS_EXPLORING,
                         STATUS_NOT_APPLICABLE, STATUS_NOT_TESTED,
                         STATUS_NOT_VULNERABLE, STATUS_SHALLOW_NEGATIVE,
-                        CoverageLedger)
+                        CoverageLedger, normalize_status)
     from orchestrator import CognitiveState
     from planner import plan_surfaces
     from project_state import canonical_asset
@@ -89,6 +108,44 @@ _FORMAT_SIGNALS = {"format_unresolved"}
 _HUMAN_SIGNALS = {"missing_role", "challenge_unsolved"}
 DIRECT_QUEUE_LIMIT = 16
 DIRECT_HINT_CARD_LIMIT = 4
+
+
+def preflight_direct_run(
+    *, run_dir: pathlib.Path, target: str,
+) -> dict[str, Any]:
+    """Create the diagnostic trust boundary before fresh black-box recon.
+
+    A fresh target cannot have an inventory before its first authorized recon
+    request.  v8.13 separates that bootstrap from ``init`` so Direct users no
+    longer have to violate the pre-network runtime rule merely to discover the
+    first endpoint.
+    """
+    run = run_dir.resolve()
+    ensure_directory(run, root=run.parent)
+    record = {
+        "schema_version": 1,
+        "mode": "direct_diagnostic",
+        "phase": "recon",
+        "target": str(target).strip(),
+        "authority_trusted": False,
+        "delivery_eligible": False,
+        "execution_contract_version": EXECUTION_CONTRACT_VERSION,
+        "runtime_incomplete": True,
+        "next_action": "complete recon, then run skill_runtime init",
+    }
+    if not record["target"]:
+        raise SkillRuntimeError("Direct preflight requires target")
+    path = run / "runtime-preflight.json"
+    created = create_json_exclusive(path, record, root=run)
+    if not created:
+        existing = _load_json(path, root=run)
+        if existing != record:
+            raise SkillRuntimeError(
+                "Direct preflight already exists with different target/state")
+    atomic_write_json(
+        run / "runtime-status.json", record, root=run,
+        reject_leaf_symlink=True)
+    return {**record, "idempotent": not created}
 
 
 def _load_json(path: pathlib.Path, *, root: pathlib.Path | None = None) -> Any:
@@ -176,11 +233,21 @@ def _decorate_surface(surface: dict[str, Any], cards: list[dict]) -> None:
     surface["knowledge_card_ids"] = [str(card.get("id")) for card in matched if card.get("id")]
 
 
-def _queue_from_ledger(ledger: CoverageLedger, cards: list[dict]) -> list[dict[str, Any]]:
+def _queue_from_ledger(
+    ledger: CoverageLedger,
+    cards: list[dict],
+    execution_projection: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    progress_by_id = {
+        str(item.get("surface_id") or ""): item
+        for item in (execution_projection or {}).get("progress", [])
+        if isinstance(item, dict)
+    }
     queue: list[dict[str, Any]] = []
     for surface in ledger.next_surfaces(DIRECT_QUEUE_LIMIT):
         matched = _cards_for_surface(surface, cards)
         hint_cards = matched[:DIRECT_HINT_CARD_LIMIT]
+        progress = progress_by_id.get(str(surface.get("surface_id") or ""), {})
         queue.append({
             "surface_id": surface.get("surface_id", ""),
             "asset_id": surface.get("asset_id", ""),
@@ -198,6 +265,11 @@ def _queue_from_ledger(ledger: CoverageLedger, cards: list[dict]) -> list[dict[s
             "next_actions": list(surface.get("next_actions") or []),
             "knowledge_card_ids": [card.get("id") for card in matched if card.get("id")],
             "knowledge_hint": render_skill_hint(hint_cards),
+            "execution_status": progress.get("execution_status", "ready"),
+            "completed_obligations": list(
+                progress.get("completed_obligations") or []),
+            "next_obligations": list(
+                progress.get("missing_obligations") or [])[:6],
         })
     return queue
 
@@ -211,6 +283,7 @@ def _runtime_status(
     projection_stale: bool = False,
     observation_errors: int = 0,
     threat_coverage: dict[str, Any] | None = None,
+    execution_projection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stats = ledger.stats()
     planning_mode = str(ledger.metadata.get("planning_mode") or "legacy_risk")
@@ -222,6 +295,11 @@ def _runtime_status(
         and int(threat_stats.get("open_threats", 1) or 0) == 0
         and int(threat_stats.get("open_features", 1) or 0) == 0
     )
+    execution_stats = (execution_projection or {}).get("stats") or {}
+    execution_closed = (
+        int(execution_stats.get("contracts", 0) or 0) > 0
+        and int(execution_stats.get("open", 1) or 0) == 0
+    )
     return {
         "schema_version": 1,
         "mode": "direct_diagnostic",
@@ -230,13 +308,15 @@ def _runtime_status(
         "delivery_eligible": False,
         "planning_mode": planning_mode,
         "planning_degraded": planning_degraded,
+        "execution_contract_version": EXECUTION_CONTRACT_VERSION,
+        "execution": execution_stats,
         "coverage": stats,
         "accepted_findings": accepted_findings,
         "rejected_findings": rejected_findings,
         "projection_stale": projection_stale,
         "observation_errors": observation_errors,
         "report_ready": bool(
-            not planning_degraded and threat_closed
+            not planning_degraded and threat_closed and execution_closed
             and stats.get("total") and not stats.get("open")
             and not projection_stale and not rejected_findings
             and not observation_errors),
@@ -254,7 +334,7 @@ def initialize_direct_run(
 ) -> dict[str, Any]:
     """Initialize a diagnostic Direct-Skill ledger and bounded work queue."""
     run = run_dir.resolve()
-    ensure_directory(run, root=run.parent)
+    preflight_direct_run(run_dir=run, target=target)
     rows = _inventory_rows(inventory_path)
     if recon_dir is not None:
         rows.extend(bootstrap_recon(recon_dir))
@@ -336,12 +416,14 @@ def initialize_direct_run(
         "planning_mode": planning_mode,
         "planning_degraded": planning_degraded,
         "planning_artifact_hashes": planning_artifact_hashes,
+        "execution_contract_version": EXECUTION_CONTRACT_VERSION,
     })
     ledger.save(run / "coverage-ledger.json")
     atomic_write_json(run / "candidate-ledger.json", {
         "schema_version": "1.1", "candidates": [],
     }, root=run, reject_leaf_symlink=True)
-    queue = _queue_from_ledger(ledger, cards)
+    execution_projection = write_execution_projection(run, ledger, [])
+    queue = _queue_from_ledger(ledger, cards, execution_projection)
     atomic_write_json(run / "execution-queue.json", {
         "schema_version": 1, "queue": queue,
     }, root=run, reject_leaf_symlink=True)
@@ -352,7 +434,9 @@ def initialize_direct_run(
         atomic_write_json(
             run / "threat-coverage.json", threat_coverage, root=run,
             reject_leaf_symlink=True)
-    status = _runtime_status(run, ledger, threat_coverage=threat_coverage)
+    status = _runtime_status(
+        run, ledger, threat_coverage=threat_coverage,
+        execution_projection=execution_projection)
     atomic_write_json(run / "runtime-status.json", status, root=run, reject_leaf_symlink=True)
     return {**status, "execution_queue": queue}
 
@@ -412,6 +496,34 @@ def record_observation(
         **({"feature_id": surface["feature_id"]} if surface.get("feature_id") else {}),
         **({"threat_id": surface["threat_id"]} if surface.get("threat_id") else {}),
     }
+    # v8.13: explicit execution claims are validated at observation time.  Old
+    # observations remain readable and are conservatively inferred at checkpoint.
+    observation_barriers = _dedupe([
+        *_as_list(normalized.get("barrier_signals")),
+        *negative_barrier_signals(
+            normalized.get("negative")
+            if isinstance(normalized.get("negative"), dict) else {}),
+    ])
+    if normalized.get("completed_obligations") or observation_barriers:
+        probe_event = {
+            "schema_version": 1,
+            "event_id": "obs-" + hashlib.sha256(
+                f"{agent_id}\x1f{observation_id}".encode("utf-8")
+            ).hexdigest()[:24],
+            "surface_id": surface_id,
+            "outcome": (
+                "blocked" if normalized.get("outcome") == "blocked"
+                or (observation_barriers and not refs) else "observed"),
+            "completed_obligations": normalized.get("completed_obligations") or [],
+            "evidence_refs": refs,
+            "barrier_signals": observation_barriers,
+        }
+        try:
+            normalize_execution_event(run, ledger, probe_event)
+            record_execution_event(
+                run_dir=run, ledger=ledger, event=probe_event)
+        except DynamicExecutionError as exc:
+            raise SkillRuntimeError(str(exc)) from exc
     destination = run / "state" / "observations" / f"{agent_id}--{observation_id}.json"
     ensure_directory(destination.parent, root=run)
     created = create_json_exclusive(destination, normalized, root=run)
@@ -548,6 +660,80 @@ def _projection_stale(run: pathlib.Path, accepted_count: int) -> bool:
         and "title" not in line.lower()
     ]
     return len(table_rows) != accepted_count
+
+
+def _execution_events_from_observations(
+    run: pathlib.Path,
+    ledger: CoverageLedger,
+    observations: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Normalize Direct observations into the shared v8.13 event contract."""
+    events: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for observation in observations:
+        negative = observation.get("negative")
+        negative = negative if isinstance(negative, dict) else {}
+        barriers = _dedupe([
+            *_as_list(observation.get("barrier_signals")),
+            *negative_barrier_signals(negative),
+        ])
+        completed = _dedupe(observation.get("completed_obligations") or [])
+        refs = _dedupe(observation.get("evidence_refs") or [])
+        if (str(observation.get("outcome") or "") in {"negative", "confirmed"}
+                and refs
+                and int(negative.get("response_count", 1) or 0) > 0
+                and "valid-baseline" not in completed):
+            completed.append("valid-baseline")
+        if not completed and not barriers:
+            continue
+        raw = {
+            "schema_version": 1,
+            "event_id": "obs-" + hashlib.sha256(
+                (str(observation.get("agent_id") or "") + "\x1f"
+                 + str(observation.get("observation_id") or "")).encode("utf-8")
+            ).hexdigest()[:24],
+            "surface_id": str(observation.get("surface_id") or ""),
+            "outcome": (
+                "blocked" if str(observation.get("outcome") or "") == "blocked"
+                or (barriers and not refs) else "observed"),
+            "completed_obligations": completed,
+            "evidence_refs": refs,
+            "barrier_signals": barriers,
+        }
+        try:
+            events.append(normalize_execution_event(run, ledger, raw))
+        except DynamicExecutionError as exc:
+            errors.append({
+                "observation_id": str(observation.get("observation_id") or ""),
+                "error": str(exc),
+            })
+    return events, errors
+
+
+def _apply_direct_execution_gate(
+    ledger: CoverageLedger,
+    projection: dict[str, Any],
+) -> bool:
+    """Reopen a negative whose v8.13 experiment obligations are still open."""
+    changed = False
+    for progress in projection.get("progress") or []:
+        surface = ledger.get(str(progress.get("surface_id") or ""))
+        if not surface or normalize_status(surface.get("status")) != STATUS_NOT_VULNERABLE:
+            continue
+        if progress.get("closure_allowed"):
+            continue
+        missing = [
+            str(item.get("description") or item.get("obligation_id") or "")
+            for item in progress.get("missing_obligations") or []
+            if isinstance(item, dict)
+        ]
+        surface["status"] = STATUS_SHALLOW_NEGATIVE
+        surface["negative_depth"] = "shallow"
+        surface["negative_depth_checked"] = False
+        surface["next_actions"] = _dedupe(
+            missing or ["complete the v8.13 execution obligations"])
+        changed = True
+    return changed
 
 
 def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
@@ -740,8 +926,23 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         surface["knowledge_card_ids"] = [
             card.get("id") for card in matched if card.get("id")]
 
+    execution_events, execution_errors = _execution_events_from_observations(
+        run, ledger, observations)
+    rejected_execution_surfaces = rejected_finding_surface_ids(
+        run, ledger, collected.get("rejected") or [])
+    execution_projection = build_execution_projection(
+        ledger, execution_events,
+        rejected_surface_ids=rejected_execution_surfaces)
+    if _apply_direct_execution_gate(ledger, execution_projection):
+        execution_projection = build_execution_projection(
+            ledger, execution_events,
+            rejected_surface_ids=rejected_execution_surfaces)
+    ledger.metadata["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
     ledger.save(run / "coverage-ledger.json")
-    queue = _queue_from_ledger(ledger, cards)
+    execution_projection = write_execution_projection(
+        run, ledger, execution_events,
+        rejected_surface_ids=rejected_execution_surfaces)
+    queue = _queue_from_ledger(ledger, cards, execution_projection)
     atomic_write_json(run / "execution-queue.json", {
         "schema_version": 1, "queue": queue,
     }, root=run, reject_leaf_symlink=True)
@@ -763,14 +964,16 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         projection_stale=stale,
         observation_errors=len(observation_errors),
         threat_coverage=threat_coverage,
+        execution_projection=execution_projection,
     )
     checkpoint = {
         "schema_version": 1,
         **status,
         "observations": len(observations),
-        "observation_errors": observation_errors,
+        "observation_errors": [*observation_errors, *execution_errors],
         "conflicts": conflicts,
         "execution_queue": queue,
+        "execution": execution_projection,
         "finding_validation": {
             "accepted": len(collected.get("accepted") or []),
             "rejected": len(collected.get("rejected") or []),
@@ -787,8 +990,13 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Atoolkit Direct-Skill diagnostic init/observe/checkpoint runtime")
+        description=(
+            "Atoolkit Direct-Skill diagnostic "
+            "preflight/init/observe/checkpoint runtime"))
     sub = parser.add_subparsers(dest="command", required=True)
+    preflight = sub.add_parser("preflight")
+    preflight.add_argument("--run-dir", required=True, type=pathlib.Path)
+    preflight.add_argument("--target", required=True)
     init = sub.add_parser("init")
     init.add_argument("--run-dir", required=True, type=pathlib.Path)
     init.add_argument("--target", required=True)
@@ -808,7 +1016,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        if args.command == "init":
+        if args.command == "preflight":
+            result = preflight_direct_run(
+                run_dir=args.run_dir, target=args.target)
+        elif args.command == "init":
             result = initialize_direct_run(
                 run_dir=args.run_dir, target=args.target,
                 inventory_path=args.inventory, recon_dir=args.recon_dir,
@@ -844,6 +1055,7 @@ if __name__ == "__main__":
 
 __all__ = [
     "SkillRuntimeError",
+    "preflight_direct_run",
     "initialize_direct_run",
     "record_observation",
     "checkpoint_direct_run",

@@ -9,12 +9,30 @@ from typing import Any
 from urllib.parse import parse_qsl, urljoin, urlparse, urlsplit
 
 try:
+    from ..dynamic_execution import (
+        EXECUTION_CONTRACT_VERSION,
+        DynamicExecutionError,
+        build_execution_projection,
+        load_authority_execution_events,
+        normalize_execution_event,
+        projection_matches_files,
+        rejected_finding_surface_ids,
+    )
     from ..host_policy import is_authorized_url, normalize_authorized_scopes
+    from ..ledger import CoverageLedger
     from ..run_authority import canonical_method_resolution_key
     from ..runtime_manifest import validate_manifest_binding
     from ..safe_io import atomic_write_json, safe_read_bytes, safe_read_text
 except ImportError:  # pragma: no cover - direct package fallback
+    from dynamic_execution import (EXECUTION_CONTRACT_VERSION,
+                                   DynamicExecutionError,
+                                   build_execution_projection,
+                                   load_authority_execution_events,
+                                   normalize_execution_event,
+                                   projection_matches_files,
+                                   rejected_finding_surface_ids)
     from host_policy import is_authorized_url, normalize_authorized_scopes
+    from ledger import CoverageLedger
     from run_authority import canonical_method_resolution_key
     from runtime_manifest import validate_manifest_binding
     from safe_io import atomic_write_json, safe_read_bytes, safe_read_text
@@ -2604,6 +2622,7 @@ def _run_closure_gate(
     context: ValidationContext | None = None,
     *,
     normalized_findings: list[dict[str, Any]] | None = None,
+    rejected_findings: list[dict[str, Any]] | None = None,
     source_run_dir: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     reasons: list[str] = []
@@ -2646,6 +2665,7 @@ def _run_closure_gate(
         reasons.append("inventory_asset_out_of_scope")
     ledger_path = run_dir / "coverage-ledger.json"
     surfaces: list[Any] = []
+    ledger_value: dict[str, Any] = {}
     if not ledger_path.is_file():
         reasons.append("coverage_missing_or_invalid")
     else:
@@ -3046,6 +3066,62 @@ def _run_closure_gate(
     ))
     plan_reasons, plan_stats = _authority_plan_gate(context, surfaces)
     reasons.extend(plan_reasons)
+    execution_stats: dict[str, Any] = {}
+    execution_metadata = (
+        ledger_value.get("metadata") if isinstance(ledger_value, dict) else {}) or {}
+    if int(execution_metadata.get("execution_contract_version", 0) or 0):
+        if int(execution_metadata.get("execution_contract_version", 0) or 0) != (
+                EXECUTION_CONTRACT_VERSION):
+            reasons.append("execution_contract_version_invalid")
+        elif context is None or not isinstance(context.manifest, dict):
+            reasons.append("execution_authority_missing")
+        else:
+            authority_path = pathlib.Path(str(
+                context.manifest.get("authority_path") or ""))
+            authority_root = authority_path.parent.parent
+            session_id = str(context.manifest.get("session_id") or "")
+            execution_ledger = CoverageLedger(
+                [item for item in surfaces if isinstance(item, dict)],
+                metadata=execution_metadata)
+            try:
+                authority_events = load_authority_execution_events(
+                    authority_root, session_id)
+                normalized_events: list[dict[str, Any]] = []
+                for event in authority_events:
+                    normalized = normalize_execution_event(
+                        run_dir, execution_ledger, event)
+                    if normalized != event:
+                        raise DynamicExecutionError(
+                            "authority execution event is not canonical")
+                    normalized_events.append(normalized)
+                    for ref in normalized.get("evidence_refs") or []:
+                        evidence_path = (run_dir / str(ref)).resolve()
+                        try:
+                            relative = evidence_path.relative_to(run_dir).as_posix()
+                        except ValueError as exc:
+                            raise DynamicExecutionError(
+                                "execution evidence escaped run") from exc
+                        closure_artifact_hashes[relative] = _sha256_file(
+                            evidence_path)
+                execution_projection = build_execution_projection(
+                    execution_ledger, normalized_events,
+                    rejected_surface_ids=rejected_finding_surface_ids(
+                        run_dir, execution_ledger, rejected_findings or []))
+                execution_stats = dict(execution_projection.get("stats") or {})
+                reasons.extend(projection_matches_files(
+                    run_dir, execution_projection))
+                if int(execution_stats.get("open", 0) or 0) != 0:
+                    reasons.append("execution_contract_open")
+                for name in (
+                    "execution-contracts.json", "execution-progress.json",
+                    "execution-queue.json", "execution-backlog.json",
+                ):
+                    path = run_dir / name
+                    if path.is_file():
+                        closure_artifact_hashes[name] = _sha256_file(path)
+            except (DynamicExecutionError, OSError, ValueError) as exc:
+                reasons.append(
+                    f"execution_projection_invalid:{type(exc).__name__}:{exc}")
     try:
         candidates = json.loads((run_dir / "candidate-ledger.json").read_text(encoding="utf-8"))
         if (not isinstance(candidates, dict)
@@ -3103,6 +3179,7 @@ def _run_closure_gate(
         "session_gate": session_gate,
         "authority_plan": plan_stats,
         "threat_coverage": threat_stats,
+        "execution": execution_stats,
         "artifact_hashes": closure_artifact_hashes,
     }
 
@@ -3294,6 +3371,7 @@ def validate_run_artifacts(
     canonical_count = int((collected.get("counts") or {}).get("canonical", 0) or 0)
     closure_gate = _run_closure_gate(
         base, context=context, normalized_findings=normalized_confirmed,
+        rejected_findings=rejected,
         source_run_dir=source_run)
     for ref, digest in (closure_gate.get("artifact_hashes") or {}).items():
         path = (base / str(ref)).resolve()

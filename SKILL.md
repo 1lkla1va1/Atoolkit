@@ -1,7 +1,7 @@
 ---
 name: Atoolkit
 description: Authorized AI-assisted SRC/bug-bounty vulnerability research toolkit. Use whenever the user wants to read, install, configure, or run this Atoolkit package; mentions SRC 漏洞挖掘, 授权靶场, bug bounty, Codex AGENTS.md, /src, Guardian 质检, PoC 复验, or model-independent security testing automation. Only proceed for clearly authorized defensive testing or educational lab contexts.
-version: 8.12.0
+version: 8.13.0
 ---
 
 # Atoolkit Skill
@@ -56,10 +56,14 @@ Direct/QoderWork should use `engine.skill_runtime` for deterministic session
 state even though it remains untrusted. This closes execution feedback and
 multi-agent synchronization; it does not weaken the authority boundary.
 
-v8.12 threat mode starts from a validated business feature graph and explicit
+v8.13 threat mode starts from a validated business feature graph and explicit
 security invariants. Risk tags route knowledge; they do not create the coverage
 denominator. Direct runs without both threat artifacts remain compatible but
 are marked `legacy_risk/planning_degraded=true` and can never be report-ready.
+Each frozen threat compiles into an Experiment Contract. Engine consumes
+evidence-bound `EXECUTION_EVENT` lines; Direct observations carry
+`completed_obligations`. Host projections dynamically queue missing depth,
+barrier recovery, and proof repair without changing the frozen denominator.
 Engine materializes raw multi-identity headers only after Planning in the
 restricted Attack `identities.json`; models must keep labels isolated and must
 never copy that file into a report.
@@ -76,7 +80,7 @@ cgroup/job/container supervisor is integrated.
    is a hard stop. Running `init-manifest` from Direct Skill Mode is diagnostic,
    not an independent trust anchor.
 3. Load `<project>/project_state.json` when present. It is the cross-run authority; `blackboard.json`, `business_graph.json`, and summaries are derived views only.
-4. Read `hint.md`, then execute Phase 0 recon per `skill/recon-checklist.md` and initialize JSON `inventory.json` plus `coverage-ledger.json`. In Direct/Qoder mode run `python3 -m engine.skill_runtime init ...`; its files are session-authoritative diagnostics but not cross-Run authority. `attack_surface_list.md` is a derived human view, not the closure source.
+4. In Direct/Qoder mode, run `python3 -m engine.skill_runtime preflight --run-dir <session> --target <url>` before fresh black-box recon. Read `hint.md`, execute Phase 0 per `skill/recon-checklist.md`, then run `engine.skill_runtime init ...` before attack testing to initialize JSON inventory, coverage, execution contracts and queue. These files are session-authoritative diagnostics but not cross-Run authority. `attack_surface_list.md` is a derived human view, not the closure source.
 5. Merge new inventory into project inventory by asset + method + path. Unknown methods stay unresolved and must not default to GET.
 6. Restore coverage only for an exact asset + method/path + param + role + vuln-class cell, then schedule pending Intents and still-open cells.
 
@@ -88,7 +92,7 @@ For each surface in the queue:
 2. Look up the corresponding knowledge card summary for the risk_tags.
 3. Execute testing; for each risk dimension respond: `CANDIDATE` / `NONE:<reason>`.
 4. Write evidence (finding package or negative record).
-4.5 Write an immutable per-agent observation and run `engine.skill_runtime checkpoint` at each phase boundary and every 10 cells in Direct/Qoder mode.
+4.5 Complete only obligation IDs present in `execution-queue.json`, write an immutable per-agent observation, and run `engine.skill_runtime checkpoint` after each exact cell, at each phase boundary, and every 10 cells in Direct/Qoder mode.
 5. Update coverage ledger status.
 6. Run the termination self-check (see §9 of `skill/核心技能文件.v3.md`): depth floor met? Time to pivot?
 
@@ -117,6 +121,7 @@ Finalizer exit codes are `0=verified complete`, `1=invalid/conflict`,
 Direct diagnostic commands:
 
 ```bash
+python3 -m engine.skill_runtime preflight --run-dir <session> --target <url>
 python3 -m engine.skill_runtime init --run-dir <session> --target <url> \
   --inventory <inventory.json> --recon-dir <recon> \
   --feature-graph <feature-graph.json> --threat-model <threat-model.json>
@@ -125,7 +130,8 @@ python3 -m engine.skill_runtime observe --run-dir <session> \
 python3 -m engine.skill_runtime checkpoint --run-dir <session>
 ```
 
-The observation/barrier contract is documented in `skill/runtime-hot-path.md`.
+The observation/barrier/execution-obligation contract is documented in
+`skill/runtime-hot-path.md`.
 Use `--legacy-risk-plan` on the wrapper only for an intentional degraded
 compatibility run. A threat-mode Finding additionally requires
 `feature_point.feature_id` and `claim.threat_id`.
