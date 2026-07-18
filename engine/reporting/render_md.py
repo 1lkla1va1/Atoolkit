@@ -133,8 +133,11 @@ def render_final_report(
         if reasons:
             lines.append("- session-gate: " + str(gate.get("result", "")))
             for reason in reasons[:8]:
-                pred = reason.get("predicate") or reason.get("kind") or "reason"
-                detail = reason.get("action") or reason.get("detail") or ""
+                if isinstance(reason, dict):
+                    pred = reason.get("predicate") or reason.get("kind") or "reason"
+                    detail = reason.get("action") or reason.get("detail") or ""
+                else:
+                    pred, detail = "reason", str(reason)
                 lines.append(f"- {pred}: {detail}".rstrip(": "))
         if coverage_stats:
             lines.append(f"- high_value_open: {coverage_stats.get('high_value_open', 0)}")

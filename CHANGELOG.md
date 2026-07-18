@@ -1,5 +1,16 @@
 # Changelog
 
+## 9.0.0 - 2026-07-18
+
+- 新增确定性 `miss-attribution.json`：逐一归因 frozen cell、unassigned inventory、unresolved method、dynamic backlog、proof rejection 与批次原子门连带阻断的 Finding；未知状态 fail closed，终结静默遗漏和虚假覆盖率。
+- 新增 `next-run-agenda.json` 与 `v9_host_continuation`：trusted finalizer 在不完整 Run 中只提交续航任务，scheduler 可优先恢复有证据的新 discovery，但普通模型 Intent 仍不能绕过 inventory。
+- 修复 v8.13 closure 失败即丢弃 backlog/Intent 的跨 Run 断链；后续阴性与 confirmed truth 冲突时改为 Finding/Fact 强制复验，不再静默覆盖。
+- Manifest 升级 schema 5，冻结 outcome/submission contract；receipt 强制绑定归因与续航产物。
+- 新增 `run.py audit` 历史 Run 只读审计，以及 `run.py submission` 提交资格验证；人工 Markdown、篡改报告、未脱敏报告或无 authority receipt 的报告均不可提交。
+- 结构化 Finding 增加垃圾风险门：报错/500/类型混淆必须证明安全边界结果；凭据回显必须证明跨边界使用；单独限频/开放重定向等不得借散文升级。
+- Shared finalizer 保持报告唯一写入权，输出 receipt-bound、稳定脱敏的 Canonical report 和 `submission_status.json`。
+- 新增 v9 设计、反向审核、结果归因/续航/真值冲突/提交资格/旧 Run 审计回归测试。
+
 ## 8.13.0 - 2026-07-17
 
 - 新增 Threat-driven Experiment Contract：逐项保留模型 `evidence_required`，并按身份、认证、交易、持久化输入、注入、SSRF、跳转和文件结果增加确定性最低深度；只约束 frozen threat 内实验，不恢复 endpoint × 漏洞类笛卡尔积。

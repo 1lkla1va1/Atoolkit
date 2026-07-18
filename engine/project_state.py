@@ -1108,12 +1108,63 @@ class ProjectStateStore:
                 }
                 existing = next(
                     (x for x in state["negatives"] if x.get("cell_key") == key), None)
+                prior = state["cell_registry"].get(key)
+                if prior and prior.get("status") == "confirmed":
+                    item.update({
+                        "status": "conflicts_confirmed",
+                        "conflicts_with_finding_id": prior.get(
+                            "canonical_finding_id", ""),
+                        "conflict_detected_at": _now(),
+                    })
                 if existing:
                     existing.update(item)
                 else:
                     state["negatives"].append(item)
-                prior = state["cell_registry"].get(key)
-                if not prior or prior.get("status") != "confirmed":
+                if prior and prior.get("status") == "confirmed":
+                    canonical_id = str(prior.get("canonical_finding_id") or "")
+                    prior.update({
+                        "revalidation_status": "required",
+                        "conflicting_negative_run": run_id,
+                        "conflicting_negative_evidence_refs": evidence_refs,
+                        "updated_at": _now(),
+                    })
+                    for record in state.get("finding_registry", {}).values():
+                        if record.get("canonical_finding_id") == canonical_id:
+                            record["status"] = "needs_revalidation"
+                            record["revalidation_reason"] = (
+                                "later canonical negative conflicts with confirmed cell")
+                            record["conflicting_run"] = run_id
+                    for fact in state.get("facts", []):
+                        if fact.get("canonical_finding_id") == canonical_id:
+                            fact["proof_status"] = "revalidation_required"
+                            fact["conflicting_run"] = run_id
+                    intent_identity = f"{key}|{canonical_id}|truth_conflict"
+                    intent_id = _stable_id("intent", intent_identity)
+                    if not any(
+                            row.get("intent_id") == intent_id
+                            for row in state.get("intents", [])):
+                        state["intents"].append({
+                            "intent_id": intent_id,
+                            "source": "v9_host_continuation",
+                            "source_kind": "truth_conflict",
+                            "source_finding_id": canonical_id,
+                            "source_surface_id": key,
+                            "cause_code": "truth_conflict",
+                            "description": (
+                                "revalidate the exact cell with the original positive "
+                                "and later negative controls before submission"),
+                            "priority": "critical",
+                            "status": "pending",
+                            "target_endpoint": canonical_path,
+                            "target_method": method,
+                            "target_params": [param] if param else [],
+                            "target_roles": [role] if role else [],
+                            "vuln_class": norm_vc(vc),
+                            "evidence_refs": list(dict.fromkeys(
+                                list(prior.get("evidence_refs") or [])
+                                + evidence_refs)),
+                        })
+                else:
                     state["cell_registry"][key] = {
                         "cell_key": key, "asset_id": asset, "method": method,
                         "path": canonical_path,
@@ -1268,6 +1319,9 @@ class ProjectStateStore:
                 "first_seen": _now(), "last_seen": "", "seen_in_runs": [],
                 "observations": [], "status": "confirmed",
             })
+            record["status"] = "confirmed"
+            record.pop("revalidation_reason", None)
+            record.pop("conflicting_run", None)
             _merge_unique(record["seen_in_runs"], [run_id])
             observation = next((
                 item for item in record["observations"]
@@ -1287,9 +1341,18 @@ class ProjectStateStore:
             record["last_seen"] = _now()
 
             for neg in state["negatives"]:
-                if neg.get("cell_key") == key and neg.get("status") == "active":
+                if (neg.get("cell_key") == key
+                        and neg.get("status") in {"active", "conflicts_confirmed"}):
                     neg["status"] = "superseded"
                     neg["superseded_by_finding_id"] = canonical_id
+            for intent in state.get("intents", []):
+                if (intent.get("source_kind") == "truth_conflict"
+                        and intent.get("source_surface_id") == key
+                        and intent.get("status") == "pending"):
+                    intent["status"] = "completed"
+                    intent["outcome_summary"] = (
+                        "exact cell revalidated by a new proof-confirmed finding")
+                    intent["resolved_at"] = _now()
             state["cell_registry"][key] = {
                 "cell_key": key, "asset_id": asset, "method": method,
                 "path": _canonical_row_path(path, param, dimensions),

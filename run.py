@@ -983,7 +983,7 @@ def _run_self_check() -> int:
         assert req and req.method == "GET" and "order_id=1001" in req.url, req
         print("  断言8 ✅ collect/render/normalized/verify helper")
 
-    # 断言9：_conclude 等价闭环写 final_report_path，gate 未过时 draft_incomplete。
+    # 断言9：无 Manifest 的 _conclude 只能写 legacy diagnostic draft。
     def _assert9():
         from engine.orchestrator import CognitiveState, harvest_evidence, _conclude
         fixture = reporting_fixture
@@ -996,7 +996,7 @@ def _run_self_check() -> int:
         state.update("", evidence, maintain_matrix=True)
         out = _conclude("VULN_FOUND", evidence, tmp, state, ["t.example"], 1)
         assert out["structured_findings"]["accepted"] == 1, out
-        assert out["final_report_status"] == "draft_incomplete", out
+        assert out["final_report_status"] == "legacy_diagnostic_draft", out
         assert out["final_report_path"] and pathlib.Path(out["final_report_path"]).exists(), out
         summary = {
             "findings": _summary_findings(out),
@@ -1006,8 +1006,10 @@ def _run_self_check() -> int:
         }
         (tmp / "summary.json").write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
         loaded = json.loads((tmp / "summary.json").read_text(encoding="utf-8"))
-        assert loaded["final_report_path"] and loaded["final_report_status"] == "draft_incomplete", loaded
-        print("  断言9 ✅ _conclude structured finding → draft final_report + summary fields")
+        assert (loaded["final_report_path"]
+                and loaded["final_report_status"] == "legacy_diagnostic_draft"), loaded
+        assert pathlib.Path(loaded["final_report_path"]).name == "legacy_draft_report.md"
+        print("  断言9 ✅ manifest-less _conclude → legacy diagnostic draft")
 
     # ── v6.1 §10.4: 6 条新断言（候选台账 / depth floor / 再探测 / proof 保底 / 缺口附录）──
     def _assert10():
@@ -1738,6 +1740,12 @@ def _run_self_check() -> int:
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "score":
         return _score_run(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "audit":
+        from engine.run_audit import main as audit_main
+        return audit_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "submission":
+        from engine.submission import main as submission_main
+        return submission_main(sys.argv[2:])
     ap = argparse.ArgumentParser(description="起一次授权 SRC 会话（engine 三件套接线）")
     ap.add_argument("--version", action="version", version=f"Atoolkit {__version__}")
     ap.add_argument("--target", default="", help="授权目标 URL")

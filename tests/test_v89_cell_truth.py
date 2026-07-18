@@ -551,7 +551,7 @@ def test_invalid_validation_does_not_increment_or_submit_project_truth(tmp_path)
     assert state["finding_registry"] == {}
 
 
-def test_proof_empty_incomplete_run_projects_blackboard_without_state_write(tmp_path):
+def test_proof_empty_incomplete_run_commits_only_v9_host_continuations(tmp_path):
     project = tmp_path / "project"
     workdir = project / "sessions" / "run-1"
     workdir.mkdir(parents=True)
@@ -563,7 +563,16 @@ def test_proof_empty_incomplete_run_projects_blackboard_without_state_write(tmp_
         endpoints=["/api/refund"], target_domains=["txn"], surface_budget=5,
     )
 
-    assert not (project / "project_state.json").exists()
+    state = ProjectStateStore(project).load()
+    assert (project / "project_state.json").is_file()
+    assert state["finding_registry"] == {}
+    assert state["inventory"]["surfaces"] == {}
+    assert state["negatives"] == []
+    assert state["dead_ends"] == []
+    assert state["intents"]
+    assert all(item.get("source") == "v9_host_continuation"
+               for item in state["intents"])
+    assert out["project_truth_submission"]["mode"] == "continuations_only"
     assert (project / "blackboard.json").is_file()
     assert not any(
         error.startswith("finalizer:FileNotFoundError")
@@ -571,7 +580,7 @@ def test_proof_empty_incomplete_run_projects_blackboard_without_state_write(tmp_
     )
 
 
-def test_incomplete_run_with_finding_commits_only_proof_roots(tmp_path):
+def test_incomplete_run_with_finding_commits_roots_and_host_continuations(tmp_path):
     project = tmp_path / "project"
     workdir = project / "sessions" / "run-1"
     workdir.mkdir(parents=True)
@@ -595,14 +604,18 @@ def test_incomplete_run_with_finding_commits_only_proof_roots(tmp_path):
     )
     state = ProjectStateStore(project).load()
 
-    assert out["project_truth_submission"]["mode"] == "proof_roots"
+    assert out["project_truth_submission"]["mode"] == (
+        "proof_roots_and_continuations")
     assert out["status"] == "incomplete_with_findings"
     assert len(state["finding_registry"]) == 1
     assert state["inventory"]["surfaces"] == {}
     assert state["negatives"] == []
     assert state["dead_ends"] == []
-    assert state["intents"] == []
-    assert state["run_history"]["run-1"]["truth_submission_mode"] == "proof_roots"
+    assert state["intents"]
+    assert all(item.get("source") == "v9_host_continuation"
+               for item in state["intents"])
+    assert state["run_history"]["run-1"]["truth_submission_mode"] == (
+        "proof_roots_and_continuations")
 
 
 def test_intent_prompt_block_escapes_closing_tag_and_is_bounded_json():

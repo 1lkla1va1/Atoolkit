@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover
 
 try:  # Support both ``python -m engine.finalize`` and direct repo CLI use.
     from .project_state import ProjectStateError, ProjectStateStore, _default_state
+    from .data_hygiene import sensitive_kinds
     from .reporting.render_md import render_final_report
     from .reporting.validate import validate_run_artifacts
     from .run_authority import (
@@ -45,6 +46,7 @@ try:  # Support both ``python -m engine.finalize`` and direct repo CLI use.
     from .version import __version__
 except ImportError:  # pragma: no cover - exercised by subprocess CLI tests
     from project_state import ProjectStateError, ProjectStateStore, _default_state
+    from data_hygiene import sensitive_kinds
     from reporting.render_md import render_final_report
     from reporting.validate import validate_run_artifacts
     from run_authority import (
@@ -89,6 +91,9 @@ _INPUT_FILES = (
 )
 _DERIVED_RUN_FILES = {
     "finding_validation.json",
+    "miss-attribution.json",
+    "next-run-agenda.json",
+    "submission_status.json",
     "summary.json",
     "project_state_commit.json",
     "run_receipt.json",
@@ -487,13 +492,13 @@ def _frozen_commit_input(
     validation: dict[str, Any],
     closure_pass: bool,
     runtime_summary: dict[str, Any] | None,
+    include_findings: bool = True,
+    include_continuations: bool = False,
 ) -> dict[str, Any] | None:
     findings = [
         dict(row) for row in (validation.get("normalized_findings") or [])
         if isinstance(row, dict)
-    ]
-    if not closure_pass and not findings:
-        return None
+    ] if include_findings else []
     for finding in findings:
         rewritten = [
             ref for ref in (
@@ -506,13 +511,37 @@ def _frozen_commit_input(
         finding["proof_files"] = rewritten
         finding["evidence_refs"] = rewritten
 
-    if closure_pass:
+    continuations = [
+        dict(row) for row in (
+            (validation.get("next_run_agenda") or {}).get("items") or [])
+        if isinstance(row, dict)
+    ] if include_continuations else []
+    for continuation in continuations:
+        continuation["source_run"] = session_id
+        continuation["evidence_refs"] = [
+            ref for ref in (
+                _clean_relative_evidence_ref(
+                    value, source_run=source_run, session_id=session_id)
+                for value in (continuation.get("evidence_refs") or [])
+            ) if ref
+        ]
+
+    full_commit = bool(closure_pass and include_findings)
+    if full_commit:
         inventory = _load_list_file(
             snapshot_run / "inventory.json", "endpoints", "surfaces")
         negatives = _load_list_file(
             snapshot_run / "negative_findings.json", "negatives")
         dead_ends = _load_list_file(snapshot_run / "dead_ends.json", "dead_ends")
-        intents = _load_list_file(snapshot_run / "intents.json", "intents")
+        intents = [
+            item for item in _load_list_file(
+                snapshot_run / "intents.json", "intents")
+            if item.get("source") != "v9_host_continuation"
+        ]
+        by_id = {str(item.get("intent_id") or ""): item for item in intents}
+        for continuation in continuations:
+            if str(continuation.get("intent_id") or "") not in by_id:
+                intents.append(continuation)
         for row in [*negatives, *dead_ends]:
             refs = list(row.get("evidence_refs") or [])
             if row.get("evidence_ref"):
@@ -529,8 +558,21 @@ def _frozen_commit_input(
                 row["evidence_ref"] = rewritten[0]
         run_status = "complete"
     else:
-        inventory, negatives, dead_ends, intents = [], [], [], []
-        run_status = "incomplete_with_findings"
+        inventory, negatives, dead_ends, intents = [], [], [], continuations
+        run_status = (
+            "incomplete_with_findings" if findings else
+            "incomplete_with_continuations" if continuations else "incomplete"
+        )
+    if not findings and not intents and not full_commit:
+        return None
+    if full_commit:
+        submission_mode = "full"
+    elif findings and continuations:
+        submission_mode = "proof_roots_and_continuations"
+    elif findings:
+        submission_mode = "proof_roots"
+    else:
+        submission_mode = "continuations_only"
     return {
         "inventory": inventory,
         "findings": findings,
@@ -540,8 +582,9 @@ def _frozen_commit_input(
         "run_summary": {
             **dict(runtime_summary or {}),
             "status": str((runtime_summary or {}).get("status") or run_status),
-            "truth_submission_mode": "full" if closure_pass else "proof_roots",
+            "truth_submission_mode": submission_mode,
             "proof_confirmed_findings": len(findings),
+            "host_continuations": len(continuations),
             "validation_sha256": validation.get("validation_sha256", ""),
         },
     }
@@ -557,19 +600,20 @@ def _prepare_project_truth(
     project_id: str,
     validation: dict[str, Any],
     proof_pass: bool,
+    continuation_pass: bool,
     closure_pass: bool,
     runtime_summary: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     store = ProjectStateStore(project_dir)
     before = _project_state_or_empty(store)
     revision_before = int(before.get("revision", 0) or 0)
-    commit_input = (
-        _frozen_commit_input(
-            snapshot_run=snapshot_run, source_run=source_run,
-            session_id=session_id, validation=validation,
-            closure_pass=closure_pass, runtime_summary=runtime_summary)
-        if proof_pass else None
-    )
+    commit_input = _frozen_commit_input(
+        snapshot_run=snapshot_run, source_run=source_run,
+        session_id=session_id, validation=validation,
+        closure_pass=closure_pass, runtime_summary=runtime_summary,
+        include_findings=proof_pass,
+        include_continuations=continuation_pass,
+    ) if (proof_pass or continuation_pass) else None
     shadow = authority / "prepared" / session_id / "project"
     atomic_write_json(shadow / "project_state.json", before, root=authority)
     if commit_input is not None:
@@ -1008,6 +1052,14 @@ def finalize_run(
         # evidence for inspection but do not merge it into cross-run truth.
         project_truth_proof_pass = bool(
             proof_pass and finalization_contract["authority_trusted"])
+        miss_attribution = dict(validation.get("miss_attribution") or {})
+        continuation_pass = bool(
+            finalization_contract["authority_trusted"]
+            and int(manifest_value.get("outcome_contract_version", 0) or 0) >= 1
+            and miss_attribution.get("complete") is True
+            and not validation.get("ingestion_errors")
+            and validation.get("status") not in {"error", "precondition_missing"}
+        )
 
         if _stage_index(journal["stage"]) < _stage_index("PROJECT_PREPARED"):
             commit, commit_input = _prepare_project_truth(
@@ -1015,6 +1067,7 @@ def finalize_run(
                 snapshot_run=snapshot_run, source_run=run,
                 session_id=session_id, project_id=identity["project_id"],
                 validation=validation, proof_pass=project_truth_proof_pass,
+                continuation_pass=continuation_pass,
                 closure_pass=closure_pass,
                 runtime_summary=dict(journal.get("runtime_summary") or {}),
             )
@@ -1100,6 +1153,17 @@ def finalize_run(
                 "project_complete": False,
                 "proof_gate": validation.get("proof_gate", {}),
                 "closure_gate": validation.get("closure_gate", {}),
+                "miss_attribution": {
+                    key: value for key, value in (
+                        validation.get("miss_attribution") or {}).items()
+                    if key not in {"rows", "continuations"}
+                },
+                "next_run_agenda": {
+                    "status": (validation.get("next_run_agenda") or {}).get(
+                        "status", "no_work"),
+                    "count": int((validation.get("next_run_agenda") or {}).get(
+                        "count", 0) or 0),
+                },
                 "findings": findings,
                 "finding_validation_path": str(validation_path),
                 "finding_validation_projection_path": str(
@@ -1144,6 +1208,12 @@ def finalize_run(
                 "canonical_report_sha256": canonical_report_sha256,
             }
             atomic_write_json(run / "finding_validation.json", validation, root=run)
+            atomic_write_json(
+                run / "miss-attribution.json",
+                validation.get("miss_attribution") or {}, root=run)
+            atomic_write_json(
+                run / "next-run-agenda.json",
+                validation.get("next_run_agenda") or {}, root=run)
             atomic_write_json(commit_projection, commit, root=run)
             atomic_write_json(run / "summary.json", summary, root=run)
             advance("PROJECTIONS_WRITTEN", summary=summary)
@@ -1162,6 +1232,12 @@ def finalize_run(
         # after the journal advanced cannot turn a swapped projection into a
         # newly anchored receipt.
         atomic_write_json(run / "finding_validation.json", validation, root=run)
+        atomic_write_json(
+            run / "miss-attribution.json",
+            validation.get("miss_attribution") or {}, root=run)
+        atomic_write_json(
+            run / "next-run-agenda.json",
+            validation.get("next_run_agenda") or {}, root=run)
         atomic_write_json(commit_projection, commit, root=run)
         atomic_write_json(run / "summary.json", summary, root=run)
         canonical_report_complete = _restore_canonical_report(
@@ -1172,6 +1248,8 @@ def finalize_run(
         if _stage_index(journal["stage"]) < _stage_index("RECEIPT_ANCHORED"):
             artifacts = {
                 "finding_validation": validation_path,
+                "miss_attribution": snapshot_run / "miss-attribution.json",
+                "next_run_agenda": snapshot_run / "next-run-agenda.json",
                 "summary": run / "summary.json",
                 "project_state_commit": commit_projection,
             }
@@ -1246,6 +1324,10 @@ def finalize_run(
                 "validation_status": validation.get("status"),
                 "proof_pass": proof_pass,
                 "closure_pass": closure_pass,
+                "attribution_complete": bool(
+                    (validation.get("miss_attribution") or {}).get("complete")),
+                "next_run_continuations": int(
+                    (validation.get("next_run_agenda") or {}).get("count", 0) or 0),
                 "receipt_verification": verification,
                 "receipt_anchor_path": str(anchor_path),
                 "canonical_report_verified": canonical_report_verified,
@@ -1259,6 +1341,41 @@ def finalize_run(
                     != frozen_assurance):
                 raise FinalizationError("frozen delivery binding mismatch")
             atomic_write_json(run / "delivery_status.json", delivery, root=run)
+
+        local_report = run / "final_report.md"
+        report_sensitive_kinds = (
+            sensitive_kinds(_read_regular_bytes(
+                local_report, trusted_root=run).decode("utf-8", errors="ignore"))
+            if local_report.is_file() else []
+        )
+        submission_eligible = bool(
+            delivery.get("delivery_complete")
+            and delivery.get("canonical_report_verified")
+            and delivery.get("attribution_complete")
+            and not report_sensitive_kinds)
+        submission = {
+            "schema_version": 1,
+            "submission_contract_version": int(
+                manifest_value.get("submission_contract_version", 0) or 0),
+            "status": "eligible" if submission_eligible else "not_eligible",
+            "eligible": submission_eligible,
+            "session_id": session_id,
+            "canonical_report_sha256": str(
+                summary.get("canonical_report_sha256") or ""),
+            "receipt_sha256": str(receipt.get("receipt_sha256") or ""),
+            "sensitive_kinds": report_sensitive_kinds,
+            "reasons": [
+                reason for condition, reason in (
+                    (not delivery.get("delivery_complete"), "delivery_incomplete"),
+                    (not delivery.get("canonical_report_verified"),
+                     "canonical_report_unverified"),
+                    (not delivery.get("attribution_complete"),
+                     "miss_attribution_incomplete"),
+                    (bool(report_sensitive_kinds), "canonical_report_contains_sensitive_data"),
+                ) if condition
+            ],
+        }
+        atomic_write_json(run / "submission_status.json", submission, root=run)
 
         return delivery
 

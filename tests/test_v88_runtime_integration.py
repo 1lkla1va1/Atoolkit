@@ -146,7 +146,8 @@ def test_conclude_commits_only_proof_confirmed_root_to_project_registry(tmp_path
     assert len(state["finding_registry"]) == 1
     assert any(cell["status"] == "confirmed" for cell in state["cell_registry"].values())
     assert (workdir / "finding_validation.json").is_file()
-    assert (workdir / "final_report.md").is_file()
+    assert not (workdir / "final_report.md").exists()
+    assert (workdir / "draft_report.md").is_file()
 
 
 def test_fully_closed_project_with_no_intent_skips_adapter(tmp_path):

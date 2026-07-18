@@ -28,7 +28,7 @@
 
 ---
 
-## 0.0 运行身份与跨 Run 真值（v8.13）
+## 0.0 运行身份与跨 Run 真值（v9.0）
 
 - **首个网络动作之前**，authority-eligible Run 必须已有 host-owned `run_manifest.json` 与 frozen `run_plan.json`。Engine Mode 由父进程创建；Wrapped Skill 由外部 `engine.skill_wrapper` 创建。Direct/Qoder 模式无法建立独立 authority：fresh black-box recon 前先运行 `engine.skill_runtime preflight`，Phase 0 后、攻击测试前再运行 `engine.skill_runtime init` 生成 `authority_trusted=false` 的 diagnostic ledger/queue；它不得改写 ProjectState 或声称 verified delivery。
 - `<project>/project_state.json`（schema 2）是跨 Run 唯一权威。`blackboard.json`、`business_graph.json`、`run_scope.json` 和摘要均为派生视图，禁止反向覆盖项目真值。
@@ -61,6 +61,16 @@
 - `empty_dataset/object_absent/session_expired/format_unresolved/missing_role/challenge_unsolved/WAF` 先进入可恢复 blocker 或浅阴性恢复队列，不得积累请求数量后写成 `not_vulnerable`。Finding 被 proof validator 拒绝时优先返工 proof，不得只在最终散文里保留。
 - Event 只证明实验已发生并驱动下一步，不能替代 canonical Finding 或 negative envelope。accepted Finding 才能关闭阳性；阴性同时通过 depth gate 与 execution obligations 才能关闭。
 - 运行中新 endpoint/param 绑定证据后只进入 `execution-backlog.json`，disposition 固定 `next_run_required`；当前 Run 不得用动态发现改写 v8.12 frozen denominator。
+
+## 0.4 结果归因、跨 Run 续航与提交资格（v9.0）
+
+- 每个本轮 frozen/open 对象（coverage cell、未分配 inventory、unresolved method、动态 discovery、proof-rejected Finding）终态时必须在 `miss-attribution.json` 中恰好有一个 `cause_code`。未知状态固定 fail closed，不得计入覆盖率或无风险结论。
+- 未闭项只由 Host reducer 生成稳定 `v9_host_continuation`，输出到 `next-run-agenda.json`。authority-trusted finalizer 可在本轮不完整时只提交这些 continuation 到 ProjectState；不得同时提交未通过 closure 的阴性、dead-end 或模型散文。
+- 下一 Run scheduler 必须按 critical/high/medium/low 顺序消费全部 Host continuation。只有 Host continuation 可以把有证据的新 discovery 加入陈旧 inventory 之外的待测队列；普通模型 Intent 仍只接收 critical/high 且受 inventory 约束。
+- 后续 canonical negative 与既有 confirmed cell 冲突时，禁止静默覆盖任一方：保留 confirmed cell，将 Finding/Fact 标为 `revalidation_required`，保存冲突证据并生成 critical 精确复验 continuation。
+- Agent 不得创建或修改 `final_report.md`、`summary.json`、`delivery_status.json` 或 `submission_status.json`。只有 shared finalizer 可以从 accepted proof roots 重建脱敏报告并写入 authority receipt。
+- 对外提交前必须运行 `python3 run.py submission <run-dir>`；只有 delivery、归因、receipt、报告 hash 与敏感信息检查全部通过才可提交。`python3 run.py audit <legacy-run>` 只读审计旧产物，绝不提升旧 Markdown 为 Finding 真值。
+- 报错/500/类型混淆仅是 response differential，除非证明数据读取、状态变化、代码执行、授权绕过或可信凭据使用；自有 token/cookie/API key 的响应回显除非证明跨边界使用或特权凭据暴露，否则不得进入 SRC 报告。
 
 ## 0. Phase 0 侦察协议
 

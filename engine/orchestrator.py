@@ -2851,10 +2851,11 @@ def _project_truth_commit_plan(
 ) -> dict[str, object]:
     """Select the only project-truth payload class a run may submit.
 
-    Proof and closure are independent gates.  A proof-invalid run submits
-    nothing.  A proof-valid but closure-incomplete run may submit only its
-    validator-normalized proof roots.  Model inventory, negatives, dead ends
-    and intents become eligible only after both gates pass.
+    Proof and closure are independent gates.  A proof-valid but
+    closure-incomplete run may submit its validator-normalized proof roots.
+    v9 Host continuations may also cross the Run boundary independently; model
+    inventory, negatives, dead ends and free-form intents become eligible only
+    after both gates pass.
     """
     status = str(validation.get("status") or "").strip().lower()
     exit_code = int(validation.get("exit_code", 3) or 0)
@@ -2873,6 +2874,13 @@ def _project_truth_commit_plan(
         ))
     )
     roots = list(validation.get("normalized_findings") or []) if proof_pass else []
+    continuations = list(
+        (validation.get("next_run_agenda") or {}).get("items") or [])
+    # Authority/ingestion corruption cannot authorize even a continuation.
+    # Proof-contract rejection with a valid manifest can; it becomes a bounded
+    # proof-repair agenda item instead of a Finding.
+    if validation.get("ingestion_errors") or status in {"error", "precondition_missing"}:
+        continuations = []
     closure_gate = validation.get("closure_gate") or validation.get("empty_gate") or {}
     closure_result = str(closure_gate.get("result") or "").strip().lower()
     validator_closure_pass = (
@@ -2881,16 +2889,33 @@ def _project_truth_commit_plan(
             and exit_code == 0)
     )
     if not proof_pass:
-        return {"mode": "none", "reason": "proof_gate_failed", "findings": []}
+        result = {
+            "mode": "continuations_only" if continuations else "none",
+            "reason": "proof_gate_failed", "findings": [],
+        }
+        if continuations:
+            result["continuations"] = continuations
+        return result
     if runtime_closure_pass and validator_closure_pass:
         return {"mode": "full", "reason": "proof_and_closure_passed", "findings": roots}
     if roots:
-        return {
-            "mode": "proof_roots",
+        result = {
+            "mode": (
+                "proof_roots_and_continuations"
+                if continuations else "proof_roots"),
             "reason": "closure_incomplete_with_proof_roots",
             "findings": roots,
         }
-    return {"mode": "none", "reason": "closure_incomplete_without_findings", "findings": []}
+        if continuations:
+            result["continuations"] = continuations
+        return result
+    result = {
+        "mode": "continuations_only" if continuations else "none",
+        "reason": "closure_incomplete_without_findings", "findings": [],
+    }
+    if continuations:
+        result["continuations"] = continuations
+    return result
 
 
 # ── 主循环（§3 + 支柱 1：不首洞即停，覆盖闭合/预算/危险闸三选一终止）──────
@@ -4395,12 +4420,15 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
     final_report_status = "not_generated"
     if (structured_guardian_accepted
             and not (pathlib.Path(wd) / "run_manifest.json").is_file()):
-        final_report_status = "complete" if gate_result == "pass" else "draft_incomplete"
+        # Manifest-less Direct/legacy calls may keep a diagnostic rendering,
+        # but never under the Canonical final_report.md name and never with a
+        # complete status.  The submission checker will reject it.
+        final_report_status = "legacy_diagnostic_draft"
         final_report_path = str(render_final_report(
             structured_guardian_accepted,
-            pathlib.Path(wd) / "final_report.md",
+            pathlib.Path(wd) / "legacy_draft_report.md",
             target_name=(state.target.splitlines()[0] if getattr(state, "target", "") else "目标"),
-            status=final_report_status,
+            status="draft_incomplete",
             session_gate=session_gate,
             open_risk_cells=open_risk_cells,
             coverage_stats=(derive_coverage(coverage_ledger).get("stats") or {}),
@@ -4604,37 +4632,14 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
                 if out.get("status") in {"complete", "vuln_found", "low_roi", "no_work"}:
                     out["status"] = "incomplete"
             else:
-                if truth_plan["mode"] == "proof_roots":
+                if str(truth_plan["mode"]).startswith("proof_roots"):
                     out["status"] = "incomplete_with_findings"
-                confirmed_paths = {
-                    str(pathlib.Path(item.get("path") or "").resolve())
-                    for item in (validation.get("proof_confirmed") or [])
-                }
-                report_items = [
-                    item for item in structured_guardian_accepted
-                    if str(pathlib.Path(item.get("path") or "").resolve()) in confirmed_paths
-                ]
-                if report_items:
-                    report_complete = (
-                        truth_plan["mode"] == "full"
-                        and out.get("status") in {"complete", "vuln_found"}
-                    )
-                    final_report_status = (
-                        "complete" if report_complete else "draft_incomplete")
-                    final_report_path = str(render_final_report(
-                        report_items,
-                        pathlib.Path(wd) / "final_report.md",
-                        target_name=(
-                            state.target.splitlines()[0]
-                            if getattr(state, "target", "") else "目标"),
-                        status=final_report_status,
-                        session_gate=session_gate,
-                        open_risk_cells=open_risk_cells,
-                        coverage_stats=(derive_coverage(coverage_ledger).get("stats") or {}),
-                        coverage_gaps=coverage_gaps,
-                    ))
-                    out["final_report_path"] = final_report_path
-                    out["final_report_status"] = final_report_status
+                # The shared finalizer is the only Canonical report writer.
+                # Do not create a same-name pre-finalizer projection here.
+                final_report_path = ""
+                final_report_status = "pending_finalizer"
+                out["final_report_path"] = ""
+                out["final_report_status"] = final_report_status
 
             # Materialize the only JSON submissions the shared finalizer may
             # consume.  It owns the sole ProjectState commit, immutable
@@ -4690,6 +4695,16 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
                     },
                 )
                 out["delivery_status"] = delivery
+                frozen_summary = json.loads(
+                    (pathlib.Path(wd) / "summary.json").read_text(
+                        encoding="utf-8"))
+                final_report_status = str(
+                    frozen_summary.get("canonical_report_status")
+                    or "not_generated")
+                final_report_path = str(
+                    frozen_summary.get("canonical_report_projection_path") or "")
+                out["final_report_status"] = final_report_status
+                out["final_report_path"] = final_report_path
                 out["project_state_path"] = str(project_dir / "project_state.json")
                 commit_projection = pathlib.Path(wd) / "project_state_commit.json"
                 commit = json.loads(commit_projection.read_text(encoding="utf-8"))

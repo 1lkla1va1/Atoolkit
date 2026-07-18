@@ -210,6 +210,10 @@ _MANIFEST_V4_IDENTITY_FIELDS = _MANIFEST_V3_IDENTITY_FIELDS + (
     "run_phase",
     "phase_parent",
 )
+_MANIFEST_V5_IDENTITY_FIELDS = _MANIFEST_V4_IDENTITY_FIELDS + (
+    "outcome_contract_version",
+    "submission_contract_version",
+)
 
 
 def _assert_manifest_request_identity(
@@ -227,6 +231,8 @@ def _assert_manifest_request_identity(
     except (TypeError, ValueError):
         schema_version = 0
     fields = (
+        _MANIFEST_V5_IDENTITY_FIELDS
+        if schema_version >= 5 else
         _MANIFEST_V4_IDENTITY_FIELDS
         if schema_version >= 4 else
         _MANIFEST_V3_IDENTITY_FIELDS
@@ -363,6 +369,17 @@ def validate_manifest_binding(
             "code": "invalid_manifest_schema_version",
             "reason": "manifest schema_version must be an integer",
         })
+    if schema_version >= 5:
+        if int(manifest.get("outcome_contract_version", 0) or 0) != 1:
+            errors.append({
+                "code": "outcome_contract_version_invalid",
+                "reason": "schema-5 manifest requires outcome contract version 1",
+            })
+        if int(manifest.get("submission_contract_version", 0) or 0) != 1:
+            errors.append({
+                "code": "submission_contract_version_invalid",
+                "reason": "schema-5 manifest requires submission contract version 1",
+            })
     authority_id = str(manifest.get("authority_id") or "").strip()
     identity_path: pathlib.Path | None = None
     if schema_version >= 2:
@@ -853,6 +870,8 @@ def create_run_manifest(
         "canonical_report_required": bool(canonical_report_required),
         "run_phase": normalized_phase,
         "phase_parent": normalized_parent,
+        "outcome_contract_version": 1,
+        "submission_contract_version": 1,
         "authz_sha256": sha256_text(authz),
     }
     manifest_path = run_base / "run_manifest.json"
@@ -897,7 +916,7 @@ def create_run_manifest(
     else:
         raise ValueError("authority manifest must be outside the model-writable run directory")
     manifest: dict[str, Any] = {
-        "schema_version": 4,
+        "schema_version": 5,
         "atoolkit_version": __version__,
         "source_revision": revision,
         "source_dirty": bool(git_status),
@@ -951,6 +970,8 @@ MANDATORY_DELIVERY_ARTIFACTS = frozenset({
 
 def mandatory_delivery_artifacts(manifest: dict[str, Any] | None = None) -> frozenset[str]:
     required = set(MANDATORY_DELIVERY_ARTIFACTS)
+    if int((manifest or {}).get("outcome_contract_version", 0) or 0) >= 1:
+        required.update({"miss_attribution", "next_run_agenda"})
     if bool((manifest or {}).get("canonical_report_required")):
         required.add("final_report")
     return frozenset(required)
@@ -1090,6 +1111,19 @@ def write_run_receipt(
 
     output = _absolute_lexical(output_path)
     prepared_artifacts = dict(artifacts)
+    # v9 validator projections are deterministic children of
+    # finding_validation.json.  Compatibility callers that already invoked
+    # the validator need not duplicate these two paths in their artifact map;
+    # the receipt writer discovers only the canonical filenames in the same
+    # frozen run directory.  Missing files remain missing and fail delivery.
+    if int(manifest.get("outcome_contract_version", 0) or 0) >= 1:
+        for artifact_name, filename in (
+            ("miss_attribution", "miss-attribution.json"),
+            ("next_run_agenda", "next-run-agenda.json"),
+        ):
+            candidate = run_base / filename
+            if artifact_name not in prepared_artifacts and candidate.is_file():
+                prepared_artifacts[artifact_name] = candidate
     live_project_state = prepared_artifacts.pop("project_state", None)
     generated_commit: tuple[pathlib.Path, dict[str, Any], bytes] | None = None
     if "project_state_commit" not in prepared_artifacts and (

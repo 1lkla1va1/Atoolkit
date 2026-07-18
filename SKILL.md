@@ -1,7 +1,7 @@
 ---
 name: Atoolkit
 description: Authorized AI-assisted SRC/bug-bounty vulnerability research toolkit. Use whenever the user wants to read, install, configure, or run this Atoolkit package; mentions SRC 漏洞挖掘, 授权靶场, bug bounty, Codex AGENTS.md, /src, Guardian 质检, PoC 复验, or model-independent security testing automation. Only proceed for clearly authorized defensive testing or educational lab contexts.
-version: 8.13.0
+version: 9.0.0
 ---
 
 # Atoolkit Skill
@@ -56,7 +56,7 @@ Direct/QoderWork should use `engine.skill_runtime` for deterministic session
 state even though it remains untrusted. This closes execution feedback and
 multi-agent synchronization; it does not weaken the authority boundary.
 
-v8.13 threat mode starts from a validated business feature graph and explicit
+v9 threat mode starts from a validated business feature graph and explicit
 security invariants. Risk tags route knowledge; they do not create the coverage
 denominator. Direct runs without both threat artifacts remain compatible but
 are marked `legacy_risk/planning_degraded=true` and can never be report-ready.
@@ -64,6 +64,11 @@ Each frozen threat compiles into an Experiment Contract. Engine consumes
 evidence-bound `EXECUTION_EVENT` lines; Direct observations carry
 `completed_obligations`. Host projections dynamically queue missing depth,
 barrier recovery, and proof repair without changing the frozen denominator.
+Every frozen/open object is additionally reduced into exactly one
+`miss-attribution.json` cause. Its deterministic continuations become
+`next-run-agenda.json` and, only through a trusted finalizer, pending
+ProjectState Intents that the next scheduler must consume. Unknown states fail
+attribution closed; they are never counted as coverage.
 Engine materializes raw multi-identity headers only after Planning in the
 restricted Attack `identities.json`; models must keep labels isolated and must
 never copy that file into a report.
@@ -195,7 +200,9 @@ For targets requiring multiple runs (large SRC programs, 50+ endpoints):
 1. Load or migrate `runs/targets/{target}/project_state.json` (schema 2).
 2. Merge project inventory into this session before recon; recon is incremental, not a reset.
 3. Restore only exact role-aware coverage cells. Unknown role is not a wildcard, and legacy facts without evidence remain pending revalidation.
-4. Add pending Intents to the work queue, followed by open/high-value cells. A fully closed matrix with no pending Intent is a valid no-work run and must not call a model.
+4. Add every pending Host continuation in priority order, then high-priority
+   inventory-bound model Intents and open/high-value cells. A fully closed
+   matrix with no pending Intent is a valid no-work run and must not call a model.
 
 ### After testing (run shutdown)
 
@@ -207,6 +214,9 @@ For targets requiring multiple runs (large SRC programs, 50+ endpoints):
 3. Regenerate `blackboard.json`, `business_graph.json`, `run_scope.json`, and summaries as compatibility views; never merge them back as equal authorities.
 4. Bind `run_receipt.json` to an immutable project commit snapshot and the
    host authority anchor. Never bind the mutable live `project_state.json`.
+5. Treat `miss-attribution.json` and `next-run-agenda.json` as mandatory v9
+   delivery artifacts. An incomplete trusted Run may commit only Host-created
+   continuations; it may not commit model-authored closure or negatives.
 
 ### Directory structure
 
@@ -278,9 +288,25 @@ End-to-end workflow for real-world SRC / bug-bounty targets.
 ### Phase E: Patch + report (agent)
 
 - Run additional tests based on human review feedback.
-- Generate `final_report.md`, `coverage_gaps.md`, `summary.json`.
+- Write only canonical Finding/negative/dead-end evidence packages and close
+  the machine ledger. The agent must not generate or edit `final_report.md` or
+  `summary.json`.
+- Let the external finalizer regenerate and receipt-bind the Canonical report,
+  then require `python3 run.py submission <session>` to return eligible before
+  treating it as an SRC submission.
 
 ## Common workflows
+
+### Audit old runs and verify a submission
+
+Both commands are offline/read-only. `audit` explains contract gaps without
+promoting legacy Markdown; `submission` accepts only the finalizer-rendered,
+redacted report whose hash is bound to the authority receipt.
+
+```bash
+python3 run.py audit /path/to/session
+python3 run.py submission /path/to/session
+```
 
 ### 1. Use as an independent Codex project
 

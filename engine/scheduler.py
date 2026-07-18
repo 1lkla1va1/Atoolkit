@@ -126,10 +126,14 @@ def _shallow_negatives(bb: dict) -> list[str]:
     return result
 
 def _carryover_intents(bb: dict) -> list[dict]:
-    """High-priority pending intents to carry into the next run."""
+    """Host continuations plus high-priority model intents for the next run."""
     carried: list[dict] = []
     for intent in bb.get("intents", []):
-        if intent.get("status") != "pending" or intent.get("priority") != "high":
+        host_continuation = intent.get("source") == "v9_host_continuation"
+        if intent.get("status") != "pending":
+            continue
+        if (not host_continuation
+                and intent.get("priority") not in {"critical", "high"}):
             continue
         target = canonical_surface_key({
             "endpoint": intent.get("target_endpoint", ""),
@@ -143,7 +147,16 @@ def _carryover_intents(bb: dict) -> list[dict]:
             "target_params": list(intent.get("target_params") or []),
             "target_roles": list(intent.get("target_roles") or []),
             "vuln_class": intent.get("vuln_class", ""),
+            # Only deterministic Host continuations may introduce a surface
+            # not present in a stale inventory snapshot.  Arbitrary model
+            # intents remain inventory-bound.
+            "host_continuation": host_continuation,
         })
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    carried.sort(key=lambda item: (
+        order.get(str(item.get("priority") or "low"), 9),
+        str(item.get("intent_id") or ""),
+    ))
     return carried
 
 
@@ -210,6 +223,18 @@ def compute_run_scope(
     # these as statistics; v8.8 makes their actual target the first scheduled
     # surface so cross-run work is executable rather than decorative.
     carryover = _carryover_intents(bb)
+    for item in carryover:
+        target = item.get("target_surface", "")
+        if not target or not item.get("host_continuation"):
+            continue
+        if target not in inv_set:
+            inv_eps.append(target)
+            inv_set.add(target)
+        params = inv_params.setdefault(target, [])
+        for param in item.get("target_params") or []:
+            text = str(param or "").strip()
+            if text and text not in params:
+                params.append(text)
     intent_surfaces = [
         item["target_surface"] for item in carryover
         if item.get("target_surface") in inv_set

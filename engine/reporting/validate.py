@@ -20,6 +20,7 @@ try:
     )
     from ..host_policy import is_authorized_url, normalize_authorized_scopes
     from ..ledger import CoverageLedger
+    from ..outcome import build_miss_attribution, build_next_run_agenda
     from ..run_authority import canonical_method_resolution_key
     from ..runtime_manifest import validate_manifest_binding
     from ..safe_io import atomic_write_json, safe_read_bytes, safe_read_text
@@ -33,6 +34,7 @@ except ImportError:  # pragma: no cover - direct package fallback
                                    rejected_finding_surface_ids)
     from host_policy import is_authorized_url, normalize_authorized_scopes
     from ledger import CoverageLedger
+    from outcome import build_miss_attribution, build_next_run_agenda
     from run_authority import canonical_method_resolution_key
     from runtime_manifest import validate_manifest_binding
     from safe_io import atomic_write_json, safe_read_bytes, safe_read_text
@@ -75,6 +77,24 @@ RCE_IMPACT = re.compile(
 ATO_IMPACT = re.compile(r"(?:账户接管|管理员接管|\bATO\b)", re.I)
 SESSION_THEFT_IMPACT = re.compile(r"窃取.{0,8}(?:Cookie|Session)", re.I)
 BULK_DATA_IMPACT = re.compile(r"(?:大量数据|全量数据)", re.I)
+SUBMISSION_NOISE_ROOT = re.compile(
+    r"(?:\bCORS\b|source\s*map|sourcemap|\.map\b|x-frame-options|\bCSP\b|"
+    r"\bHSTS\b|安全响应?头|版本号|中间件指纹|self[- ]?xss|"
+    r"\bSSL\b|\bTLS\b|目录列举|报错堆栈|stack\s*trace)", re.I)
+RATE_LIMIT_ROOT = re.compile(
+    r"(?:rate[- ]?limit|限频|速率限制|频率限制)", re.I)
+OPEN_REDIRECT_ROOT = re.compile(
+    r"(?:open[- ]?redirect|开放重定向|任意跳转)", re.I)
+ERROR_ONLY_ROOT = re.compile(
+    r"(?:type\s*confusion|类型混淆|unhandled\s+exception|未处理异常|"
+    r"\b500\b|internal\s+server\s+error|报错)", re.I)
+CREDENTIAL_LEAK_ROOT = re.compile(
+    r"(?:(?:token|cookie|api[-_ ]?key|credential|session|凭据|令牌|密钥|会话)"
+    r".{0,20}(?:leak|expos|disclos|泄露|暴露)|"
+    r"(?:leak|expos|disclos|泄露|暴露).{0,20}"
+    r"(?:token|cookie|api[-_ ]?key|credential|session|凭据|令牌|密钥|会话))",
+    re.I,
+)
 
 
 @dataclass
@@ -90,7 +110,54 @@ class ValidationResult:
         out = {"id": self.id, "path": self.path}
         if self.reasons:
             out["reasons"] = self.reasons
+        if isinstance(self.finding, dict):
+            out.update(_finding_target_projection(self.finding))
         return out
+
+
+def _finding_target_projection(finding: dict[str, Any]) -> dict[str, Any]:
+    """Return non-secret scheduling identity for a rejected proof package."""
+    apis = [
+        item for item in (finding.get("apis") or [])
+        if isinstance(item, dict)
+    ]
+    primary = apis[0] if apis else {}
+    params: list[str] = []
+    for value in primary.get("risk_params") or []:
+        text = str(value or "").strip()
+        if text and text not in params:
+            params.append(text)
+    for value in primary.get("params") or []:
+        text = str(value.get("name") if isinstance(value, dict) else value).strip()
+        if text and text not in params:
+            params.append(text)
+    roles: list[str] = []
+    for key in (
+        "actor_roles", "affected_roles", "role_scopes", "roles",
+        "actor_role", "affected_role", "role_scope", "role",
+    ):
+        value = finding.get(key)
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            text = str(item or "").strip().lower()
+            if text and text not in roles:
+                roles.append(text)
+    feature = (
+        finding.get("feature_point")
+        if isinstance(finding.get("feature_point"), dict) else {})
+    claim = (
+        finding.get("claim")
+        if isinstance(finding.get("claim"), dict) else {})
+    return {
+        "method": str(primary.get("method") or "").strip().upper(),
+        "endpoint": str(primary.get("path") or "").strip(),
+        "params": params,
+        "roles": roles,
+        "vuln_class": str(finding.get("vuln_type") or "").strip(),
+        "feature_id": str(feature.get("feature_id") or "").strip(),
+        "threat_id": str(
+            claim.get("threat_id") or finding.get("threat_id") or "").strip(),
+    }
 
 
 @dataclass(frozen=True)
@@ -595,6 +662,97 @@ def _validate_claims(
         reasons.append("risk.proven_impact must exactly match a proven impact_claim")
     if ABSOLUTE_IMPACT_CLAIM.search(proven_impact):
         reasons.append("absolute impact wording is not a finite observed result")
+
+
+def _validate_submission_policy(
+    finding: dict[str, Any], packets: list[dict[str, Any]],
+    finding_dir: pathlib.Path, run_base: pathlib.Path, reasons: list[str],
+) -> None:
+    """Reject phenomenon-only roots before they can become SRC truth.
+
+    Structured proof may show that a response changed while still failing to
+    show a security boundary break.  These rules encode the repository's
+    report policy independently of model wording and Markdown rendering.
+    """
+    risk = finding.get("risk") if isinstance(finding.get("risk"), dict) else {}
+    verification = (
+        finding.get("verification")
+        if isinstance(finding.get("verification"), dict) else {})
+    chain = (
+        finding.get("chain_assessment")
+        if isinstance(finding.get("chain_assessment"), dict) else {})
+    text = "\n".join(str(value or "") for value in (
+        finding.get("title"), finding.get("vuln_type"),
+        risk.get("summary"), risk.get("proven_impact"),
+    ))
+    if SUBMISSION_NOISE_ROOT.search(text):
+        reasons.append("submission_policy: phenomenon-only noise root is not SRC eligible")
+    if RATE_LIMIT_ROOT.search(text) and str(chain.get("status") or "") != "proven":
+        reasons.append(
+            "submission_policy: rate-limit weakness requires a proven downstream security result")
+    if OPEN_REDIRECT_ROOT.search(text) and str(chain.get("status") or "") != "proven":
+        reasons.append(
+            "submission_policy: open redirect requires a proven downstream security result")
+    if ERROR_ONLY_ROOT.search(text):
+        boundary = verification.get("security_boundary")
+        if not isinstance(boundary, dict):
+            reasons.append(
+                "submission_policy: error-only response requires a proven security_boundary result")
+        else:
+            kind = str(boundary.get("kind") or "").strip().lower()
+            refs = boundary.get("proof_refs") or []
+            marker = str(boundary.get("marker") or "").strip()
+            if (kind not in {"data_read", "state_change", "code_execution",
+                             "authorization_bypass", "trusted_secret_use"}
+                    or not isinstance(refs, list) or not refs or len(marker) < 4):
+                reasons.append(
+                    "submission_policy: security_boundary requires kind, proof_refs and marker")
+            else:
+                resolved = [
+                    _exists(finding_dir, ref, run_base, reasons,
+                            f"verification.security_boundary.proof_refs[{index}]")
+                    for index, ref in enumerate(refs)
+                ]
+                if not any(path and marker in _read_text(path) for path in resolved):
+                    reasons.append(
+                        "submission_policy: security_boundary marker not found in proof_refs")
+    if CREDENTIAL_LEAK_ROOT.search(text):
+        boundary = verification.get("credential_boundary")
+        if not isinstance(boundary, dict):
+            reasons.append(
+                "submission_policy: credential exposure requires cross-boundary use proof")
+        else:
+            status = str(boundary.get("status") or "").strip().lower()
+            refs = boundary.get("proof_packet_ids") or []
+            marker = str(boundary.get("outcome_marker") or "").strip()
+            if (status not in {"cross_boundary_use_proven",
+                               "privileged_credential_exposed"}
+                    or not isinstance(refs, list) or not refs or len(marker) < 4):
+                reasons.append(
+                    "submission_policy: credential_boundary proof is incomplete")
+            else:
+                packet_map = _packet_name_map(
+                    packets, finding_dir, run_base)
+                if any(str(ref) not in packet_map for ref in refs):
+                    reasons.append(
+                        "submission_policy: credential_boundary references unknown proof packets")
+                elif not any(
+                        marker in _read_text(packet_map[str(ref)]["response"])
+                        for ref in refs):
+                    reasons.append(
+                        "submission_policy: credential outcome_marker not found in proof responses")
+                if status == "cross_boundary_use_proven":
+                    source_identity = str(
+                        boundary.get("source_identity") or "").strip()
+                    consumer_identity = str(
+                        boundary.get("consumer_identity") or "").strip()
+                    if (not source_identity or not consumer_identity
+                            or source_identity == consumer_identity):
+                        reasons.append(
+                            "submission_policy: cross-boundary credential use requires distinct identities")
+                elif not str(boundary.get("privilege_scope") or "").strip():
+                    reasons.append(
+                        "submission_policy: privileged credential exposure requires privilege_scope")
 
 
 def _validate_chain(
@@ -1361,6 +1519,8 @@ def validate_finding(
     _validate_verification(finding, packets, finding_dir, run_base, reasons)
     _validate_chain(finding, finding_dir, run_base, reasons)
     _validate_claims(finding, packets, finding_dir, run_base, reasons)
+    _validate_submission_policy(
+        finding, packets, finding_dir, run_base, reasons)
 
     poc = finding.get("poc") if isinstance(finding.get("poc"), dict) else {}
     steps = finding.get("manual_burp_replay")
@@ -1411,7 +1571,7 @@ def validate_finding(
         id=fid,
         path=str(finding_file),
         reasons=reasons,
-        finding=finding if not reasons else None,
+        finding=finding,
         normalized=normalized,
     )
 
@@ -3067,6 +3227,7 @@ def _run_closure_gate(
     plan_reasons, plan_stats = _authority_plan_gate(context, surfaces)
     reasons.extend(plan_reasons)
     execution_stats: dict[str, Any] = {}
+    execution_projection: dict[str, Any] = {}
     execution_metadata = (
         ledger_value.get("metadata") if isinstance(ledger_value, dict) else {}) or {}
     if int(execution_metadata.get("execution_contract_version", 0) or 0):
@@ -3173,6 +3334,15 @@ def _run_closure_gate(
                     or int(stats.get("in_scope_closed", 0) or 0)
                     != int(stats.get("in_scope_total", 0) or 0)):
                 reasons.append("coverage_in_scope_incomplete")
+    miss_attribution = build_miss_attribution(
+        surfaces=[item for item in surfaces if isinstance(item, dict)],
+        inventory_rows=(endpoints if isinstance(endpoints, list) else []),
+        unresolved_rows=(unresolved if isinstance(unresolved, list) else []),
+        execution_projection=execution_projection,
+        rejected_findings=(rejected_findings or []),
+    )
+    if not miss_attribution.get("complete"):
+        reasons.append("miss_attribution_incomplete")
     return {
         "result": "pass" if not reasons and session_gate.get("result") == "pass" else "fail",
         "reasons": reasons,
@@ -3180,6 +3350,7 @@ def _run_closure_gate(
         "authority_plan": plan_stats,
         "threat_coverage": threat_stats,
         "execution": execution_stats,
+        "miss_attribution": miss_attribution,
         "artifact_hashes": closure_artifact_hashes,
     }
 
@@ -3279,6 +3450,7 @@ def validate_run_artifacts(
     expected_project_id: str = "",
     expected_project_name: str = "",
     source_run_dir: str | pathlib.Path | None = None,
+    write_output: bool = True,
 ) -> dict[str, Any]:
     """Single library entry point used by both CLI and orchestrator."""
     from .collect import collect_structured_findings
@@ -3363,8 +3535,35 @@ def validate_run_artifacts(
 
     # Canonical ingestion is all-or-nothing.  A mixed batch containing one
     # malformed/rejected finding must not expose the remaining rows as project
-    # truth merely because they validated individually.
+    # truth merely because they validated individually.  v9 also attributes
+    # every otherwise-valid package suppressed by this batch gate; silently
+    # clearing ``confirmed`` would lose both its result and repair target.
     if rejected or ingestion_errors:
+        rejected_paths = {
+            str(pathlib.Path(str(item.get("path") or "")).resolve())
+            for item in rejected if item.get("path")
+        }
+        accepted_by_path = {
+            str(pathlib.Path(str(item.get("path") or "")).resolve()): item
+            for item in (collected.get("accepted") or []) if item.get("path")
+        }
+        for candidate in confirmed:
+            candidate_path = str(
+                pathlib.Path(str(candidate.get("path") or "")).resolve())
+            if not candidate_path or candidate_path in rejected_paths:
+                continue
+            source = accepted_by_path.get(candidate_path) or {}
+            row = {
+                "id": candidate.get("id"),
+                "path": candidate_path,
+                "reasons": [
+                    "batch_atomicity: another canonical finding or ingestion "
+                    "artifact failed validation",
+                ],
+            }
+            if isinstance(source.get("finding"), dict):
+                row.update(_finding_target_projection(source["finding"]))
+            rejected.append(row)
         confirmed = []
         normalized_confirmed = []
 
@@ -3443,16 +3642,22 @@ def validate_run_artifacts(
         "counts": counts,
         "proof_gate": proof_gate,
         "closure_gate": closure_gate,
+        "miss_attribution": closure_gate.get("miss_attribution") or {},
     }
+    result["next_run_agenda"] = build_next_run_agenda(
+        result["miss_attribution"])
     # v8.8 callers used empty_gate; retain the projection while making the
     # run-wide closure gate authoritative for both empty and non-empty runs.
     if canonical_count == 0:
         result["empty_gate"] = closure_gate
     result["validation_sha256"] = _canonical_digest(result)
-    output = pathlib.Path(output_path) if output_path else base / "finding_validation.json"
-    if not output.is_absolute():
-        output = base / output
-    atomic_write_json(output, result)
+    if write_output:
+        output = pathlib.Path(output_path) if output_path else base / "finding_validation.json"
+        if not output.is_absolute():
+            output = base / output
+        atomic_write_json(output, result)
+        atomic_write_json(base / "miss-attribution.json", result["miss_attribution"])
+        atomic_write_json(base / "next-run-agenda.json", result["next_run_agenda"])
     return result
 
 
