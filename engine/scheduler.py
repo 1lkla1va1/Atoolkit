@@ -64,14 +64,14 @@ def _endpoints_in_blackboard(bb: dict, *, fully_covered: bool = False) -> set[st
                 or fact.get("proof_status") in {"untrusted_legacy", "pending", "refuted"}):
             continue
         ck = canonical_surface_key({"endpoint": fact.get("endpoint", ""),
-                                     "method": fact.get("method", "GET")})
+                                     "method": fact.get("method", "")})
         if ck:
             eps.add(ck)
     for neg in bb.get("negatives", []):
         if not neg.get("depth_sufficient"):
             continue
         ck = canonical_surface_key({"endpoint": neg.get("endpoint", ""),
-                                     "method": neg.get("method", "GET")})
+                                     "method": neg.get("method", "")})
         if ck:
             eps.add(ck)
     for dead_end in bb.get("dead_ends", []):
@@ -120,7 +120,7 @@ def _shallow_negatives(bb: dict) -> list[str]:
     for neg in bb.get("negatives", []):
         if not neg.get("depth_sufficient", True):
             ck = canonical_surface_key({"endpoint": neg.get("endpoint", ""),
-                                         "method": neg.get("method", "GET")})
+                                         "method": neg.get("method", "")})
             if ck and ck not in result:
                 result.append(ck)
     return result

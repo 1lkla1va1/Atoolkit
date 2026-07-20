@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover
 try:  # Support both ``python -m engine.finalize`` and direct repo CLI use.
     from .project_state import ProjectStateError, ProjectStateStore, _default_state
     from .data_hygiene import sensitive_kinds
+    from .exploration import validate_intuition_exploration
     from .reporting.render_md import render_final_report
     from .reporting.validate import validate_run_artifacts
     from .run_authority import (
@@ -47,6 +48,7 @@ try:  # Support both ``python -m engine.finalize`` and direct repo CLI use.
 except ImportError:  # pragma: no cover - exercised by subprocess CLI tests
     from project_state import ProjectStateError, ProjectStateStore, _default_state
     from data_hygiene import sensitive_kinds
+    from exploration import validate_intuition_exploration
     from reporting.render_md import render_final_report
     from reporting.validate import validate_run_artifacts
     from run_authority import (
@@ -88,6 +90,7 @@ _INPUT_FILES = (
     "dead_ends.json",
     "intents.json",
     "negative_findings.json",
+    "intuition-exploration.json",
 )
 _DERIVED_RUN_FILES = {
     "finding_validation.json",
@@ -875,7 +878,7 @@ def finalize_run(
     project_dir: str | pathlib.Path,
     authority_dir: str | pathlib.Path,
     allow_empty: bool = False,
-    authority_trusted: bool = True,
+    authority_trusted: bool = False,
     authorization_assurance: str = "unverified",
     project_name: str = "target",
     primary_target: str = "",
@@ -912,6 +915,16 @@ def finalize_run(
             project_dir=project,
             project_id=identity["project_id"],
         )
+        runtime_summary_value = dict(runtime_summary or {})
+        low_roi_claimed = (
+            str(runtime_summary_value.get("marker") or "").upper() == "LOW_ROI"
+            or str(runtime_summary_value.get("status") or "").lower() == "low_roi"
+        )
+        if low_roi_claimed:
+            intuition_result = validate_intuition_exploration(run)
+            runtime_summary_value["intuition_exploration"] = intuition_result
+            if not intuition_result.get("ok"):
+                runtime_closure_pass = False
         finalization_contract = {
             "allow_empty": bool(allow_empty),
             "authority_trusted": bool(authority_trusted),
@@ -923,7 +936,7 @@ def finalize_run(
             "runtime_closure_pass": (
                 bool(runtime_closure_pass)
                 if runtime_closure_pass is not None else None),
-            "runtime_summary": dict(runtime_summary or {}),
+            "runtime_summary": runtime_summary_value,
         }
         journal_path = _journal_path(authority, session_id)
         if journal_path.is_file():

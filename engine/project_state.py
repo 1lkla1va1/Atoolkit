@@ -27,13 +27,13 @@ except ImportError:  # pragma: no cover
 
 try:
     from .surface_key import canonical_surface_key
-    from .vuln_classes import norm_vc
+    from .vuln_classes import exact_vc, norm_vc
 except ImportError:  # pragma: no cover
     from surface_key import canonical_surface_key
-    from vuln_classes import norm_vc
+    from vuln_classes import exact_vc, norm_vc
 
 
-PROJECT_STATE_SCHEMA_VERSION = 2
+PROJECT_STATE_SCHEMA_VERSION = 3
 DEAD_END_REASON_CODES = {
     "endpoint_removed",
     "feature_disabled",
@@ -492,7 +492,7 @@ def canonical_project_cell_key(
             path, param=param, param_location=param_location),
     )
     role = str(role_scope or "unknown").strip().lower() or "unknown"
-    vc = norm_vc(vuln_class)
+    vc = exact_vc(vuln_class)
     base = f"{surface} :: {str(param or '').strip()} @ {role} × {vc}"
     dimensions = {
         "namespace": str(namespace or "").strip(),
@@ -680,15 +680,18 @@ class ProjectStateStore:
         if not isinstance(data, dict):
             raise ProjectStateCorrupt("project state must be an object")
         version = data.get("schema_version")
-        if version == 1:
+        if version in {1, 2}:
             for record in (data.get("cell_registry") or {}).values():
                 if isinstance(record, dict):
-                    record.setdefault("identity_version", 1)
-                    record.setdefault("migration_status", "legacy_v1")
+                    record.setdefault("identity_version", int(version))
+                    record.setdefault("legacy_status", record.get("status", ""))
+                    record["status"] = "stale_requires_retest"
+                    record["migration_status"] = (
+                        "legacy_semantic_group_retest_required")
             data["schema_version"] = PROJECT_STATE_SCHEMA_VERSION
-            data["migrated_from_schema"] = 1
+            data["migrated_from_schema"] = int(version)
             data.setdefault("migrated_at", "")
-            data["schema1_backup_sha256"] = hashlib.sha256(raw).hexdigest()
+            data[f"schema{version}_backup_sha256"] = hashlib.sha256(raw).hexdigest()
         elif version != PROJECT_STATE_SCHEMA_VERSION:
             raise ProjectStateCorrupt(f"unsupported project state schema: {version!r}")
         for key, expected in (
@@ -845,6 +848,55 @@ class ProjectStateStore:
                     continue
                 if written <= 0:
                     raise OSError("short write while creating schema1 migration backup")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self._fsync_directory()
+
+    def _ensure_schema2_backup(self, migrated_state: dict[str, Any]) -> None:
+        """Preserve the exact pre-v9.1 schema-2 bytes before publishing v3."""
+        expected = str(migrated_state.get("schema2_backup_sha256") or "")
+        backup = self.project_dir / "project_state.pre-v91.schema2.json"
+        try:
+            raw_source = self._read_state_bytes_unlocked()
+        except FileNotFoundError:
+            raw_source = b""
+        try:
+            source_value = json.loads(raw_source.decode("utf-8")) if raw_source else {}
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ProjectStateCorrupt(f"cannot verify schema2 source: {exc}") from exc
+        source_is_schema2 = (
+            isinstance(source_value, dict) and source_value.get("schema_version") == 2)
+        if source_is_schema2:
+            if not expected or hashlib.sha256(raw_source).hexdigest() != expected:
+                raise ProjectStateCorrupt(
+                    "schema2 migration source digest changed during commit")
+        elif not backup.exists():
+            return
+        if backup.exists():
+            info = os.lstat(backup)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ProjectStateCorrupt("schema2 migration backup is unsafe")
+            fd = os.open(backup, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                opened = os.fstat(fd)
+                payload = self._read_fd_fully(fd)
+                if ((opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)
+                        or hashlib.sha256(payload).hexdigest() != expected):
+                    raise ProjectStateCorrupt("schema2 migration backup is invalid")
+            finally:
+                os.close(fd)
+            return
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(backup, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(raw_source)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("short write while creating schema2 migration backup")
                 view = view[written:]
             os.fsync(fd)
         finally:
@@ -1101,7 +1153,8 @@ class ProjectStateStore:
                 item = {
                     **neg, "cell_key": key, "asset_id": asset, "method": method,
                     "endpoint": canonical_path, "param": param, "role_scope": role,
-                    "vuln_class": norm_vc(vc), "source_run": run_id,
+                    "vuln_class": exact_vc(vc), "vuln_family": norm_vc(vc),
+                    "source_run": run_id,
                     **dimensions,
                     "status": "active", "evidence_refs": evidence_refs,
                     "evidence_hashes": evidence_hashes,
@@ -1159,7 +1212,8 @@ class ProjectStateStore:
                             "target_method": method,
                             "target_params": [param] if param else [],
                             "target_roles": [role] if role else [],
-                            "vuln_class": norm_vc(vc),
+                            "vuln_class": exact_vc(vc),
+                            "vuln_family": norm_vc(vc),
                             "evidence_refs": list(dict.fromkeys(
                                 list(prior.get("evidence_refs") or [])
                                 + evidence_refs)),
@@ -1169,11 +1223,17 @@ class ProjectStateStore:
                         "cell_key": key, "asset_id": asset, "method": method,
                         "path": canonical_path,
                         "param": param,
-                        "role_scope": role, "vuln_class": norm_vc(vc),
+                        "role_scope": role, "vuln_class": exact_vc(vc),
+                        "vuln_family": norm_vc(vc),
                         **dimensions,
                         "status": "not_vulnerable", "source_run": run_id,
                         "evidence_refs": evidence_refs,
                         "evidence_hashes": evidence_hashes,
+                        "negative_vectors": list(neg.get("vectors") or []),
+                        "negative_encoding_families": list(
+                            neg.get("encoding_families") or []),
+                        "negative_strategy_families": list(
+                            neg.get("strategy_families") or []),
                         "updated_at": _now(),
                     }
 
@@ -1357,7 +1417,8 @@ class ProjectStateStore:
                 "cell_key": key, "asset_id": asset, "method": method,
                 "path": _canonical_row_path(path, param, dimensions),
                 "param": param,
-                "role_scope": role, "vuln_class": norm_vc(vc),
+                "role_scope": role, "vuln_class": exact_vc(vc),
+                "vuln_family": norm_vc(vc),
                 **dimensions,
                 "status": "confirmed", "source_run": run_id,
                 "canonical_finding_id": canonical_id,
@@ -1373,7 +1434,8 @@ class ProjectStateStore:
                 "endpoint": _canonical_row_path(path, param, dimensions),
                 "method": method,
                 "params": [param] if param else [], "affected_role": role,
-                "affected_roles": [role], "vuln_class": norm_vc(vc),
+                "affected_roles": [role], "vuln_class": exact_vc(vc),
+                "vuln_family": norm_vc(vc),
                 **root_dimensions,
                 "param_locations": (
                     {param: dimensions["param_location"]}
@@ -1457,7 +1519,7 @@ class ProjectStateStore:
             "endpoint": canonical_path,
             "param": str(dead_end.get("param") or ""),
             "role_scope": role,
-            "vuln_class": norm_vc(vc),
+            "vuln_class": exact_vc(vc), "vuln_family": norm_vc(vc),
             **dimensions,
             "status": "not_applicable",
             "reason_code": reason_code,
@@ -1479,7 +1541,7 @@ class ProjectStateStore:
             "path": canonical_path,
             "param": str(dead_end.get("param") or ""),
             "role_scope": role,
-            "vuln_class": norm_vc(vc),
+            "vuln_class": exact_vc(vc), "vuln_family": norm_vc(vc),
             **dimensions,
             "status": "not_applicable",
             "reason_code": reason_code,
@@ -1618,6 +1680,8 @@ class ProjectStateStore:
             state["updated_at"] = _now()
             if state.get("migrated_from_schema") == 1:
                 self._ensure_schema1_backup(state)
+            elif state.get("migrated_from_schema") == 2:
+                self._ensure_schema2_backup(state)
             self._atomic_write(state)
             self.last_commit = {
                 "run_id": run_id,
@@ -1687,6 +1751,8 @@ class ProjectStateStore:
                 raise ProjectStateError("prepared project state contract mismatch")
             if candidate.get("migrated_from_schema") == 1:
                 self._ensure_schema1_backup(candidate)
+            elif candidate.get("migrated_from_schema") == 2:
+                self._ensure_schema2_backup(candidate)
             self._atomic_write(candidate)
             self.last_commit = {
                 "run_id": run_id, "idempotent": False,

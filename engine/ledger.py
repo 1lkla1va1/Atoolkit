@@ -122,7 +122,10 @@ def _first(value: Any, default: str = "") -> str:
 
 
 def _clean_method(value: Any) -> str:
-    return (_first(value, "GET") or "GET").upper()
+    method = _first(value, "").upper()
+    return method if method in {
+        "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+    } else ""
 
 
 def _roles_from_cell(cell: dict[str, Any]) -> list[str]:
@@ -513,6 +516,8 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
     if not endpoint:
         return []
     method = _clean_method(surface_meta.get("method") or cell.get("method"))
+    if not method:
+        return []
     feature = str(cell.get("feature") or surface_meta.get("feature") or "default")
     cell_state = str(cell.get("state") or "").lower()
     status = normalize_status(cell.get("state") or cell.get("status"))
@@ -591,6 +596,9 @@ def surfaces_from_legacy_cell(cell: dict[str, Any]) -> list[dict[str, Any]]:
             "negative_depth": negative_depth,
             "negative_depth_checked": bool(cell.get("negative_depth_checked", False)),
             "negative": cell.get("negative") if isinstance(cell.get("negative"), dict) else None,
+            "cross_stage_prior_negative": (
+                dict(cell.get("cross_stage_prior_negative") or {})
+                if isinstance(cell.get("cross_stage_prior_negative"), dict) else {}),
             "inherited_from_blackboard": bool(cell.get("inherited_from_blackboard", False)),
             "structured_dead_end": structured_dead_end,
             "deferred_by_text_skip": bool(

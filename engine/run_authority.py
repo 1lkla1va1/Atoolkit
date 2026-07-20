@@ -197,7 +197,7 @@ def create_run_plan(
     method_resolution_items: Iterable[dict[str, Any]] = (),
     candidate_baseline: Iterable[dict[str, Any] | str] = (),
     budget: dict[str, Any] | None = None,
-    identity_version: int = 2,
+    identity_version: int = 3,
 ) -> dict[str, Any]:
     """Freeze this run's closure denominator before the model starts."""
     session_id = validate_session_id(session_id)

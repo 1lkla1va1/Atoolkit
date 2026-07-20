@@ -926,7 +926,7 @@ def create_run_manifest(
             requested["authorization_assurance"] == "preexec_enforced"),
         "instruction_sources": _instruction_records(instruction_sources, source),
         "reporting_schema_version": 2,
-        "project_state_schema_version": 2,
+        "project_state_schema_version": 3,
         "authority_path": str(authority_path),
         "authority_id": authority_id,
         "authority_identity_path": str(identity_path),
@@ -2124,7 +2124,7 @@ def verify_run_receipt(
 def _file_check(path: pathlib.Path) -> dict[str, Any]:
     if not path.exists():
         return {"status": "missing", "path": str(path), "sha256": ""}
-    if not path.is_file():
+    if path.is_symlink() or not path.is_file():
         return {"status": "invalid", "path": str(path), "sha256": ""}
     size = path.stat().st_size
     return {
@@ -2135,10 +2135,46 @@ def _file_check(path: pathlib.Path) -> dict[str, Any]:
     }
 
 
+def inspect_workspace_instructions(
+    repo_root: str | pathlib.Path,
+    workspace_root: str | pathlib.Path,
+) -> dict[str, Any]:
+    """Bind the active workspace ``AGENTS.md`` to this project revision.
+
+    The check is intentionally exact and rejects a symlinked active file.  A
+    stale parent-workspace instruction file is otherwise indistinguishable
+    from a successful Skill Mode installation and was the root cause of the
+    v9.0 field runs bypassing the runtime contracts.
+    """
+    root = pathlib.Path(repo_root).resolve()
+    workspace = pathlib.Path(workspace_root).expanduser().resolve()
+    expected = _file_check(root / "AGENTS.md")
+    active = _file_check(workspace / "AGENTS.md")
+    matches = bool(
+        expected.get("status") == "ok"
+        and active.get("status") == "ok"
+        and expected.get("sha256") == active.get("sha256")
+    )
+    status = str(active.get("status") or "invalid")
+    if status == "ok" and not matches:
+        status = "drift"
+    return {
+        **active,
+        "status": status,
+        "workspace_root": str(workspace),
+        "project_agents_path": str(root / "AGENTS.md"),
+        "expected_sha256": str(expected.get("sha256") or ""),
+        "matches_project": matches,
+    }
+
+
 def doctor(
     repo_root: str | pathlib.Path,
     *,
     codex_home: str | pathlib.Path | None = None,
+    workspace_root: str | pathlib.Path | None = None,
+    strict_runtime: bool = False,
+    allow_foreign_src: bool = False,
 ) -> dict[str, Any]:
     """Inspect instruction resolution without changing user configuration."""
     root = pathlib.Path(repo_root).resolve()
@@ -2210,17 +2246,27 @@ def doctor(
         "global_agents": global_agents,
         "src_alias": src_alias,
     }
+    if workspace_root is not None or strict_runtime:
+        checks["workspace_agents"] = inspect_workspace_instructions(
+            root, workspace_root or root)
     fatal = (
         project_agents["status"] != "ok"
         or compatibility_agents["status"] in {"invalid", "drift"}
         or agents_source["status"] != "ok"
         or version_consistency["status"] != "ok"
     )
+    if strict_runtime:
+        fatal = bool(
+            fatal
+            or checks["workspace_agents"]["status"] != "ok"
+            or (src_alias["status"] == "foreign" and not allow_foreign_src)
+        )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "atoolkit_version": __version__,
         "repo_root": str(root),
         "codex_home": str(home),
+        "strict_runtime": strict_runtime,
         "ok": not fatal,
         "checks": checks,
     }
@@ -2265,6 +2311,9 @@ def main(argv: list[str] | None = None) -> int:
     doctor_parser = subparsers.add_parser("doctor")
     doctor_parser.add_argument("repo_root", type=pathlib.Path)
     doctor_parser.add_argument("--codex-home", type=pathlib.Path)
+    doctor_parser.add_argument("--workspace-root", type=pathlib.Path)
+    doctor_parser.add_argument("--strict-runtime", action="store_true")
+    doctor_parser.add_argument("--allow-foreign-src", action="store_true")
     doctor_parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "init-manifest":
@@ -2344,7 +2393,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == "doctor":
-        result = doctor(args.repo_root, codex_home=args.codex_home)
+        result = doctor(
+            args.repo_root,
+            codex_home=args.codex_home,
+            workspace_root=args.workspace_root,
+            strict_runtime=args.strict_runtime,
+            allow_foreign_src=args.allow_foreign_src,
+        )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["ok"] else 1
     return 2
@@ -2359,6 +2414,7 @@ __all__ = [
     "canonical_json_sha256",
     "create_run_manifest",
     "doctor",
+    "inspect_workspace_instructions",
     "load_manifest",
     "sha256_file",
     "source_tree_sha256",

@@ -180,6 +180,8 @@ def guardian_check_finding(
     finding: dict,
     finding_dir: str | pathlib.Path,
     authorized_hosts: list[str] | None = None,
+    *,
+    context=None,
 ) -> Verdict:
     """Validate a structured finding, then reuse Guardian on a Markdown excerpt."""
     fdir = pathlib.Path(finding_dir).resolve()
@@ -192,7 +194,9 @@ def guardian_check_finding(
         from reporting.schema import resolve_finding_file
 
     finding_path = fdir / "finding.json"
-    validation = validate_finding(finding, finding_path, run_dir, authorized_hosts=authorized_hosts)
+    validation = validate_finding(
+        finding, finding_path, run_dir,
+        authorized_hosts=authorized_hosts, context=context)
     sev = str(finding.get("severity") or "").upper()
     if not validation.ok:
         return Verdict(REJECTED, 2, "structured finding invalid: " + "; ".join(validation.reasons), sev)

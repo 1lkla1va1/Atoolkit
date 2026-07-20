@@ -28,7 +28,7 @@ def _strip_host(path: str) -> str:
     return _SCHEME_HOST_RE.sub('', path)
 
 
-def canonical_surface_key(item, default_method: str = "GET") -> str:
+def canonical_surface_key(item, default_method: str = "") -> str:
     """Normalize any surface representation to ``"METHOD /path"``.
 
     Accepts:
@@ -39,7 +39,7 @@ def canonical_surface_key(item, default_method: str = "GET") -> str:
         {"path": "/api/refund", "method": "POST"}
         {"url": "https://t.example/api/refund", "method": "GET"}
     """
-    method = default_method.upper()
+    method = str(default_method or "").upper()
     path = ""
 
     if isinstance(item, dict):
@@ -69,7 +69,7 @@ def canonical_surface_key(item, default_method: str = "GET") -> str:
         path = str(item).strip()
 
     path = _strip_host(path).strip()
-    if not path:
+    if not path or method not in _HTTP_METHODS:
         return ""
     return f"{method} {path}"
 
@@ -81,6 +81,8 @@ def canonical_cell_key(surface_key: str, vuln_class: str, param: str = "") -> st
     first so callers do not need to pre-normalize.
     """
     sk = canonical_surface_key(surface_key)
+    if not sk:
+        return ""
     vc = (vuln_class or "").strip()
     param_part = f" :: {str(param).strip()}" if str(param or "").strip() else ""
     return f"{sk}{param_part}{_CELL_SEP}{vc}"

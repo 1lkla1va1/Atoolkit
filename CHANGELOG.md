@@ -1,5 +1,23 @@
 # Changelog
 
+## 9.1.0 - 2026-07-20
+
+- 新增 `--continue-from-run`：重算并校验 prior validation/attribution/agenda，将 diagnostic `continuation-input.json` 绑定进新 Run manifest；不伪造 containment，也不提升 ProjectState/submission authority。
+- Cell identity 与 ProjectState 升至 v3/schema 3；exact vulnerability class 与语义家族分离，stored/reflected/DOM XSS、horizontal/vertical IDOR 不再串格，旧 schema cell 迁移为 stale 待复测。
+- LOW_ROI 新增物理 `intuition-exploration.json` 双门；跨阶段输入阴性自动重开，并强制新 encoding family + strategy family。
+- 敏感数据检测与脱敏 regex 解耦；captcha 在五类绕过方向耗尽前保持 recoverable。
+- Finalizer authority 默认 false、无 scope 的 Finding 校验拒绝、unknown method 不再猜 GET；删除 legacy summary 死代码。
+- 明确 proof 文件早已由 validator 全量 hash-bound，并新增替换 proof 后校验失败的回归证据。
+- 新增 v9.1 完整性修复专项对抗测试；修复前基线和修复后全量套件均实际执行。
+
+## 9.0.1 - 2026-07-20
+
+- Engine 与 Direct CLI 启动前严格绑定当前 workspace `AGENTS.md` 到项目版本；`doctor` 可显式检查工作区漂移和外来 `/src`，避免“代码已升级、实际仍按旧提示手跑”。
+- `run.py audit` 要求非空 inventory/coverage、真实持久化且可重算一致的 miss attribution/next-run agenda，并识别人工终态声明；凭据权限扫描扩展到整个 Run。
+- Finding validator 的外部 `--output` 默认只写目标文件，不再隐式回写历史 Run；需要归因 sidecar 时必须在 Run 内输出或显式 `--write-sidecars`。
+- Direct checkpoint 输出 proof-rejected 明细、proof repair 数量与 finalizer 保留产物违规，任何一项存在都禁止 `report_ready`。
+- 增加 v9.0.1 实跑入口、空台账、审计投影、凭据权限、外部验证副作用与通用 Recon 解析回归。
+
 ## 9.0.0 - 2026-07-18
 
 - 新增确定性 `miss-attribution.json`：逐一归因 frozen cell、unassigned inventory、unresolved method、dynamic backlog、proof rejection 与批次原子门连带阻断的 Finding；未知状态 fail closed，终结静默遗漏和虚假覆盖率。

@@ -144,7 +144,9 @@ def test_validated_normalized_cell_retains_its_packet_binding(tmp_path):
     fdir = _idor_fixture(tmp_path)
     path = fdir / "finding.json"
 
-    result = validate_finding(load_finding(path), path, tmp_path)
+    result = validate_finding(
+        load_finding(path), path, tmp_path,
+        authorized_hosts=["https://t.example/"])
 
     assert result.ok is True, result.reasons
     cell = result.normalized["exact_cells"][0]
@@ -180,7 +182,8 @@ def test_same_id_same_bytes_in_two_canonical_dirs_normalizes_once(tmp_path):
     first = _idor_fixture(tmp_path)
     shutil.copytree(first, tmp_path / "findings" / "finding_shadow")
 
-    collected = collect_structured_findings(tmp_path)
+    collected = collect_structured_findings(
+        tmp_path, authorized_hosts=["https://t.example/"])
 
     assert len(collected["accepted"]) == 1
     assert len(collected["normalized"]) == 1

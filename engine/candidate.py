@@ -114,7 +114,7 @@ def make_candidate(
     *,
     surface_id: str,
     endpoint: str,
-    method: str = "GET",
+    method: str = "",
     param: str = "",
     role: str = "",
     object: str = "",
@@ -513,7 +513,7 @@ def derive_spread_candidates(
         if _norm_endpoint(ep) == _norm_endpoint(confirmed_cand.get("endpoint", "")):
             continue
         spread.append(make_candidate(
-            surface_id="", endpoint=ep, method=confirmed_cand.get("method", "GET"),
+            surface_id="", endpoint=ep, method=confirmed_cand.get("method", ""),
             param=confirmed_cand.get("param", ""),
             hypothesis=f"同根因扩散：{root_cause} @ {ep}",
             next_probe=f"验证 {root_cause} 在 {ep} 是否同样存在",
@@ -526,7 +526,7 @@ def derive_spread_candidates(
         spread.append(make_candidate(
             surface_id=confirmed_cand.get("surface_id", ""),
             endpoint=confirmed_cand.get("endpoint", ""),
-            method=confirmed_cand.get("method", "GET"), param=p,
+            method=confirmed_cand.get("method", ""), param=p,
             hypothesis=f"同根因扩散：{root_cause} × 参数 {p}",
             next_probe=f"验证 {root_cause} 在参数 {p} 是否同样存在",
             **{k: v for k, v in base.items() if k not in ("_spread_depth",)},
@@ -536,7 +536,7 @@ def derive_spread_candidates(
         spread.append(make_candidate(
             surface_id=confirmed_cand.get("surface_id", ""),
             endpoint=confirmed_cand.get("endpoint", ""),
-            method=confirmed_cand.get("method", "GET"),
+            method=confirmed_cand.get("method", ""),
             param=confirmed_cand.get("param", ""),
             hypothesis=f"升级路径：{esc}",
             next_probe=f"验证升级：{esc}",

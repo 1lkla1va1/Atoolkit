@@ -66,10 +66,22 @@ BLOCKER_RULES: dict[str, dict[str, Any]] = {
         "patterns": ("missing role", "need role", "no admin", "no merchant", "role account", "permission account"),
     },
     "captcha_required": {
+        "category": RECOVERABLE,
+        "status": BLOCKED_STATUS,
+        "next_actions": [
+            "try empty/null/omitted challenge fields",
+            "test common-code and response-echo behavior",
+            "test code reuse and cross-session/user binding",
+            "test direct access to the post-verification step",
+            "test type/channel confusion and record each distinct direction",
+        ],
+        "patterns": ("captcha", "verify code", "verification code", "sms", "mfa", "2fa"),
+    },
+    "captcha_bypass_exhausted": {
         "category": NEEDS_INPUT,
         "status": BLOCKED_STATUS,
-        "next_actions": ["request human-provided captcha or verification code", "do not bypass human verification boundaries"],
-        "patterns": ("captcha", "verify code", "verification code", "sms", "mfa", "2fa"),
+        "next_actions": ["request a fresh human-provided captcha/code or authorized session"],
+        "patterns": ("captcha bypass exhausted", "challenge bypass exhausted"),
     },
     "out_of_scope": {
         "category": OUT_OF_SCOPE,
@@ -98,6 +110,19 @@ def classify_blocker(blocker: str | dict[str, Any] | None, context: dict[str, An
         explicit = str(blocker.get("type") or blocker.get("blocker_type") or blocker.get("kind") or "").strip()
     if explicit in BLOCKER_RULES:
         return explicit
+    attempts: list[Any] = []
+    for source in (blocker, context):
+        if isinstance(source, dict) and isinstance(source.get("bypass_attempts"), list):
+            attempts.extend(source["bypass_attempts"])
+    distinct_attempts = {
+        json.dumps(item, ensure_ascii=False, sort_keys=True)
+        if isinstance(item, (dict, list)) else str(item).strip().lower()
+        for item in attempts if str(item).strip()
+    }
+    if (len(distinct_attempts) >= 5
+            and any(token in raw for token in (
+                "captcha", "verify code", "verification code", "sms", "mfa", "2fa"))):
+        return "captcha_bypass_exhausted"
     for blocker_type, rule in BLOCKER_RULES.items():
         if any(pattern in raw for pattern in rule["patterns"]):
             return blocker_type

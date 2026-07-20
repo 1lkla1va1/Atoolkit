@@ -1,7 +1,7 @@
 ---
 name: Atoolkit
 description: Authorized AI-assisted SRC/bug-bounty vulnerability research toolkit. Use whenever the user wants to read, install, configure, or run this Atoolkit package; mentions SRC 漏洞挖掘, 授权靶场, bug bounty, Codex AGENTS.md, /src, Guardian 质检, PoC 复验, or model-independent security testing automation. Only proceed for clearly authorized defensive testing or educational lab contexts.
-version: 9.0.0
+version: 9.1.0
 ---
 
 # Atoolkit Skill
@@ -197,7 +197,7 @@ For targets requiring multiple runs (large SRC programs, 50+ endpoints):
 
 ### Before testing (run startup)
 
-1. Load or migrate `runs/targets/{target}/project_state.json` (schema 2).
+1. Load or migrate `runs/targets/{target}/project_state.json` (schema 3). Schema 1/2 cells are retained as stale evidence but cannot close v3 exact-class cells without retesting.
 2. Merge project inventory into this session before recon; recon is incremental, not a reset.
 3. Restore only exact role-aware coverage cells. Unknown role is not a wildcard, and legacy facts without evidence remain pending revalidation.
 4. Add every pending Host continuation in priority order, then high-priority
@@ -221,7 +221,7 @@ For targets requiring multiple runs (large SRC programs, 50+ endpoints):
 ### Directory structure
 
     runs/{target}/
-      project_state.json       # authoritative, revisioned cross-run truth (schema 2)
+      project_state.json       # authoritative, revisioned cross-run truth (schema 3)
       .atoolkit/manifests/     # authority copies outside session write scope
       blackboard.json          # derived compatibility view
       business_graph.json      # derived endpoint→domain view

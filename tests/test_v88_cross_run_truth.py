@@ -40,7 +40,7 @@ def test_project_store_same_run_is_content_addressed_and_rejects_rewrite(tmp_pat
     )
     retried = store.commit_run("run-1", **commit)
 
-    assert first["schema_version"] == 2
+    assert first["schema_version"] == 3
     assert retried["revision"] == first["revision"]
     assert store.last_commit["idempotent"] is True
     assert retried["merged_run_ids"] == ["run-1"]

@@ -341,7 +341,9 @@ def test_csrf_requires_cross_site_state_change_not_token_phenomenon(tmp_path):
     finding["proof_packets"][1]["phase"] = "test"
     finding["proof_packets"][2]["phase"] = "control"
 
-    result = validate_finding(finding, fdir / "finding.json", tmp_path)
+    result = validate_finding(
+        finding, fdir / "finding.json", tmp_path,
+        authorized_hosts=["https://t.example/"])
 
     assert result.ok is False
     assert any("cross_site_state_change" in reason for reason in result.reasons)
@@ -352,7 +354,9 @@ def test_csrf_requires_cross_site_state_change_not_token_phenomenon(tmp_path):
 def test_real_cross_site_state_change_contract_can_pass(tmp_path):
     fdir, finding = _csrf_finding(tmp_path)
 
-    result = validate_finding(finding, fdir / "finding.json", tmp_path)
+    result = validate_finding(
+        finding, fdir / "finding.json", tmp_path,
+        authorized_hosts=["https://t.example/"])
 
     assert result.ok, result.reasons
 

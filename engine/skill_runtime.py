@@ -51,6 +51,7 @@ try:
     from .planner import plan_surfaces
     from .project_state import canonical_asset
     from .reporting.collect import collect_structured_findings
+    from .runtime_manifest import inspect_workspace_instructions
     from .safe_io import (
         atomic_write_json,
         create_json_exclusive,
@@ -65,7 +66,7 @@ try:
         derive_threat_coverage,
         validate_threat_plan,
     )
-    from .vuln_classes import norm_vc
+    from .vuln_classes import exact_vc, norm_vc
 except ImportError:  # pragma: no cover - script execution fallback
     from blocker import RECOVERABLE, resolve_blocker
     from dynamic_execution import (EXECUTION_CONTRACT_VERSION,
@@ -86,12 +87,13 @@ except ImportError:  # pragma: no cover - script execution fallback
     from planner import plan_surfaces
     from project_state import canonical_asset
     from reporting.collect import collect_structured_findings
+    from runtime_manifest import inspect_workspace_instructions
     from safe_io import (atomic_write_json, create_json_exclusive,
                          ensure_directory, safe_read_bytes, safe_read_text)
     from surface import bootstrap as bootstrap_recon
     from threat_model import (ThreatModelError, compile_threat_model,
                               derive_threat_coverage, validate_threat_plan)
-    from vuln_classes import norm_vc
+    from vuln_classes import exact_vc, norm_vc
 
 
 class SkillRuntimeError(RuntimeError):
@@ -108,10 +110,20 @@ _FORMAT_SIGNALS = {"format_unresolved"}
 _HUMAN_SIGNALS = {"missing_role", "challenge_unsolved"}
 DIRECT_QUEUE_LIMIT = 16
 DIRECT_HINT_CARD_LIMIT = 4
+DIRECT_RESERVED_ARTIFACTS = (
+    "final_report.md",
+    "summary.json",
+    "delivery_status.json",
+    "submission_status.json",
+)
 
 
 def preflight_direct_run(
-    *, run_dir: pathlib.Path, target: str,
+    *,
+    run_dir: pathlib.Path,
+    target: str,
+    workspace_root: pathlib.Path | None = None,
+    require_instruction_match: bool = False,
 ) -> dict[str, Any]:
     """Create the diagnostic trust boundary before fresh black-box recon.
 
@@ -121,20 +133,41 @@ def preflight_direct_run(
     first endpoint.
     """
     run = run_dir.resolve()
+    normalized_target = str(target).strip()
+    if not normalized_target:
+        raise SkillRuntimeError("Direct preflight requires target")
+    instruction_binding: dict[str, Any] | None = None
+    if require_instruction_match:
+        workspace = workspace_root.resolve() if workspace_root else None
+        if workspace is None:
+            for candidate in (run.parent, *run.parents):
+                if (candidate / "AGENTS.md").is_file():
+                    workspace = candidate
+                    break
+        if workspace is None:
+            raise SkillRuntimeError(
+                "cannot locate active workspace AGENTS.md; pass --workspace-root")
+        project_root = pathlib.Path(__file__).resolve().parent.parent
+        instruction_binding = inspect_workspace_instructions(
+            project_root, workspace)
+        if instruction_binding.get("status") != "ok":
+            raise SkillRuntimeError(
+                "active workspace AGENTS.md is missing, unsafe, or stale; "
+                "install the project AGENTS.md before Direct preflight")
     ensure_directory(run, root=run.parent)
     record = {
-        "schema_version": 1,
+        "schema_version": 2 if instruction_binding is not None else 1,
         "mode": "direct_diagnostic",
         "phase": "recon",
-        "target": str(target).strip(),
+        "target": normalized_target,
         "authority_trusted": False,
         "delivery_eligible": False,
         "execution_contract_version": EXECUTION_CONTRACT_VERSION,
         "runtime_incomplete": True,
         "next_action": "complete recon, then run skill_runtime init",
+        **({"instruction_binding": instruction_binding}
+           if instruction_binding is not None else {}),
     }
-    if not record["target"]:
-        raise SkillRuntimeError("Direct preflight requires target")
     path = run / "runtime-preflight.json"
     created = create_json_exclusive(path, record, root=run)
     if not created:
@@ -284,6 +317,7 @@ def _runtime_status(
     observation_errors: int = 0,
     threat_coverage: dict[str, Any] | None = None,
     execution_projection: dict[str, Any] | None = None,
+    reserved_artifact_violations: int = 0,
 ) -> dict[str, Any]:
     stats = ledger.stats()
     planning_mode = str(ledger.metadata.get("planning_mode") or "legacy_risk")
@@ -315,12 +349,41 @@ def _runtime_status(
         "rejected_findings": rejected_findings,
         "projection_stale": projection_stale,
         "observation_errors": observation_errors,
+        "reserved_artifact_violations": reserved_artifact_violations,
         "report_ready": bool(
             not planning_degraded and threat_closed and execution_closed
             and stats.get("total") and not stats.get("open")
             and not projection_stale and not rejected_findings
-            and not observation_errors),
+            and not observation_errors and not reserved_artifact_violations),
     }
+
+
+def _rejected_finding_details(
+    run: pathlib.Path, rejected: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for item in rejected[:32]:
+        raw_path = str(item.get("path") or "")
+        rendered_path = raw_path
+        if raw_path:
+            try:
+                rendered_path = pathlib.Path(raw_path).resolve().relative_to(run).as_posix()
+            except ValueError:
+                rendered_path = raw_path
+        details.append({
+            "id": str(item.get("id") or ""),
+            "path": rendered_path,
+            "layout": str(item.get("layout") or ""),
+            "method": str(item.get("method") or "").strip().upper(),
+            "endpoint": str(item.get("endpoint") or "").strip(),
+            "params": [str(value) for value in _as_list(item.get("params"))[:16]],
+            "roles": [str(value) for value in _as_list(item.get("roles"))[:8]],
+            "vuln_class": str(item.get("vuln_class") or "").strip(),
+            "feature_id": str(item.get("feature_id") or "").strip(),
+            "threat_id": str(item.get("threat_id") or "").strip(),
+            "reasons": [str(reason) for reason in (item.get("reasons") or [])[:12]],
+        })
+    return details
 
 
 def initialize_direct_run(
@@ -331,10 +394,17 @@ def initialize_direct_run(
     recon_dir: pathlib.Path | None = None,
     feature_graph_path: pathlib.Path | None = None,
     threat_model_path: pathlib.Path | None = None,
+    workspace_root: pathlib.Path | None = None,
+    require_instruction_match: bool = False,
 ) -> dict[str, Any]:
     """Initialize a diagnostic Direct-Skill ledger and bounded work queue."""
     run = run_dir.resolve()
-    preflight_direct_run(run_dir=run, target=target)
+    preflight_direct_run(
+        run_dir=run,
+        target=target,
+        workspace_root=workspace_root,
+        require_instruction_match=require_instruction_match,
+    )
     rows = _inventory_rows(inventory_path)
     if recon_dir is not None:
         rows.extend(bootstrap_recon(recon_dir))
@@ -557,7 +627,7 @@ def _finding_matches_surface(normalized: dict[str, Any], surface: dict[str, Any]
     expected_method = str(surface.get("method") or "").upper()
     expected_endpoint = str(surface.get("endpoint") or "").split("?", 1)[0]
     expected_param = str(surface.get("param") or "")
-    expected_class = norm_vc(str(surface.get("vuln_class") or ""))
+    expected_class = exact_vc(str(surface.get("vuln_class") or ""))
     expected_asset = canonical_asset(str(surface.get("asset_id") or ""))
     expected_roles = {str(role).lower() for role in surface.get("roles") or ["unknown"]}
     exact_dimensions = {
@@ -601,7 +671,8 @@ def _finding_matches_surface(normalized: dict[str, Any], surface: dict[str, Any]
             for field, expected in exact_dimensions.items()
         ):
             continue
-        row_class = norm_vc(str(row.get("vuln_class") or normalized.get("vuln_class") or ""))
+        row_class = exact_vc(str(
+            row.get("vuln_class") or normalized.get("vuln_class") or ""))
         if expected_class and row_class and row_class != expected_class:
             continue
         return True
@@ -947,6 +1018,14 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         "schema_version": 1, "queue": queue,
     }, root=run, reject_leaf_symlink=True)
     stale = _projection_stale(run, len(collected.get("accepted") or []))
+    reserved_violations = [
+        name for name in DIRECT_RESERVED_ARTIFACTS if (run / name).exists()
+    ]
+    rejected_details = _rejected_finding_details(
+        run, list(collected.get("rejected") or []))
+    proof_repair_required = (
+        len(collected.get("rejected") or [])
+        + len(collected.get("ingestion_errors") or []))
     threat_coverage = None
     if str(ledger.metadata.get("planning_mode") or "") == "threat_model":
         threat_model = _load_json(run / "threat-model.json", root=run)
@@ -962,9 +1041,10 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
             len(collected.get("rejected") or [])
             + len(collected.get("ingestion_errors") or [])),
         projection_stale=stale,
-        observation_errors=len(observation_errors),
+        observation_errors=len(observation_errors) + len(execution_errors),
         threat_coverage=threat_coverage,
         execution_projection=execution_projection,
+        reserved_artifact_violations=len(reserved_violations),
     )
     checkpoint = {
         "schema_version": 1,
@@ -977,8 +1057,11 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         "finding_validation": {
             "accepted": len(collected.get("accepted") or []),
             "rejected": len(collected.get("rejected") or []),
+            "rejected_items": rejected_details,
             "ingestion_errors": collected.get("ingestion_errors") or [],
+            "proof_repair_required": proof_repair_required,
         },
+        "reserved_artifact_violations": reserved_violations,
         **({"threat_coverage": threat_coverage} if threat_coverage is not None else {}),
     }
     atomic_write_json(run / "state" / "checkpoint.json", checkpoint, root=run,
@@ -997,6 +1080,7 @@ def _parser() -> argparse.ArgumentParser:
     preflight = sub.add_parser("preflight")
     preflight.add_argument("--run-dir", required=True, type=pathlib.Path)
     preflight.add_argument("--target", required=True)
+    preflight.add_argument("--workspace-root", type=pathlib.Path)
     init = sub.add_parser("init")
     init.add_argument("--run-dir", required=True, type=pathlib.Path)
     init.add_argument("--target", required=True)
@@ -1004,6 +1088,7 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--recon-dir", type=pathlib.Path)
     init.add_argument("--feature-graph", type=pathlib.Path)
     init.add_argument("--threat-model", type=pathlib.Path)
+    init.add_argument("--workspace-root", type=pathlib.Path)
     observe = sub.add_parser("observe")
     observe.add_argument("--run-dir", required=True, type=pathlib.Path)
     observe.add_argument("--agent-id", required=True)
@@ -1018,13 +1103,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "preflight":
             result = preflight_direct_run(
-                run_dir=args.run_dir, target=args.target)
+                run_dir=args.run_dir, target=args.target,
+                workspace_root=args.workspace_root,
+                require_instruction_match=True)
         elif args.command == "init":
             result = initialize_direct_run(
                 run_dir=args.run_dir, target=args.target,
                 inventory_path=args.inventory, recon_dir=args.recon_dir,
                 feature_graph_path=args.feature_graph,
-                threat_model_path=args.threat_model)
+                threat_model_path=args.threat_model,
+                workspace_root=args.workspace_root,
+                require_instruction_match=True)
         elif args.command == "observe":
             if args.input == "-":
                 observation = json.load(sys.stdin)

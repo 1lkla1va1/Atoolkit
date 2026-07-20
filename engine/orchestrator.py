@@ -53,6 +53,9 @@ try:                                  # 支持「脚本直跑」与「包内导�
     from surface_key import canonical_surface_key, canonical_cell_key, is_canonical
     from reporting.collect import collect_structured_findings
     from reporting.validate import ValidationContext, validate_run_artifacts
+    from exploration import validate_intuition_exploration
+    from negative_retest import (families_from_packets,
+                                 is_input_validation_cell)
     from reporting.render_md import render_final_report, render_coverage_gaps
     from project_state import (ProjectStateStore, canonical_asset,
                                canonical_project_cell_key, verify_project_evidence)
@@ -101,6 +104,9 @@ except ImportError:
     from engine.surface_key import canonical_surface_key, canonical_cell_key, is_canonical
     from engine.reporting.collect import collect_structured_findings
     from engine.reporting.validate import ValidationContext, validate_run_artifacts
+    from engine.exploration import validate_intuition_exploration
+    from engine.negative_retest import (families_from_packets,
+                                        is_input_validation_cell)
     from engine.reporting.render_md import render_final_report, render_coverage_gaps
     from engine.project_state import (ProjectStateStore, canonical_asset,
                                       canonical_project_cell_key, verify_project_evidence)
@@ -281,7 +287,7 @@ def _classes_for_endpoint(base_classes: list[str], ep: str, feature: str,
     tags = {str(x).lower() for x in _listify(surface.get("risk_tags"))}
     param = str(surface.get("param") or next(
         iter(_listify(surface.get("params"))), "") or "").lower()
-    method = str(surface.get("method") or "GET").upper()
+    method = str(surface.get("method") or "").upper()
     hay = f"{ep} {feature} {param}".lower()
 
     groups: set[str] = set()
@@ -407,14 +413,14 @@ def _surface_method(endpoint: str, surface: dict | None = None, method: str = ""
     if "method" in surface and not explicit:
         return ""
     key = canonical_surface_key({"endpoint": endpoint, "method": explicit} if explicit else endpoint)
-    return key.partition(" ")[0] if key else "GET"
+    return key.partition(" ")[0] if key else ""
 
 
 def _cell_surface_key(cell: dict) -> str:
     surface = cell.get("surface") if isinstance(cell.get("surface"), dict) else {}
     return canonical_surface_key({
         "endpoint": cell.get("endpoint", ""),
-        "method": cell.get("method") or surface.get("method") or "GET",
+        "method": cell.get("method") or surface.get("method") or "",
     })
 
 
@@ -459,7 +465,7 @@ def _cell_budget_key(cell: dict) -> str:
 
 
 def _cell_schema(ep: str, vc: str, feature: str, surface: dict | None = None,
-                 method: str = "GET", param: str = "", *, asset_id: str = "",
+                 method: str = "", param: str = "", *, asset_id: str = "",
                  actor_role: str = "unknown") -> dict:
     surface = dict(surface or {})
     surface["method"] = method
@@ -673,7 +679,7 @@ class CognitiveState:
         normalized_method, _, path = key.partition(" ")
         if asset:
             return runtime_cell_key(
-                asset, method=normalized_method or method or "GET", path=path or ep,
+                asset, method=normalized_method or method, path=path or ep,
                 param=param, actor_role=actor_role, vuln_class=vc,
                 namespace=namespace, param_location=param_location,
                 subject_role=subject_role, object_kind=object_kind)
@@ -1040,7 +1046,7 @@ class CognitiveState:
                     "asset_id": asset_id,
                     "endpoint": nf.get("endpoint", ""),
                     "method": (nf.get("method")
-                               or next(iter(nf.get("methods") or []), "GET")),
+                               or next(iter(nf.get("methods") or []), "")),
                     "param": param,
                     "actor_role": role,
                     "namespace": nf.get("namespace", ""),
@@ -1051,7 +1057,7 @@ class CognitiveState:
                   for param in dict.fromkeys(params)]
             for row in exact_rows:
                 ep = row.get("endpoint") or row.get("path") or ""
-                method = row.get("method") or nf.get("method") or "GET"
+                method = row.get("method") or nf.get("method") or ""
                 if not ep or not vc:
                     continue
                 lookup = canonical_surface_key({"endpoint": ep, "method": method})
@@ -1074,7 +1080,7 @@ class CognitiveState:
             ep, vc = neg.get("endpoint", ""), neg.get("vuln", "")
             if ep and vc:
                 lookup = canonical_surface_key({
-                    "endpoint": ep, "method": neg.get("method", "GET")})
+                    "endpoint": ep, "method": neg.get("method", "")})
                 param = str(neg.get("param") or "").strip()
                 role_fields = {"actor_roles", "actor_role", "role_scopes", "role_scope",
                                "roles", "role", "observed_roles"}
@@ -1130,6 +1136,10 @@ class CognitiveState:
                                         neg.get("barrier_signals") or []),
                                     "preconditions": dict(
                                         neg.get("preconditions") or {}),
+                                    "encoding_families": list(
+                                        neg.get("encoding_families") or []),
+                                    "strategy_families": list(
+                                        neg.get("strategy_families") or []),
                                 }
                             notes.append(f"[NEG] {msg}")
         # 3) 模型对单格的显式声明（PASS/NEG/SKIP）：文本 SKIP 仅 deferred；PASS/NEG 仍需证据撑腰
@@ -1141,7 +1151,19 @@ class CognitiveState:
                 "method": ctx.get("method", ""),
             }) if ctx.get("endpoint") else ""
             cell_lookup = canonical_surface_key(ep)
-            bound = ctx if (ctx_lookup and cell_lookup == ctx_lookup) else {}
+            declaration_parts = str(ep or "").strip().split(None, 1)
+            declaration_has_method = (
+                len(declaration_parts) == 2
+                and declaration_parts[0].upper() in HTTP_METHOD_NAMES)
+            path_matches_ctx = (
+                bool(ctx_lookup)
+                and _norm_path(
+                    declaration_parts[1] if declaration_has_method else ep)
+                == _norm_path(str(ctx.get("endpoint") or "")))
+            bound = ctx if (
+                path_matches_ctx
+                and (not declaration_has_method or cell_lookup == ctx_lookup)
+            ) else {}
             exact_kwargs = {
                 "param": str(bound.get("param") or "").strip(),
                 "asset": bound.get("asset_id") or bound.get("asset") or "",
@@ -1474,7 +1496,8 @@ def harvest_evidence(workdir: pathlib.Path, authorized_hosts: list[str] | None =
         finding_path = pathlib.Path(item.get("path") or "")
         verdict = guardian_check_finding(
             item.get("finding") or {}, finding_path.parent,
-            authorized_hosts=(authorized_hosts if validation_context is None else None))
+            authorized_hosts=(authorized_hosts if validation_context is None else None),
+            context=validation_context)
         if verdict.result == ACCEPTED:
             guardian_items.append(item)
             accepted_paths.add(str(finding_path.resolve()))
@@ -1577,15 +1600,29 @@ def _parse_negative(txt: str, path: str) -> dict:
             preconditions = {}
     if not isinstance(preconditions, dict):
         preconditions = {}
+    encoding_families = fm.get("encoding_families") or fm.get("encodings") or []
+    if isinstance(encoding_families, str):
+        encoding_families = [
+            x.strip().lower() for x in re.split(r"[,，;；]", encoding_families)
+            if x.strip()
+        ]
+    strategy_families = fm.get("strategy_families") or fm.get("strategies") or []
+    if isinstance(strategy_families, str):
+        strategy_families = [
+            x.strip().lower() for x in re.split(r"[,，;；]", strategy_families)
+            if x.strip()
+        ]
     body = _body(txt)
     vector_hits = re.findall(r"\b(?:curl|probe|payload|vector)\b", body, re.I)
     response_hits = re.findall(r"\b(?:HTTP/1\.1|HTTP/2|status)\b|响应", body, re.I)
     response_count = len(response_hits)
     if not vectors:
         vectors = [x.lower() for x in vector_hits[:3]]
+    derived_encodings, derived_strategies = families_from_packets(
+        [{"vector": vector} for vector in vectors])
     return {
         "endpoint": fm.get("endpoint", ""),
-        "method": str(fm.get("method", "GET") or "GET").upper(),
+        "method": str(fm.get("method", "") or "").upper(),
         "param": str(fm.get("param", "") or "").strip(),
         "vuln": fm.get("vuln", "") or fm.get("type", ""),
         "reason": fm.get("reason", "已测，无可利用结果"),
@@ -1601,6 +1638,10 @@ def _parse_negative(txt: str, path: str) -> dict:
         "barrier_signals": barrier_signals,
         "preconditions": preconditions,
         "response_count": response_count,
+        "encoding_families": list(dict.fromkeys(
+            [*encoding_families, *derived_encodings])),
+        "strategy_families": list(dict.fromkeys(
+            [*strategy_families, *derived_strategies])),
     }
 
 
@@ -2299,7 +2340,7 @@ def _current_surface_ctx(state: "CognitiveState", cards: list[dict] | None,
     cell = nxt[0]
     surface = cell.get("surface") if isinstance(cell.get("surface"), dict) else {}
     endpoint = cell.get("endpoint", "")
-    method = str(surface.get("method") or cell.get("method") or "GET").upper()
+    method = str(surface.get("method") or cell.get("method") or "").upper()
     param = _cell_param(cell)
     params = [param] if param else []
     roles = surface.get("roles") or cell.get("needed_roles") or ["unknown"]
@@ -2389,7 +2430,7 @@ def _bind_proof_confirmed_findings(
             finding_key = canonical_surface_key({
                 "endpoint": finding.get("endpoint", ""),
                 "method": finding.get("method") or next(
-                    iter(finding.get("methods") or []), "GET"),
+                    iter(finding.get("methods") or []), ""),
             })
             wanted_vc = {
                 str(value).lower()
@@ -2400,7 +2441,7 @@ def _bind_proof_confirmed_findings(
             for candidate in candidate_ledger.candidates:
                 candidate_key = canonical_surface_key({
                     "endpoint": candidate.get("endpoint", ""),
-                    "method": candidate.get("method", "GET"),
+                    "method": candidate.get("method", ""),
                 })
                 candidate_vc = {
                     str(value).lower()
@@ -2557,8 +2598,12 @@ def _merge_unresolved_records(
         item = dict(raw)
         if str(item.get("method") or "").strip():
             continue
-        surface_key = canonical_surface_key(item)
-        _ignored_method, _, endpoint = surface_key.partition(" ")
+        endpoint = str(
+            item.get("endpoint") or item.get("path") or item.get("url") or ""
+        ).strip()
+        parts = endpoint.split(None, 1)
+        if len(parts) == 2 and parts[0].upper() in HTTP_METHOD_NAMES:
+            endpoint = parts[1]
         if not endpoint:
             continue
         assets = surface_assets(item, fallback_asset)
@@ -2646,15 +2691,36 @@ def _apply_project_cells(
             })
             restored += 1
         elif status == "not_vulnerable":
-            cell.update({
-                "state": NEGATIVE_WITH_EVIDENCE,
-                "reason": "inherited depth-sufficient exact project negative",
-                "evidence": project_state_path,
-                "negative_depth_checked": True,
-                "inherited_from_project_state": True,
-                "inherited_from_blackboard": True,
-            })
-            restored += 1
+            if is_input_validation_cell({
+                    **surface, **cell,
+                    "vuln_class": cell.get("vuln", "")}):
+                cell.update({
+                    "state": SHALLOW_NEGATIVE,
+                    "reason": "cross-stage input negative requires a distinct retest",
+                    "negative_depth_checked": False,
+                    "cross_stage_prior_negative": {
+                        "source_run": prior.get("source_run", ""),
+                        "negative_vectors": list(prior.get("negative_vectors") or []),
+                        "negative_encoding_families": list(
+                            prior.get("negative_encoding_families") or []),
+                        "negative_strategy_families": list(
+                            prior.get("negative_strategy_families") or []),
+                    },
+                    "next_actions": [
+                        *list(cell.get("next_actions") or []),
+                        "retest with a new encoding family and a new injection strategy",
+                    ],
+                })
+            else:
+                cell.update({
+                    "state": NEGATIVE_WITH_EVIDENCE,
+                    "reason": "inherited depth-sufficient exact project negative",
+                    "evidence": project_state_path,
+                    "negative_depth_checked": True,
+                    "inherited_from_project_state": True,
+                    "inherited_from_blackboard": True,
+                })
+                restored += 1
         elif (status == "not_applicable" and prior.get("reason_code")
               and prior.get("refutation")):
             cell.update({
@@ -2953,7 +3019,8 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                 execution_provenance: dict | None = None,
                 planning_mode: str = "legacy_risk",
                 planning_lineage: dict | None = None,
-                identity_readiness: dict | None = None) -> dict:
+                identity_readiness: dict | None = None,
+                continuation_input: dict | None = None) -> dict:
     """verify_fn(report_md) -> verify.VerifyResult，可选：对 accepted 报告做确定性重放复验。
     owned_ids：本会话自有对象 id，改删类命中其中则自动放行。
     confirm_policy："halt"=改删他人/未知 id 时熔断停手交人工(默认)；"allow"=放行(信任场景)。
@@ -2965,6 +3032,17 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
       ③ 危险闸 block / needs_confirm。矩阵为空时退化：首个终态标记即 _conclude。"""
     sid = pathlib.Path(workdir).name
     wd = pathlib.Path(workdir); wd.mkdir(parents=True, exist_ok=True)
+    continuation_path: pathlib.Path | None = None
+    if continuation_input:
+        if (continuation_input.get("trust_level") != "diagnostic_only"
+                or continuation_input.get("authority_trusted") is not False
+                or any(item.get("source") != "v9_host_continuation"
+                       for item in continuation_input.get("items") or [])):
+            raise ValueError("continuation input is not a Host diagnostic projection")
+        continuation_path = wd / "continuation-input.json"
+        atomic_write_json(
+            continuation_path, continuation_input,
+            root=wd, reject_leaf_symlink=True)
     ev_dir = str(wd.resolve())                            # 钉死的落盘绝对目录
     inventory_path = wd / "inventory.json"                # P1-3：endpoint 台账（与 coverage-ledger.json 同目录）
     state_path = wd / "state.json"
@@ -3126,6 +3204,15 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
     # v8.6 product contract: explicit target domains win; otherwise choose
     # from cumulative blackboard coverage instead of repeating the last scope.
     _bb_preload = project_store.blackboard_view()
+    if continuation_input:
+        _bb_preload = {
+            **_bb_preload,
+            "intents": [
+                *[dict(item) for item in continuation_input.get("items") or []],
+                *[dict(item) for item in _bb_preload.get("intents") or []
+                  if isinstance(item, dict)],
+            ],
+        }
     target_domains = select_target_domains(_bb_preload, target_domains)
     # v8.5.1: Domain soft priority — no longer drops endpoints.
     # plan_surfaces annotates domain_scores + _domain_priority.
@@ -3374,7 +3461,7 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                 continue
             surface = cell.get("surface") if isinstance(cell.get("surface"), dict) else {}
             admitted_cells.append({
-                "identity_version": 2,
+                "identity_version": 3,
                 "cell_key": _cell_budget_key(cell),
                 "surface_id": surface.get("surface_id", ""),
                 "feature_id": surface.get("feature_id", ""),
@@ -3421,15 +3508,17 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                 "intent_budget": int(intent_budget or 0),
                 "allowed_cell_count": len(admitted_cells),
             },
-            identity_version=2,
+            identity_version=3,
         )
     planning_artifacts: dict[str, pathlib.Path] = {}
+    if continuation_path is not None:
+        planning_artifacts["continuation-input.json"] = continuation_path
     if normalized_planning_mode == "threat_model":
-        planning_artifacts = {
+        planning_artifacts.update({
             "feature-graph.json": wd / "feature-graph.json",
             "threat-model.json": wd / "threat-model.json",
             "identity-readiness.json": wd / "identity-readiness.json",
-        }
+        })
         if (wd / "discovery-evidence.json").is_file():
             planning_artifacts["discovery-evidence.json"] = (
                 wd / "discovery-evidence.json")
@@ -4047,7 +4136,7 @@ def _build_project_coverage(biz_graph: BusinessGraph, ledger_surfaces: list[dict
     for surface in ledger_surfaces or []:
         key = canonical_surface_key({
             "endpoint": surface.get("endpoint", ""),
-            "method": surface.get("method", "GET"),
+            "method": surface.get("method", ""),
         })
         if key:
             counts = current_cells.setdefault(key, {"total": 0, "closed": 0})
@@ -4249,7 +4338,7 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
                     sufficient, _missing = negative_sufficient(surface, neg_obj, cards)
                     lookup = canonical_surface_key({
                         "endpoint": surface.get("endpoint", ""),
-                        "method": surface.get("method", "GET"),
+                        "method": surface.get("method", ""),
                     })
                     vuln_class = (surface.get("vuln_class")
                                   or surface.get("legacy_vuln") or "")
@@ -4361,7 +4450,16 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
                 needs_cells.append(rec)
             if cell.get("state") == SHALLOW_NEGATIVE:
                 shallow_negative_cells.append(rec)
+    intuition_exploration = (
+        validate_intuition_exploration(wd)
+        if marker == "LOW_ROI" else {
+            "ok": True, "reasons": [], "artifact_hashes": {},
+            "directions": [], "required": False,
+        }
+    )
     if status == "low_roi":
+        if not intuition_exploration.get("ok"):
+            status = "incomplete"
         if open_risk_cells:
             status = "incomplete"
         elif needs_cells:
@@ -4373,7 +4471,7 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
                 _ep = s.get("endpoint", "")
                 if _ep:
                     _surface_key = canonical_surface_key({
-                        "endpoint": _ep, "method": s.get("method", "GET")})
+                        "endpoint": _ep, "method": s.get("method", "")})
                     _cov_matrix[_surface_key] = {
                         "tested": s.get("status") not in ("untested", "not_tested")
                     }
@@ -4490,6 +4588,7 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
         "shallow_negative_cells": shallow_negative_cells,
         "open_next_actions_count": open_next_actions_count,
         "saturation_reached": saturation_reached,
+        "intuition_exploration": intuition_exploration,
         # v6.1: 候选台账统计 + 四类缺口清单
         "candidate_stats": (candidate_ledger.stats() if candidate_ledger else {}),
         "coverage_gaps": coverage_gaps,
@@ -4529,9 +4628,11 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
     for neg in evidence.get("negatives", []):
         _ep = neg.get("endpoint", "")
         _vc = neg.get("vuln", neg.get("vuln_class", ""))
+        if str(neg.get("method") or "").upper() not in HTTP_METHOD_NAMES:
+            continue
         _negative_cell = {
             "endpoint": _ep,
-            "method": neg.get("method", "GET"),
+            "method": neg.get("method", ""),
             "param": neg.get("param", ""),
             "vuln": _vc,
             "risk_tags": [],
@@ -4543,16 +4644,16 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
         _run_negatives.append({
             "surface_key": (
                 runtime_cell_key(
-                    _negative_assets[0], method=neg.get("method", "GET"),
+                    _negative_assets[0], method=neg.get("method", ""),
                     path=_ep, param=neg.get("param", ""),
                     actor_role=_negative_roles[0], vuln_class=_vc)
                 if _negative_assets else
-                f"{canonical_surface_key({'endpoint': _ep, 'method': neg.get('method', 'GET')})}"
+                f"{canonical_surface_key({'endpoint': _ep, 'method': neg.get('method', '')})}"
                 f"::{neg.get('param', '')}::{_vc}"
             ),
             "asset_id": _negative_assets[0] if _negative_assets else "",
             "endpoint": _ep,
-            "method": neg.get("method", "GET"),
+            "method": neg.get("method", ""),
             "param": neg.get("param", ""),
             "vuln_class": _vc,
             "role_scope": _negative_roles[0],
@@ -4567,6 +4668,8 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
             "roles": _negative_roles,
             "barrier_signals": list(neg.get("barrier_signals") or []),
             "preconditions": dict(neg.get("preconditions") or {}),
+            "encoding_families": list(neg.get("encoding_families") or []),
+            "strategy_families": list(neg.get("strategy_families") or []),
         })
 
     # v8.5 compatibility path.  v8.8 runtime runs use project_state.json below

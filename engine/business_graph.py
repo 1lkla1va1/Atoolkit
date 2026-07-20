@@ -214,7 +214,9 @@ class BusinessGraph:
 
     def update_from_fact(self, fact_data: dict[str, Any]) -> None:
         """Update the graph when a confirmed Fact is recorded."""
-        method = fact_data.get("method", "GET").upper()
+        method = str(fact_data.get("method") or "").upper()
+        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+            return
         endpoint = fact_data.get("endpoint", "")
         key = canonical_surface_key({"method": method, "endpoint": endpoint})
 

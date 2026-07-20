@@ -48,7 +48,7 @@ def test_schema1_migration_creates_exact_private_durable_backup(tmp_path):
     backup = tmp_path / "project_state.pre-v89.schema1.json"
     assert backup.read_bytes() == source
     assert stat.S_IMODE(backup.stat().st_mode) == 0o600
-    assert migrated["schema_version"] == 2
+    assert migrated["schema_version"] == 3
     assert migrated["migrated_from_schema"] == 1
     assert migrated["schema1_backup_sha256"] == hashlib.sha256(source).hexdigest()
 
@@ -158,7 +158,7 @@ def test_schema1_backup_file_fsync_error_aborts_migration_and_is_retryable(
     monkeypatch.setattr(os, "open", original_open)
     monkeypatch.setattr(os, "fsync", original_fsync)
     migrated = store.commit_run("run-migrate", run_summary={"status": "complete"})
-    assert migrated["schema_version"] == 2
+    assert migrated["schema_version"] == 3
 
 
 def test_project_state_directory_fsync_error_is_not_swallowed_and_retry_is_idempotent(

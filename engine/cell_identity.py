@@ -17,7 +17,7 @@ except ImportError:  # pragma: no cover - script execution fallback
     from project_state import canonical_asset, canonical_project_cell_key
 
 
-CELL_IDENTITY_VERSION = 2
+CELL_IDENTITY_VERSION = 3
 _METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 
 
@@ -122,9 +122,12 @@ class CellIdentity:
         vuln_class: str = "",
         **metadata: Any,
     ) -> "CellIdentity":
+        normalized_method = str(method or "").strip().upper()
+        if normalized_method not in _METHODS:
+            raise ValueError("exact cell identity requires an explicit HTTP method")
         return cls(
             asset_id=canonical_asset(asset),
-            method=str(method or "GET").strip().upper() or "GET",
+            method=normalized_method,
             path=str(path or "").strip(),
             param=str(param or "").strip(),
             actor_role=str(actor_role or "unknown").strip().lower() or "unknown",

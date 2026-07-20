@@ -40,6 +40,8 @@ from engine.engine_planning import (EnginePlanningError, accept_prebuilt_plan,
                                     create_planning_session,
                                     promote_planning_artifacts,
                                     run_planning_model)  # noqa: E402
+from engine.continuation import (ContinuationError,
+                                 load_prior_continuation)  # noqa: E402
 from engine.version import __version__  # noqa: E402
 
 
@@ -357,43 +359,8 @@ def _print_open_high_value(res: dict):
     for s in hv_open:
         roles = ",".join(s.get("roles", [])) or "-"
         tags = ",".join(s.get("risk_tags", [])) or "-"
-        print(f"  - {s.get('endpoint', '')} | method={s.get('method', 'GET')} "
+        print(f"  - {s.get('endpoint', '')} | method={s.get('method') or 'unknown'} "
               f"| role={roles} | risk_tag={tags}")
-
-
-def _map_finding_for_summary(f: dict, idx: int) -> dict:
-    """aggregate_findings 的 finding（root_cause/affected_role 命名）→ summary.json 行，
-    补 engine.benchmark_eval.load_findings 期望的键（class/vuln_class/roles/id/endpoint）。
-    不改 aggregate_findings 本身的输出，只在这份产物里做字段映射：class=root_cause、
-    roles=[affected_role]、id=finding_key。method/params 留空（benchmark_eval 对空 method/params
-    取宽容匹配），endpoint 保留 aggregate_findings 的可读原值。"""
-    role = f.get("affected_role")
-    facets = f.get("facets") or []
-    endpoint = f.get("endpoint", "")
-    return {
-        "id": f.get("finding_key") or f"finding-{idx:03d}",
-        "endpoint": endpoint,
-        "endpoints": [endpoint] if endpoint else [],
-        "method": "",
-        "methods": [],
-        "params": [],
-        "evidence_file": "",
-        "class": f.get("root_cause", ""),
-        "vuln_class": f.get("root_cause", ""),
-        "roles": ([role] if role and role != "default" else []),
-        "severity": f.get("severity", ""),
-        "title": facets[0] if facets else "",
-        # 保留原始聚合信息（不影响 benchmark_eval 读取，仅供溯源）
-        "root_cause": f.get("root_cause", ""),
-        "affected_role": role,
-        "facets": facets,
-        "primary_impact": f.get("primary_impact", ""),
-        "report_count": f.get("report_count", 0),
-        "finding_key": f.get("finding_key", ""),
-        "acceptance_status": "untrusted_legacy",
-        "proof_status": "pending",
-        "claim_kind": "legacy_report",
-    }
 
 
 _SUMMARY_UUID_RE = re.compile(
@@ -463,6 +430,13 @@ def _inventory_records_from_endpoint_arg(arg: str) -> tuple[list, list[dict]]:
         key = canonical_surface_key(
             {"endpoint": endpoint, "method": method}, default_method="")
         normalized_method, _, path = key.partition(" ")
+        if not path:
+            raw = str(endpoint or "").strip()
+            parsed = urlsplit(raw)
+            path = (
+                parsed.path + (("?" + parsed.query) if parsed.query else "")
+                if parsed.scheme in {"http", "https"} else raw
+            )
         return (key if normalized_method else ""), normalized_method, path
 
     from engine.surface_key import canonical_surface_key
@@ -1177,7 +1151,8 @@ def _run_self_check() -> int:
             workdir=str(tmp),
             authorized_hosts=["t.example"],
             max_turns=1,
-            endpoints=[{"endpoint": "/api/search", "params": ["keyword"]}],
+            endpoints=[{"endpoint": "/api/search", "method": "GET",
+                        "params": ["keyword"]}],
             vuln_classes=["SQLi"],
             verbose=False,
         )
@@ -1363,7 +1338,6 @@ def _run_self_check() -> int:
         from engine.surface_key import canonical_surface_key, is_canonical, canonical_cell_key
         expected = "GET /api/refund"
         forms = [
-            "/api/refund",
             "GET /api/refund",
             {"endpoint": "/api/refund", "method": "GET"},
             {"endpoint": "GET /api/refund"},
@@ -1374,15 +1348,16 @@ def _run_self_check() -> int:
         for f in forms:
             ck = canonical_surface_key(f)
             assert ck, f"canonical_surface_key({f!r}) 返回空"
-        # The first 5 forms (excluding POST variants) should produce GET /api/refund
-        assert canonical_surface_key(forms[0]) == expected, f"裸路径未归一: {canonical_surface_key(forms[0])}"
-        assert canonical_surface_key(forms[1]) == expected, f"METHOD /path 未保持: {canonical_surface_key(forms[1])}"
-        assert canonical_surface_key(forms[2]) == expected, f"dict+method 未归一: {canonical_surface_key(forms[2])}"
-        assert canonical_surface_key(forms[3]) == expected, f"dict endpoint含method 未剥前缀: {canonical_surface_key(forms[3])}"
-        assert canonical_surface_key(forms[4]) == "POST /api/refund", f"dict path+method=POST 未归一: {canonical_surface_key(forms[4])}"
-        assert canonical_surface_key(forms[5]) == expected, f"url+method 未剥host: {canonical_surface_key(forms[5])}"
-        assert canonical_surface_key(forms[6]) == "POST /api/refund", (
-            f"dict 同时含 method+endpoint(含method) 双重method: {canonical_surface_key(forms[6])}")
+        # Identity helpers must never guess GET for a bare path.
+        assert canonical_surface_key("/api/refund") == "", (
+            f"裸路径不应猜测 GET: {canonical_surface_key('/api/refund')}")
+        assert canonical_surface_key(forms[0]) == expected, f"METHOD /path 未保持: {canonical_surface_key(forms[0])}"
+        assert canonical_surface_key(forms[1]) == expected, f"dict+method 未归一: {canonical_surface_key(forms[1])}"
+        assert canonical_surface_key(forms[2]) == expected, f"dict endpoint含method 未剥前缀: {canonical_surface_key(forms[2])}"
+        assert canonical_surface_key(forms[3]) == "POST /api/refund", f"dict path+method=POST 未归一: {canonical_surface_key(forms[3])}"
+        assert canonical_surface_key(forms[4]) == expected, f"url+method 未剥host: {canonical_surface_key(forms[4])}"
+        assert canonical_surface_key(forms[5]) == "POST /api/refund", (
+            f"dict 同时含 method+endpoint(含method) 双重method: {canonical_surface_key(forms[5])}")
         # is_canonical
         assert is_canonical("GET /api/refund"), "is_canonical 应接受 GET /api/refund"
         assert not is_canonical("/api/refund"), "is_canonical 应拒绝裸路径"
@@ -1390,7 +1365,7 @@ def _run_self_check() -> int:
         # canonical_cell_key
         ck = canonical_cell_key("GET /api/refund", "业务逻辑")
         assert ck == "GET /api/refund × 业务逻辑", f"canonical_cell_key 错误: {ck}"
-        print("  断言22 ✅ canonical_surface_key 统一归一（6种输入形态 + is_canonical + cell_key）")
+        print("  断言22 ✅ canonical_surface_key 显式方法归一 + 裸路径 fail-closed")
 
     # ── rc3 端到端 dry-run fixture（断言23-29 共用） ──────────────────────
     def _run_budget_dryrun(fixture_dir: pathlib.Path) -> dict:
@@ -1410,7 +1385,7 @@ def _run_self_check() -> int:
             workdir=str(_wd),
             authorized_hosts=["t.example"],
             max_turns=20,
-            endpoints=["/api/user/login", "/api/refund"],
+            endpoints=["POST /api/user/login", "POST /api/refund"],
             target_domains=["auth", "txn"],
             surface_budget=1,
             intent_budget=2,
@@ -1463,10 +1438,10 @@ def _run_self_check() -> int:
         print(f"  断言24 ✅ intent_budget=2 限制 carryover_intents={len(carryover)} ≤ 2")
 
     def _assert25():
-        """v8.8 端到端: 精确角色深阴性 run2 继承 not_vulnerable"""
+        """v9.1 端到端: 输入类深阴性跨阶段必须重开并要求多样性。"""
         import tempfile, json
         from engine.orchestrator import NEGATIVE_WITH_EVIDENCE, run_session, MockAdapter
-        from engine.project_state import ProjectStateStore
+        from engine.project_state import ProjectStateStore, verify_project_evidence
         _fdir = pathlib.Path(tempfile.mkdtemp(prefix="selfcheck_deep_")).resolve()
         try:
             _proj = _fdir / "deep_proj"
@@ -1474,7 +1449,7 @@ def _run_self_check() -> int:
             _neg_dir = _proj / "sessions" / "run1"
             _neg_dir.mkdir(parents=True, exist_ok=True)
             (_neg_dir / "neg.md").write_text("depth evidence", encoding="utf-8")
-            ProjectStateStore(
+            _committed = ProjectStateStore(
                 _proj, project_scope=["https://t.example"]
             ).commit_run(
                 "run1",
@@ -1486,9 +1461,16 @@ def _run_self_check() -> int:
                     "asset": "https://t.example", "endpoint": "/api/search",
                     "method": "GET", "role_scope": "user",
                     "vuln_class": "SQLi", "vectors_tried": 5,
-                    "depth_sufficient": True, "evidence_refs": ["neg.md"],
+                    "depth_sufficient": True,
+                    "evidence_refs": ["neg.md"],
                 }],
             )
+            assert _committed.get("cell_registry"), (
+                f"self-check fixture 未生成 project cell: {_committed.get('negatives')}")
+            _prior_cell = next(iter(_committed["cell_registry"].values()))
+            assert verify_project_evidence(
+                _proj, _prior_cell.get("evidence_refs") or [],
+                _prior_cell.get("evidence_hashes") or {}), _prior_cell
             _wd = _proj / "sessions" / "run2"
             _wd.mkdir(parents=True, exist_ok=True)
             res = run_session(
@@ -1498,21 +1480,30 @@ def _run_self_check() -> int:
                 core_skill="占位",
                 workdir=str(_wd),
                 authorized_hosts=["t.example"],
-                max_turns=3,
+                max_turns=0,  # 只验证启动时继承，不让 MockAdapter 改写状态
                 endpoints=[{"endpoint": "/api/search", "method": "GET",
                             "roles": ["user"]}],
                 vuln_classes=["SQLi"],
                 surface_budget=0,  # 不限预算，测继承
                 verbose=False,
             )
-            # 精确角色深阴性应在 run2 继承为 negative_with_evidence。
+            # SQLi 属输入类；即使精确角色深阴性，run2 也必须重开，不能静默继承闭格。
             mtx = res.get("state", {}).get("matrix", {})
-            _found_skip = any(
-                c.get("state") == NEGATIVE_WITH_EVIDENCE for c in mtx.values()
-                if "search" in c.get("endpoint", ""))
-            assert _found_skip, (
-                "精确角色深阴性 negative 在 run2 未继承为 not_vulnerable")
-            print("  断言25 ✅ 精确角色深阴性 run2 继承 not_vulnerable")
+            _search_cells = [
+                c for c in mtx.values()
+                if "search" in c.get("endpoint", "")
+            ]
+            assert _search_cells, "run2 未 seed /api/search 矩阵格"
+            assert not any(c.get("state") == NEGATIVE_WITH_EVIDENCE for c in _search_cells), (
+                "输入类深阴性不应跨阶段直接继承闭格")
+            assert any(c.get("state") == "shallow_negative" for c in _search_cells), (
+                "输入类深阴性未重开: "
+                f"states={[c.get('state') for c in _search_cells]} "
+                f"project_keys={list((_committed.get('cell_registry') or {}).keys())} "
+                f"runtime_keys={list(mtx.keys())}")
+            assert any(c.get("cross_stage_prior_negative") for c in _search_cells), (
+                "重开格缺少 prior negative 元数据")
+            print("  断言25 ✅ 输入类深阴性 run2 重开并绑定跨阶段重测元数据")
         finally:
             import shutil
             shutil.rmtree(_fdir, ignore_errors=True)
@@ -1548,7 +1539,7 @@ def _run_self_check() -> int:
                 workdir=str(_wd),
                 authorized_hosts=["t.example"],
                 max_turns=1,   # 避免 MockAdapter 批量 SKIP 干扰继承验证
-                endpoints=["/api/user"],
+                endpoints=["GET /api/user"],
                 surface_budget=0,
                 verbose=False,
             )
@@ -1806,12 +1797,19 @@ def main():
     ap.add_argument("--sid", default="", help="会话 ID（默认按时间生成）")
     ap.add_argument("--resume", action="store_true",
                     help="崩溃恢复：仅复用尚未进入 finalizer 的 --sid；已收口 Run 必须新开 sid")
+    ap.add_argument("--continue-from-run", default="",
+                    help="从已收口 Run 的确定性 next-run agenda 启动新 Run；"
+                         "仅诊断续跑，不提升 authority/submission 资格")
     ap.add_argument("--dry-run", action="store_true", help="用 MockAdapter，不接模型/网络")
     ap.add_argument("--self-check", action="store_true",
                     help="自检门：临时生成 fixture 跑断言（不接模型/网络），全过 exit 0、失败 exit 1；"
                          "独立于 --target/--authz，可不带这两参数")
     ap.add_argument("--doctor", action="store_true",
                     help="只读检查版本、AGENTS/Skill Mode 指令解析与 /src 别名，不启动测试")
+    ap.add_argument("--workspace-root", default="",
+                    help="当前 Codex/Skill 工作区根目录；默认使用启动命令的 cwd")
+    ap.add_argument("--allow-foreign-src", action="store_true",
+                    help="显式确认 ~/.codex/prompts/src.md 指向其他项目（默认严格拒绝）")
     # v6.1 §10.3 flags
     ap.add_argument("--loop-mode", default="recall-first",
                     choices=["recall-first", "coverage-first"],
@@ -1845,8 +1843,14 @@ def main():
     # --self-check：临时生成 fixture 跑断言，不接模型/网络，独立于 --target/--authz。
     if args.self_check:
         return _run_self_check()
+    active_workspace = pathlib.Path(args.workspace_root or pathlib.Path.cwd()).resolve()
     if args.doctor:
-        result = doctor(ROOT)
+        result = doctor(
+            ROOT,
+            workspace_root=active_workspace,
+            strict_runtime=True,
+            allow_foreign_src=args.allow_foreign_src,
+        )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["ok"] else 1
     # 非 self-check：--target/--authz 仍为必填（argparse 层已放宽为非 required 以放行 --self-check）。
@@ -1854,6 +1858,8 @@ def main():
         ap.error("--target 与 --authz 为必填（自检门用 --self-check，可不带这两参数）")
     if args.target_fingerprint and args.target_fingerprint_file:
         ap.error("--target-fingerprint 与 --target-fingerprint-file 不能同时使用")
+    if args.resume and args.continue_from_run:
+        ap.error("--resume 与 --continue-from-run 语义不同，不能同时使用")
     if bool(args.feature_graph) != bool(args.threat_model):
         ap.error("--feature-graph 与 --threat-model 必须成对提供")
     if not args.dry_run and not args.allow_unrestricted_egress:
@@ -1861,6 +1867,24 @@ def main():
             "当前 Codex backend 无法证明命令执行前的 host/path 出站约束；"
             "live run 默认拒绝。若明确接受风险，传 --allow-unrestricted-egress"
         )
+    if not args.dry_run:
+        runtime_check = doctor(
+            ROOT,
+            workspace_root=active_workspace,
+            strict_runtime=True,
+            allow_foreign_src=args.allow_foreign_src,
+        )
+        if not runtime_check["ok"]:
+            workspace_status = (
+                runtime_check.get("checks", {}).get("workspace_agents", {}).get("status")
+            )
+            src_status = runtime_check.get("checks", {}).get("src_alias", {}).get("status")
+            ap.error(
+                "v9.0.1 runtime preflight failed: "
+                f"workspace AGENTS={workspace_status}, /src={src_status}. "
+                "先运行 --doctor 修复工作区绑定；仅确认其他项目 /src 无影响时可传 "
+                "--allow-foreign-src"
+            )
     try:
         explicit_base_path = normalize_explicit_base_path(args.base_path)
     except ValueError as exc:
@@ -1952,6 +1976,16 @@ def main():
     authorization_assurance = (
         "dry_run_no_network" if args.dry_run else "unrestricted_user_accepted"
     )
+    continuation_input: dict | None = None
+    if args.continue_from_run:
+        try:
+            continuation_input = load_prior_continuation(
+                args.continue_from_run,
+                primary_target=args.target,
+                authorized_scopes=hosts,
+            )
+        except ContinuationError as exc:
+            ap.error(f"无法承接 prior Run: {exc}")
 
     # 覆盖矩阵的攻击面来源（支柱 2）：
     #   ① --endpoints：文件(每行一个，# 注释) 或逗号分隔
@@ -1968,6 +2002,21 @@ def main():
         plan_surfaces(endpoint_inv_records) if endpoint_inv_records else list(endpoints)
     )  # parameter-aware dict surfaces for --endpoints + recon expansion below
     inventory_records: list[dict] = list(endpoint_inv_records)
+    if continuation_input:
+        continuation_records = [
+            {
+                "endpoint": str(item.get("target_endpoint") or ""),
+                "method": str(item.get("target_method") or "").upper(),
+                "params": list(item.get("target_params") or []),
+                "roles": list(item.get("target_roles") or []),
+                "vuln_class": str(item.get("vuln_class") or ""),
+                "source": "v9_host_continuation",
+                "source_run": continuation_input.get("source_run", ""),
+            }
+            for item in continuation_input.get("items") or []
+        ]
+        inventory_records.extend(continuation_records)
+        inventory.extend(plan_surfaces(continuation_records))
     from engine.surface import is_saturated
     if args.recon_dir:
         from engine.surface import bootstrap
@@ -2007,7 +2056,7 @@ def main():
     # 正式覆盖跑统一落 endpoint 台账：--endpoints-only 也必须有 inventory.json，
     # 这样 session_gate 能解释 endpoint 来源，报告引用未登记面也能被拦住。
     unresolved_inventory: list[dict] = []
-    if args.endpoints or args.recon_dir:
+    if args.endpoints or args.recon_dir or continuation_input:
         inv_path = wd / "inventory.json"
         existing_discovered = []
         existing_unresolved = []
@@ -2356,6 +2405,8 @@ def main():
         src_note = "endpoints"
     elif args.ad_hoc:
         src_note = "ad-hoc 退化(首洞即结)"
+    elif continuation_input:
+        src_note = f"continuation({continuation_input.get('count', 0)})"
     elif project_inventory_count:
         src_note = f"project-state({project_inventory_count})"
     else:
@@ -2386,6 +2437,8 @@ def main():
         "vuln_classes": (args.vuln_class or None),
         "resume": args.resume,
     }
+    if "continuation_input" in inspect.signature(run_session).parameters:
+        run_kwargs["continuation_input"] = continuation_input
     if "enable_auth_flow_column" in inspect.signature(run_session).parameters:
         run_kwargs["enable_auth_flow_column"] = (
             True if args.enable_auth_flow_column else None

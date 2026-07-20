@@ -109,6 +109,28 @@ CHAINABLE_GROUPS: frozenset[str] = frozenset({
     "auth", "business", "idor", "sqli", "rce",
 })
 
+# Exact coverage identity aliases.  Unlike ``VULN_SYNONYMS`` these aliases do
+# not collapse sibling security boundaries merely because they share a
+# knowledge-routing family.
+EXACT_VULN_ALIASES: dict[str, str] = {
+    "xss": "xss", "跨站脚本": "xss",
+    "越权/idor": "idor", "认证绕过/枚举": "auth",
+    "命令执行/rce": "rce", "文件读取/穿越": "file",
+    "存储型xss": "stored-xss", "stored-xss": "stored-xss",
+    "反射型xss": "reflected-xss", "reflected-xss": "reflected-xss",
+    "domxss": "dom-xss", "dom-xss": "dom-xss",
+    "idor": "idor", "越权": "idor", "业务逻辑越权": "idor",
+    "对象级授权缺失": "idor", "bac": "idor",
+    "水平越权": "horizontal-idor",
+    "horizontal-privilege-escalation": "horizontal-idor",
+    "垂直越权": "vertical-idor",
+    "vertical-privilege-escalation": "vertical-idor",
+    "privilege-escalation": "vertical-idor",
+    "sql注入": "sqli", "sql-injection": "sqli", "sql": "sqli", "sqli": "sqli",
+    "认证绕过": "auth-bypass", "auth-bypass": "auth-bypass",
+    "验证码绕过": "captcha-bypass", "captcha-bypass": "captcha-bypass",
+}
+
 
 # ---------------------------------------------------------------------------
 # Normalization functions
@@ -151,6 +173,14 @@ def norm_vc(vc: str) -> str:
 
     # 4. Fallback
     return raw_lower
+
+
+def exact_vc(vc: str) -> str:
+    """Return a stable exact vulnerability-class token for cell identity."""
+    raw = _squash_ws(str(vc or "")).lower()
+    if not raw:
+        return ""
+    return EXACT_VULN_ALIASES.get(raw, raw)
 
 
 def norm_vc_matrix(vc: str) -> str:

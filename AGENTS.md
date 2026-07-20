@@ -28,11 +28,13 @@
 
 ---
 
-## 0.0 运行身份与跨 Run 真值（v9.0）
+## 0.0 运行身份与跨 Run 真值（v9.1.0）
 
+- **当前工作区指令绑定**：Engine/Direct CLI 首先校验当前 workspace `AGENTS.md` 与本项目 `AGENTS.md` 的 SHA-256 完全一致；缺失、软链接或版本漂移时必须在首个网络动作前停止。不得因为仓库内存在新版文件就假定 agent 实际加载了它。
 - **首个网络动作之前**，authority-eligible Run 必须已有 host-owned `run_manifest.json` 与 frozen `run_plan.json`。Engine Mode 由父进程创建；Wrapped Skill 由外部 `engine.skill_wrapper` 创建。Direct/Qoder 模式无法建立独立 authority：fresh black-box recon 前先运行 `engine.skill_runtime preflight`，Phase 0 后、攻击测试前再运行 `engine.skill_runtime init` 生成 `authority_trusted=false` 的 diagnostic ledger/queue；它不得改写 ProjectState 或声称 verified delivery。
-- `<project>/project_state.json`（schema 2）是跨 Run 唯一权威。`blackboard.json`、`business_graph.json`、`run_scope.json` 和摘要均为派生视图，禁止反向覆盖项目真值。
-- 继承闭格必须精确匹配 `origin + namespace + METHOD/path + param/location + actor/subject/object + vuln_class`；unknown role 不是通配符。未知 method 的新路径进入 unresolved queue，不得默认 GET。
+- `<project>/project_state.json`（schema 3）是跨 Run 唯一权威。`blackboard.json`、`business_graph.json`、`run_scope.json` 和摘要均为派生视图，禁止反向覆盖项目真值。schema 1/2 的聚合 cell 只保留为 stale 待复测证据，不得自动闭合 schema 3 exact-class cell。
+- 继承闭格必须精确匹配 `origin + namespace + METHOD/path + param/location + actor/subject/object + exact vuln_class`；知识路由的语义家族不得用于闭格 key。unknown role 不是通配符。未知 method 的新路径进入 unresolved queue，不得默认 GET。
+- 当前 diagnostic Run 可用显式 `--continue-from-run` 消费上一 Run 经 validation digest、归因和 agenda 重算后的待办；`continuation-input.json` 必须绑定到新 manifest，且只能恢复当前 Run 调度，不能直接改 ProjectState 或提升 submission eligibility。
 - 项目 Finding 注册表只接收确定性校验后的 `accepted + proof_status=confirmed + claim.kind=root_finding`。标题、散文和链式假设均不能作为去重或闭格依据。
 
 ## 0.1 威胁建模计划与报告所有权（v8.11）
@@ -60,6 +62,7 @@
 - `execution-progress.json` 和 `execution-queue.json` 由 Host reducer 重算。用户枚举需消息/时间/行为通道，跨身份需 owner/alternate/object marker，交易需合法基线/边界/state delta，持久化输入需 submit/read-back/render，SSRF/文件写入需结果证明；缺任一义务的阴性保持 `shallow_negative/exploring`。
 - `empty_dataset/object_absent/session_expired/format_unresolved/missing_role/challenge_unsolved/WAF` 先进入可恢复 blocker 或浅阴性恢复队列，不得积累请求数量后写成 `not_vulnerable`。Finding 被 proof validator 拒绝时优先返工 proof，不得只在最终散文里保留。
 - Event 只证明实验已发生并驱动下一步，不能替代 canonical Finding 或 negative envelope。accepted Finding 才能关闭阳性；阴性同时通过 depth gate 与 execution obligations 才能关闭。
+- Direct checkpoint 中任一 proof-rejected Finding、ingestion error 或 agent 写入 finalizer 保留产物，均为必须返工的显式失败项；不得只保留 Markdown 结论，也不得标记 `report_ready`。
 - 运行中新 endpoint/param 绑定证据后只进入 `execution-backlog.json`，disposition 固定 `next_run_required`；当前 Run 不得用动态发现改写 v8.12 frozen denominator。
 
 ## 0.4 结果归因、跨 Run 续航与提交资格（v9.0）
@@ -248,7 +251,7 @@ Phase 0 侦察应优先覆盖本轮域内的端点——其他域的端点记录
 
 ### 跨阶段阴性重测
 
-多阶段测试架构下，前一阶段标记为 `not_vulnerable` 的输入验证类 surface，后一阶段必须使用不同的 payload 编码格式和注入策略重新测试。前阶段的阴性记录（含已测试 payload 列表和响应模式）是后阶段的测试起点，不是终点。
+多阶段/跨 Run 测试下，前一阶段标记为 `not_vulnerable` 的输入验证类 surface，后一阶段恢复为 `shallow_negative`，必须使用至少一个新的 payload 编码族和一个新的注入策略族重新测试。旧记录没有族元数据时，当前阶段至少证明两个编码族与两个策略族。前阶段阴性只是起点；final validator 会从物理 packet 重算族差异，模型文字或自报 `depth_sufficient` 不能闭格。
 
 **阴性落盘格式**：Skill Mode 使用 authoritative `negative_findings.json`；Markdown 仅作派生说明。每条阴性必须绑定 exact cell、请求/响应、actor/subject/object、向量、depth、evidence hash 与 source session。
 
@@ -365,6 +368,8 @@ Phase 0 侦察应优先覆盖本轮域内的端点——其他域的端点记录
 - 直觉探索中产生新发现同样生成 Fact 和后续 Intent
 
 唯一约束：每个探索方向必须有实际请求作为证据（不能只在推理中想象）。
+
+结束时必须写 `intuition-exploration.json`：`status=completed`，至少一个带稳定 ID、理由和 Run 内请求/响应 `evidence_refs` 的方向。LOW_ROI 缺失或证据无效时，runtime 与 shared finalizer 都会降为 incomplete。
 
 **直觉探索未完成时不得输出 LOW_ROI。** 本阶段是 LOW_ROI 的前置条件。
 

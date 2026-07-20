@@ -19,8 +19,12 @@ try:
         rejected_finding_surface_ids,
     )
     from ..host_policy import is_authorized_url, normalize_authorized_scopes
+    from ..exploration import validate_intuition_exploration
     from ..ledger import CoverageLedger
     from ..outcome import build_miss_attribution, build_next_run_agenda
+    from ..negative_retest import (families_from_packets,
+                                   has_cross_stage_diversity,
+                                   is_input_validation_cell)
     from ..run_authority import canonical_method_resolution_key
     from ..runtime_manifest import validate_manifest_binding
     from ..safe_io import atomic_write_json, safe_read_bytes, safe_read_text
@@ -33,8 +37,12 @@ except ImportError:  # pragma: no cover - direct package fallback
                                    projection_matches_files,
                                    rejected_finding_surface_ids)
     from host_policy import is_authorized_url, normalize_authorized_scopes
+    from exploration import validate_intuition_exploration
     from ledger import CoverageLedger
     from outcome import build_miss_attribution, build_next_run_agenda
+    from negative_retest import (families_from_packets,
+                                 has_cross_stage_diversity,
+                                 is_input_validation_cell)
     from run_authority import canonical_method_resolution_key
     from runtime_manifest import validate_manifest_binding
     from safe_io import atomic_write_json, safe_read_bytes, safe_read_text
@@ -207,7 +215,7 @@ def _target_allowed(
     if context is not None:
         return context.allows(target)
     if not authorized_hosts:
-        return True
+        return False
     text = str(target or "").strip()
     parts = text.split(None, 1)
     if len(parts) == 2 and parts[0].upper() in {
@@ -2285,6 +2293,7 @@ def _validate_evidence_envelope(
         dict(envelope.get("preconditions"))
         if isinstance(envelope.get("preconditions"), dict) else {}
     )
+    encoding_families, strategy_families = families_from_packets(packets)
     try:
         relative_envelope = envelope_path.resolve().relative_to(
             allowed_root.resolve()).as_posix()
@@ -2369,6 +2378,8 @@ def _validate_evidence_envelope(
         "roles": list(envelope.get("roles") or []),
         "barrier_signals": sorted(barrier_signals),
         "preconditions": preconditions,
+        "encoding_families": encoding_families,
+        "strategy_families": strategy_families,
     }, artifacts
 
 
@@ -2417,6 +2428,8 @@ def _validate_project_evidence_envelopes(
     roles: set[str] = set()
     barrier_signals: set[str] = set()
     preconditions: dict[str, bool] = {}
+    encoding_families: set[str] = set()
+    strategy_families: set[str] = set()
     if not refs:
         return False, {}
     for ref in refs:
@@ -2436,6 +2449,10 @@ def _validate_project_evidence_envelopes(
         roles.update(str(value) for value in derived.get("roles") or [])
         barrier_signals.update(
             str(value) for value in derived.get("barrier_signals") or [])
+        encoding_families.update(
+            str(value) for value in derived.get("encoding_families") or [])
+        strategy_families.update(
+            str(value) for value in derived.get("strategy_families") or [])
         for key, value in (derived.get("preconditions") or {}).items():
             preconditions[str(key)] = (
                 value is True and preconditions.get(str(key), True))
@@ -2445,6 +2462,8 @@ def _validate_project_evidence_envelopes(
         "identities": sorted(identities), "roles": sorted(roles),
         "barrier_signals": sorted(barrier_signals),
         "preconditions": preconditions,
+        "encoding_families": sorted(encoding_families),
+        "strategy_families": sorted(strategy_families),
     }
 
 
@@ -3043,6 +3062,10 @@ def _run_closure_gate(
                             except (OSError, ValueError, json.JSONDecodeError):
                                 historical_negative = None
                         if historical_negative is not None:
+                            if is_input_validation_cell(surface):
+                                reasons.append(
+                                    "cross_stage_input_negative_retest_required")
+                                continue
                             try:
                                 try:
                                     from ..knowledge import negative_sufficient
@@ -3107,6 +3130,22 @@ def _run_closure_gate(
                             if not envelope_ok:
                                 reasons.append("negative_evidence_invalid")
                                 continue
+                            for family_field in (
+                                    "encoding_families", "strategy_families"):
+                                declared_families = {
+                                    str(value).strip().lower()
+                                    for value in (negative.get(family_field) or [])
+                                    if str(value).strip()
+                                }
+                                derived_families = {
+                                    str(value).strip().lower()
+                                    for value in (derived_negative.get(family_field) or [])
+                                    if str(value).strip()
+                                }
+                                if (declared_families
+                                        and declared_families != derived_families):
+                                    reasons.append(
+                                        f"negative_{family_field}_mismatch")
                             if allowed_root == run_dir:
                                 closure_artifact_hashes.update(artifacts)
                             try:
@@ -3120,6 +3159,15 @@ def _run_closure_gate(
                                     reasons.append("negative_depth_insufficient")
                             except Exception:
                                 reasons.append("negative_depth_invalid")
+                            prior_negative = surface.get(
+                                "cross_stage_prior_negative")
+                            if (is_input_validation_cell(surface)
+                                    and isinstance(prior_negative, dict)
+                                    and prior_negative):
+                                diverse, diversity_reasons = has_cross_stage_diversity(
+                                    derived_negative, prior_negative)
+                                if not diverse:
+                                    reasons.extend(diversity_reasons)
         except (OSError, json.JSONDecodeError):
             reasons.append("coverage_missing_or_invalid")
     if isinstance(endpoints, list) and endpoints:
@@ -3451,8 +3499,14 @@ def validate_run_artifacts(
     expected_project_name: str = "",
     source_run_dir: str | pathlib.Path | None = None,
     write_output: bool = True,
+    write_sidecars: bool | None = None,
 ) -> dict[str, Any]:
-    """Single library entry point used by both CLI and orchestrator."""
+    """Single library entry point used by both CLI and orchestrator.
+
+    Sidecars follow the validation output only when that output is inside the
+    run directory.  An external ``--output`` is diagnostic/read-only by
+    default and cannot silently mutate the audited historical run.
+    """
     from .collect import collect_structured_findings
     try:
         from ..enforce import ACCEPTED, guardian_check_finding
@@ -3489,7 +3543,8 @@ def validate_run_artifacts(
         path = pathlib.Path(item.get("path") or "")
         # Scope was already validated with ValidationContext.  Passing the
         # legacy host list again would incorrectly reject relative targets.
-        verdict = guardian_check_finding(item.get("finding") or {}, path.parent)
+        verdict = guardian_check_finding(
+            item.get("finding") or {}, path.parent, context=context)
         if verdict.result == ACCEPTED:
             confirmed.append({"id": item.get("id"), "path": str(path)})
             accepted_paths.add(str(path.resolve()))
@@ -3532,6 +3587,11 @@ def validate_run_artifacts(
                 artifact_hashes[relative] = _sha256_file(path)
             else:
                 ingestion_errors.append({"code": "proof_file_missing", "path": relative})
+    intuition_exploration = validate_intuition_exploration(base)
+    if (base / "intuition-exploration.json").is_file():
+        artifact_hashes.update(
+            {str(ref): str(digest) for ref, digest in
+             (intuition_exploration.get("artifact_hashes") or {}).items()})
 
     # Canonical ingestion is all-or-nothing.  A mixed batch containing one
     # malformed/rejected finding must not expose the remaining rows as project
@@ -3643,6 +3703,7 @@ def validate_run_artifacts(
         "proof_gate": proof_gate,
         "closure_gate": closure_gate,
         "miss_attribution": closure_gate.get("miss_attribution") or {},
+        "intuition_exploration": intuition_exploration,
     }
     result["next_run_agenda"] = build_next_run_agenda(
         result["miss_attribution"])
@@ -3656,8 +3717,16 @@ def validate_run_artifacts(
         if not output.is_absolute():
             output = base / output
         atomic_write_json(output, result)
-        atomic_write_json(base / "miss-attribution.json", result["miss_attribution"])
-        atomic_write_json(base / "next-run-agenda.json", result["next_run_agenda"])
+        sidecars_enabled = write_sidecars
+        if sidecars_enabled is None:
+            try:
+                output.resolve(strict=False).relative_to(base)
+                sidecars_enabled = True
+            except ValueError:
+                sidecars_enabled = False
+        if sidecars_enabled:
+            atomic_write_json(base / "miss-attribution.json", result["miss_attribution"])
+            atomic_write_json(base / "next-run-agenda.json", result["next_run_agenda"])
     return result
 
 
@@ -3722,6 +3791,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow", action="append", default=[], dest="allowed_hosts")
     parser.add_argument("--allow-empty", action="store_true")
     parser.add_argument("--output", type=pathlib.Path)
+    parser.add_argument(
+        "--write-sidecars", action="store_true",
+        help="also persist miss-attribution/next-run-agenda in run_dir",
+    )
     args = parser.parse_args(argv)
     try:
         result = validate_run_artifacts(
@@ -3729,6 +3802,7 @@ def main(argv: list[str] | None = None) -> int:
             allowed_hosts=args.allowed_hosts or None,
             allow_empty=args.allow_empty,
             output_path=args.output,
+            write_sidecars=True if args.write_sidecars else None,
         )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         payload = {"schema_version": 2, "status": "error", "exit_code": 3,

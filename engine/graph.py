@@ -64,7 +64,7 @@ class Fact:
     source_type: str
     source_candidate_id: str
     endpoint: str
-    method: str = "GET"
+    method: str = ""
     params: list[str] = field(default_factory=list)
     vuln_class: str = ""
     summary: str = ""
@@ -143,7 +143,7 @@ class FactIntentGraph:
             "source_type": fact_type,
             "source_candidate_id": candidate.get("candidate_id", ""),
             "endpoint": candidate.get("endpoint", ""),
-            "method": candidate.get("method", "GET"),
+            "method": candidate.get("method", ""),
             "params": [candidate.get("param", "")] if candidate.get("param") else [],
             "vuln_class": norm_vc(candidate.get("vuln_class", "")),  # v8.5.2: normalize at creation
             "summary": candidate.get("hypothesis", ""),
@@ -604,7 +604,7 @@ def intent_work_queue(graph, remaining_surfaces, phase=2):
     return queue
 
 
-def _method_and_path(value: str, fallback_method: str = "GET") -> tuple[str, str]:
+def _method_and_path(value: str, fallback_method: str = "") -> tuple[str, str]:
     canonical = canonical_surface_key(value, default_method=fallback_method)
     method, _, path = canonical.partition(" ")
     return (method or fallback_method).upper(), path or str(value or "")
@@ -628,7 +628,7 @@ def normalize_blackboard_schema(data: dict | None) -> dict:
     intents = list(src.get("intents") or [])
     for index, old in enumerate(src.get("confirmed_facts") or [], start=1):
         method, endpoint = _method_and_path(
-            old.get("endpoint", ""), old.get("method", "GET"))
+            old.get("endpoint", ""), old.get("method", ""))
         finding_id = str(old.get("id") or f"legacy_fact_{index:03d}")
         facts.append({
             "fact_id": finding_id,
@@ -674,7 +674,7 @@ def normalize_blackboard_schema(data: dict | None) -> dict:
     negatives = list(src.get("negatives") or [])
     for index, old in enumerate(src.get("depth_negatives") or [], start=1):
         method, endpoint = _method_and_path(
-            old.get("surface", old.get("endpoint", "")), old.get("method", "GET"))
+            old.get("surface", old.get("endpoint", "")), old.get("method", ""))
         vuln_class = old.get("vuln_class", "")
         negatives.append({
             "surface_key": f"{method} {endpoint}::{old.get('param', '')}::{vuln_class}",
@@ -727,7 +727,7 @@ def merge_run_to_blackboard(blackboard_path: str, run_graph: FactIntentGraph,
         return (
             canonical_surface_key({
                 "endpoint": f.get("endpoint", ""),
-                "method": f.get("method", "GET"),
+                "method": f.get("method", ""),
             }),
             norm_vc(f.get("vuln_class", "")),
             str(f.get("affected_role", "")),

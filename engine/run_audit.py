@@ -23,8 +23,17 @@ _PATH_TOKEN = re.compile(
     r"\b([A-Za-z0-9_.{}-]+/[A-Za-z0-9_./{}?=-]+)", re.I)
 _NEGATIVE = re.compile(r"\b(?:not_vulnerable|shallow_negative|blocked|not_applicable)\b", re.I)
 _POSITIVE = re.compile(r"\bP[123]\b")
-_CREDENTIAL_NAME = re.compile(r"(?:token|cookie|credential|secret|account)", re.I)
+_CREDENTIAL_NAME = re.compile(
+    r"(?:token|cookie|credential|secret|account|identity|authz|session|"
+    r"password|passwd|api[_-]?key)", re.I)
 _RUN_MARKER = re.compile(r"\bRun\s*([0-9]+)\b", re.I)
+_TERMINAL_CLAIM = re.compile(
+    r"\b(?:VULN_FOUND|LOW_ROI)\b|"
+    r"(?:终态|termination_status|final_status).{0,24}(?:complete|完成|VULN_FOUND|LOW_ROI)|"
+    r"(?:全域|完整|全部).{0,16}(?:覆盖|测试完成|闭合)",
+    re.I | re.S,
+)
+_MAX_SECRET_SCAN_BYTES = 2 * 1024 * 1024
 
 
 def _relative(path: pathlib.Path, root: pathlib.Path) -> str:
@@ -39,6 +48,50 @@ def _text(path: pathlib.Path, root: pathlib.Path) -> str:
         return safe_read_bytes(path, root=root).decode("utf-8", errors="ignore")
     except (OSError, ValueError):
         return ""
+
+
+def _json_object(path: pathlib.Path, root: pathlib.Path) -> dict[str, Any] | None:
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        value = json.loads(_text(path, root))
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _nonempty_rows(value: dict[str, Any] | None, *keys: str) -> bool:
+    if not value:
+        return False
+    for key in keys:
+        rows = value.get(key)
+        if isinstance(rows, (list, dict)) and bool(rows):
+            return True
+    return False
+
+
+def _unsafe_credential_files(run: pathlib.Path) -> list[dict[str, Any]]:
+    """Find readable credential material across the whole run, values omitted."""
+    result: list[dict[str, Any]] = []
+    for path in sorted(run.rglob("*")):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            file_stat = path.stat()
+        except OSError:
+            continue
+        credential_named = bool(_CREDENTIAL_NAME.search(path.name))
+        text = "" if file_stat.st_size > _MAX_SECRET_SCAN_BYTES else _text(path, run)
+        kinds = sensitive_kinds(text)
+        if not kinds and not credential_named:
+            continue
+        if file_stat.st_mode & 0o077:
+            result.append({
+                "path": _relative(path, run),
+                "sensitive_kinds": kinds or ["credential_file"],
+                "mode": f"{file_stat.st_mode & 0o777:03o}",
+            })
+    return result
 
 
 def _report_files(run: pathlib.Path) -> list[pathlib.Path]:
@@ -170,16 +223,8 @@ def audit_run(run_dir: str | pathlib.Path) -> dict[str, Any]:
             "path": _relative(path, run),
             "sensitive_kinds": kinds,
         })
-    credential_files: list[dict[str, Any]] = []
+    credential_files = _unsafe_credential_files(run)
     state = run / "state"
-    if state.is_dir():
-        for path in sorted(item for item in state.rglob("*") if item.is_file()):
-            kinds = sensitive_kinds(_text(path, run))
-            if kinds or _CREDENTIAL_NAME.search(path.name):
-                credential_files.append({
-                    "path": _relative(path, run),
-                    "sensitive_kinds": kinds or ["credential_file"],
-                })
     try:
         submission = inspect_submission(run)
     except (OSError, ValueError):
@@ -195,12 +240,20 @@ def audit_run(run_dir: str | pathlib.Path) -> dict[str, Any]:
     required = {
         name: (run / name).is_file()
         for name in (
-            "run_manifest.json", "inventory.json", "coverage-ledger.json",
+            "run_manifest.json", "run_plan.json", "inventory.json", "coverage-ledger.json",
             "candidate-ledger.json", "feature-graph.json", "threat-model.json",
             "execution-contracts.json", "miss-attribution.json",
             "next-run-agenda.json", "delivery_status.json", "run_receipt.json",
         )
     }
+    inventory_value = _json_object(run / "inventory.json", run)
+    coverage_value = _json_object(run / "coverage-ledger.json", run)
+    inventory_nonempty = _nonempty_rows(
+        inventory_value, "surfaces", "endpoints", "inventory")
+    coverage_nonempty = _nonempty_rows(
+        coverage_value, "surfaces", "cells", "coverage")
+    persisted_attribution = _json_object(run / "miss-attribution.json", run)
+    persisted_agenda = _json_object(run / "next-run-agenda.json", run)
     manual_complete_claim = False
     summary = run / "summary.json"
     if summary.is_file():
@@ -212,29 +265,57 @@ def audit_run(run_dir: str | pathlib.Path) -> dict[str, Any]:
         for path in (run / "state" / "findings_summary.md",):
             if path.is_file() and "VULN_FOUND (complete)" in _text(path, run):
                 manual_complete_claim = not submission.get("eligible")
+    if not manual_complete_claim and not submission.get("eligible"):
+        manual_complete_claim = any(
+            bool(_TERMINAL_CLAIM.search(_text(path, run))) for path in reports)
 
     attribution = validation.get("miss_attribution") or {}
+    agenda = validation.get("next_run_agenda") or {}
+    attribution_consistent = bool(
+        persisted_attribution is not None
+        and persisted_attribution == attribution)
+    agenda_consistent = bool(
+        persisted_agenda is not None
+        and persisted_agenda == agenda)
     standards = {
         "no_silent_omission": bool(
-            required["coverage-ledger.json"] and attribution.get("complete")),
+            required["run_manifest.json"]
+            and required["run_plan.json"]
+            and inventory_nonempty
+            and coverage_nonempty
+            and attribution.get("complete")
+            and attribution_consistent),
         "no_evidenceless_finding": bool(
             int((validation.get("counts") or {}).get("canonical", 0) or 0)
             == int((validation.get("counts") or {}).get("proof_confirmed", 0) or 0)
             and not (reports and not discovery["counts"]["canonical"])),
         "no_manual_report_bypass": bool(not reports or submission.get("eligible")),
         "no_false_coverage": bool(
-            validation.get("closure_gate", {}).get("result") == "pass"),
+            inventory_nonempty and coverage_nonempty
+            and validation.get("closure_gate", {}).get("result") == "pass"),
         "no_garbage_submission": bool(
             not reports or submission.get("eligible")),
-        "exact_miss_attribution": bool(attribution.get("complete")),
-        "automatic_next_run": bool(required["next-run-agenda.json"]),
+        "exact_miss_attribution": bool(
+            inventory_nonempty and coverage_nonempty
+            and attribution.get("complete") and attribution_consistent),
+        "automatic_next_run": bool(
+            required["next-run-agenda.json"] and agenda_consistent),
         "model_independent_contract": bool(
-            required["run_manifest.json"] and required["run_receipt.json"]),
+            required["run_manifest.json"] and required["run_plan.json"]
+            and required["run_receipt.json"]),
     }
     issues: list[dict[str, Any]] = []
     for name, present in required.items():
         if not present:
             issues.append({"code": "artifact_missing", "artifact": name})
+    if required["inventory.json"] and not inventory_nonempty:
+        issues.append({"code": "empty_inventory"})
+    if required["coverage-ledger.json"] and not coverage_nonempty:
+        issues.append({"code": "empty_coverage"})
+    if required["miss-attribution.json"] and not attribution_consistent:
+        issues.append({"code": "attribution_projection_mismatch"})
+    if required["next-run-agenda.json"] and not agenda_consistent:
+        issues.append({"code": "agenda_projection_mismatch"})
     if reports and not submission.get("eligible"):
         issues.append({
             "code": "orphan_or_unverified_report",
@@ -280,6 +361,10 @@ def audit_run(run_dir: str | pathlib.Path) -> dict[str, Any]:
         "summary_conflicts": conflicts,
         "mixed_run_markers": sorted(mixed_run_ids, key=int),
         "manual_complete_claim": manual_complete_claim,
+        "inventory_nonempty": inventory_nonempty,
+        "coverage_nonempty": coverage_nonempty,
+        "attribution_projection_consistent": attribution_consistent,
+        "agenda_projection_consistent": agenda_consistent,
         "standards": standards,
         "issues": issues,
     }

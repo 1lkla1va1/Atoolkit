@@ -27,6 +27,29 @@ _KEYED = re.compile(
 _EMAIL = re.compile(r"(?i)(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![A-Z0-9.-])")
 _CN_PHONE = re.compile(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)")
 
+# Detection is intentionally independent from the redaction expressions.  A
+# regression in replacement syntax must not simultaneously blind the scanner.
+_DETECT_AUTH_HEADER = re.compile(
+    r"(?im)^(?![^\r\n]*<redacted:)\s*(?:cookie|set-cookie|authorization|proxy-authorization|"
+    r"x-api-key|x-auth-token)\s*:\s*(?!<redacted:)[^\r\n]{4,}$")
+_DETECT_BEARER = re.compile(
+    r"(?i)\bbearer\s+(?!<redacted:)[a-z0-9._~+\-/=]{8,}")
+_DETECT_SECRET_ASSIGNMENT = re.compile(
+    r"(?im)^(?![^\r\n]*<redacted:)[^\r\n]*?(?<![a-z0-9_])(?:api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"csrf[_-]?token|auth[_-]?token|password|passwd|client[_-]?secret|"
+    r"session(?:[_-]?id)?|token|secret|credential|signature)"
+    r"\s*[\"']?\s*[:=]\s*[\"']?(?!<redacted:)[^\s\"',;&}\]]{6,}")
+_DETECT_EMAIL = re.compile(
+    r"(?i)(?<![a-z0-9._%+-])[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}"
+    r"(?![a-z0-9.-])")
+_DETECT_CN_PHONE = re.compile(r"(?<!\d)(?:\+?86[ -]?)?1[3-9][0-9]{9}(?!\d)")
+_DETECT_JWT = re.compile(
+    r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\."
+    r"[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])")
+_DETECT_QUERY_SECRET = re.compile(
+    r"(?i)[?&](?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|session)="
+    r"(?!<redacted:)[^&#\s]{6,}")
+
 
 def _placeholder(kind: str, value: str) -> str:
     digest = hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:12]
@@ -69,8 +92,21 @@ def redact_text(text: str) -> tuple[str, dict[str, int]]:
 
 def sensitive_kinds(text: str) -> list[str]:
     """Return only finding kinds, never the sensitive values themselves."""
-    _redacted, counts = redact_text(text)
-    return sorted(kind for kind, count in counts.items() if count)
+    value = str(text or "")
+    kinds: set[str] = set()
+    if _DETECT_AUTH_HEADER.search(value):
+        kinds.add("auth_header")
+    if _DETECT_BEARER.search(value):
+        kinds.add("bearer")
+    if _DETECT_SECRET_ASSIGNMENT.search(value):
+        kinds.add("secret")
+    if _DETECT_EMAIL.search(value):
+        kinds.add("email")
+    if _DETECT_CN_PHONE.search(value):
+        kinds.add("phone")
+    if _DETECT_JWT.search(value) or _DETECT_QUERY_SECRET.search(value):
+        kinds.add("secret")
+    return sorted(kinds)
 
 
 def redact_json_value(value: Any) -> tuple[Any, dict[str, int]]:
