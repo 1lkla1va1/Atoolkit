@@ -140,6 +140,45 @@ def _secure_write_text(path: pathlib.Path, value: str) -> None:
     )
 
 
+_AUTHZ_TEMPLATE = """# 授权声明（Authorization Statement）
+
+> 本文件由 Atoolkit 自动生成模板。**请填写并确认后再运行任何测试。**
+
+## 免责声明
+
+本工具仅面向**已明确授权**的安全测试场景（SRC、漏洞赏金、渗透测试合同、教学/靶场环境）。
+使用本工具即表示你确认：已获得目标系统所有者或合法授权方的许可；测试行为符合适用法律法规
+与授权范围；你对使用本工具产生的一切行为与后果承担全部责任。作者与贡献者不对任何滥用行为
+及其后果承担责任。
+
+## 授权信息
+
+- 授权方（资产所有者/甲方）：
+- 被授权方（测试人/团队）：
+- 授权目标范围（域名/资产）：{target}
+- 授权有效期：
+- 授权依据（SRC 平台规则 / 合同编号 / 邮件确认 / 靶场许可）：
+- 特别约束（禁止操作 / 时间窗 / 速率限制）：
+
+## 确认
+
+- [ ] 我已阅读并确认上述授权真实有效；测试范围以本文件为准。
+"""
+
+
+def _authz_template_needed(value: str) -> bool:
+    """--authz 指向一个尚不存在的文件路径时需要生成模板（字面量文本视为声明）。"""
+    text = str(value or "").strip()
+    if not text or pathlib.Path(text).exists():
+        return False
+    return "/" in text or text.endswith(".md")
+
+
+def _write_authz_template(dest: pathlib.Path, target: str) -> pathlib.Path:
+    _secure_write_text(dest, _AUTHZ_TEMPLATE.format(target=target))
+    return dest
+
+
 def _atomic_write_json(path: pathlib.Path, value: dict) -> None:
     """Atomically replace a private JSON delivery artifact."""
     _secure_write_text(
@@ -1740,7 +1779,7 @@ def main():
     ap = argparse.ArgumentParser(description="起一次授权 SRC 会话（engine 三件套接线）")
     ap.add_argument("--version", action="version", version=f"Atoolkit {__version__}")
     ap.add_argument("--target", default="", help="授权目标 URL")
-    ap.add_argument("--authz", default="", help="授权说明文本，或授权文件路径")
+    ap.add_argument("--authz", default="", help="授权说明文本，或授权文件路径；缺省或路径不存在时生成授权声明模板并退出")
     ap.add_argument("--cookie", default="", help="人已拿到的新鲜 Cookie/Session")
     ap.add_argument("--bearer", default="", help="人已拿到的新鲜 Bearer JWT（与 --cookie 二选一）")
     ap.add_argument("--auth-scheme", choices=["cookie", "bearer"], default="cookie",
@@ -1853,9 +1892,18 @@ def main():
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["ok"] else 1
-    # 非 self-check：--target/--authz 仍为必填（argparse 层已放宽为非 required 以放行 --self-check）。
-    if not args.target or not args.authz:
-        ap.error("--target 与 --authz 为必填（自检门用 --self-check，可不带这两参数）")
+    # 非 self-check：--target 必填（argparse 层已放宽为非 required 以放行 --self-check）。
+    if not args.target:
+        ap.error("--target 为必填（自检门用 --self-check，可不带该参数）")
+    # v9.2.1：授权声明模板默认生成。--authz 缺省或指向不存在的路径时，生成
+    # 免责声明模板并 fail closed；人工确认授权后带 --authz 重跑，不伪造授权。
+    if not args.authz or _authz_template_needed(args.authz):
+        dest = _write_authz_template(
+            pathlib.Path(args.authz) if args.authz.strip() else pathlib.Path("authz.md"),
+            args.target)
+        ap.error(
+            f"已生成授权声明模板 {dest}；请填写/确认授权信息后，"
+            f"以 --authz {dest} 重新运行")
     if args.target_fingerprint and args.target_fingerprint_file:
         ap.error("--target-fingerprint 与 --target-fingerprint-file 不能同时使用")
     if args.resume and args.continue_from_run:

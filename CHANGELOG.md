@@ -1,5 +1,10 @@
 # Changelog
 
+## 9.2.1 - 2026-08-13
+
+- 版本信息统一刷新（README/SKILL.md，此前仍为 9.1.0）；新增 `DISCLAIMER.md` 免责声明，README 补设计初衷与授权模板说明。
+- `--authz` 不再硬必填：缺省或指向不存在路径时默认生成授权声明模板（含免责声明与授权字段、target 预填、权限 0600）并 fail closed 退出，人工确认后带 `--authz` 重跑；不伪造授权，scope 判定逻辑不变。
+
 ## 9.2.0 - 2026-08-12
 
 - 报告出口收口：新增 `python3 -m engine.skill_runtime report --run-dir <run>`，Direct/Skill 模式的最终报告只能由代码从验证通过的 Finding 渲染；手写 `final_report.md`/`draft_report.md`/`observation_report.md` 在 checkpoint 与 report 两个时机被 quarantine（移入 `state/quarantine/`，不删除），渲染结果 sha256 写入 `runtime-status.json` 的 `rendered_artifacts` 供人工验真。裸 Direct 模式无法防止 report 之后的再次手写，完全闭合仍需 Wrapped Skill。
