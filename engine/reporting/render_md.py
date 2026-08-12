@@ -107,6 +107,82 @@ def render_coverage_gaps(
     return out.resolve()
 
 
+def render_observation_report(
+    observations: list[dict[str, Any]],
+    output_path: str | pathlib.Path,
+    target_name: str = "",
+    *,
+    status: str = "diagnostic",
+) -> pathlib.Path:
+    """渲染观察报告（v9.2 §3.3）：现象级发现，非漏洞，不含 SRC 严重度。
+
+    输入为 observations.json 同款记录（可附带 finding 字段取标题），按
+    phenomenon_class 稳定分组。本报告严禁出现 SRC 严重度标签。
+    """
+    out = pathlib.Path(output_path)
+    lines: list[str] = [
+        f"# {target_name or '目标'} 观察报告（现象级发现）",
+        "",
+        "> 这是观察报告：以下条目均为**现象级发现**，不是已证明漏洞，"
+        "不携带 SRC 严重度评级，不得直接对外提交。",
+        f"> 状态：{status}。后续 run 若能为某条观察补出已证后果链，"
+        "请走正常 finding 验证流程升级。",
+        "",
+    ]
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for item in observations:
+        classes = [str(value) for value in (item.get("phenomenon_classes") or [])]
+        key = classes[0] if classes else "unclassified"
+        groups.setdefault(key, []).append(item)
+    for group in sorted(groups):
+        lines.extend([f"## 现象分类：{group}", ""])
+        for item in groups[group]:
+            finding = item.get("finding") if isinstance(item.get("finding"), dict) else {}
+            title = str(finding.get("title") or item.get("title") or item.get("id") or "")
+            lines.extend([f"### {title}", ""])
+            method = str(item.get("method") or "")
+            endpoint = str(item.get("endpoint") or "")
+            params = ", ".join(str(value) for value in (item.get("params") or []))
+            lines.append(f"- 端点：{method} {endpoint}".rstrip())
+            if params:
+                lines.append(f"- 参数：{params}")
+            classes = [str(value) for value in (item.get("phenomenon_classes") or [])]
+            if classes:
+                lines.append(f"- 现象分类：{', '.join(classes)}")
+            reasons = [str(reason) for reason in (item.get("reasons") or [])]
+            lines.append("- 为什么只是现象：")
+            for reason in reasons:
+                lines.append(f"  - {reason}")
+            if not reasons:
+                lines.append("  - （无记录）")
+            chain_status = str(item.get("chain_status") or "")
+            final_impact = str(item.get("final_impact") or "")
+            if chain_status or final_impact:
+                lines.append(
+                    f"- 可能的链式方向：status={chain_status or 'NONE'} "
+                    f"final_impact={final_impact or 'NONE'}")
+            else:
+                lines.append("- 可能的链式方向：NONE")
+            refs = [str(ref) for ref in (item.get("evidence_refs") or [])]
+            if refs:
+                lines.append("- 证据引用：")
+                for ref in refs:
+                    lines.append(f"  - `{ref}`")
+            lines.append("")
+    if not groups:
+        lines.append("（本轮无现象级观察。）")
+        lines.append("")
+
+    rendered, _redactions = redact_text("\n".join(lines).rstrip() + "\n")
+    atomic_write_text(
+        out,
+        rendered,
+        root=out.parent,
+        reject_leaf_symlink=True,
+    )
+    return out.resolve()
+
+
 def render_final_report(
     findings: list[dict[str, Any]],
     output_path: str | pathlib.Path,

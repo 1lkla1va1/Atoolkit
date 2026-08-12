@@ -28,7 +28,7 @@ from typing import Iterator, Protocol
 try:                                  # 支持「脚本直跑」与「包内导入」两种方式
     from enforce import (guardian_check, guardian_check_finding, triage, extract_executed_cmds,
                          classify_action, is_authorized_host, finalize,
-                         ACCEPTED, BLOCK, CONFIRM)
+                         ACCEPTED, DEMOTED, BLOCK, CONFIRM)
     from ledger import CoverageLedger, derive_coverage, surfaces_from_legacy_cell
     from knowledge import (load_cards, match_cards, render_skill_hint, resolve_negative_state,
                            negative_sufficient, positive_depth_floor_for, risk_dimensions_for)
@@ -79,7 +79,7 @@ try:                                  # 支持「脚本直跑」与「包内导�
 except ImportError:
     from engine.enforce import (guardian_check, guardian_check_finding, triage, extract_executed_cmds,
                                 classify_action, is_authorized_host, finalize,
-                                ACCEPTED, BLOCK, CONFIRM)
+                                ACCEPTED, DEMOTED, BLOCK, CONFIRM)
     from engine.ledger import CoverageLedger, derive_coverage, surfaces_from_legacy_cell
     from engine.knowledge import (load_cards, match_cards, render_skill_hint, resolve_negative_state,
                                   negative_sufficient, positive_depth_floor_for, risk_dimensions_for)
@@ -1491,6 +1491,7 @@ def harvest_evidence(workdir: pathlib.Path, authorized_hosts: list[str] | None =
     # and linger in the ledger after final rejection.
     guardian_items = []
     guardian_rejected = list(structured["rejected"])
+    guardian_observations = list(structured.get("observations") or [])
     accepted_paths: set[str] = set()
     for item in structured["accepted"]:
         finding_path = pathlib.Path(item.get("path") or "")
@@ -1501,6 +1502,16 @@ def harvest_evidence(workdir: pathlib.Path, authorized_hosts: list[str] | None =
         if verdict.result == ACCEPTED:
             guardian_items.append(item)
             accepted_paths.add(str(finding_path.resolve()))
+        elif verdict.result == DEMOTED or verdict.level == 1:
+            # v9.2: demotions/L1 garbage hits become observations, not
+            # rejections; they must not close cells nor poison the batch.
+            guardian_observations.append({
+                "id": item.get("id") or finding_path.parent.name,
+                "path": str(finding_path),
+                "finding": item.get("finding") or {},
+                "outcome": "observation",
+                "reasons": [f"guardian:{verdict.result}:L{verdict.level}:{verdict.reason}"],
+            })
         else:
             guardian_rejected.append({
                 "id": item.get("id") or finding_path.parent.name,
@@ -1518,10 +1529,12 @@ def harvest_evidence(workdir: pathlib.Path, authorized_hosts: list[str] | None =
             "trusted_report_objs": [],                 # 保留键，生产路径不信任 Markdown
             "negatives": negatives, "files": files,
             "finding_objs": guardian_items,
+            "finding_observations": guardian_observations,
             "finding_validation": {
                 "accepted": guardian_items,
                 "proof_confirmed": guardian_items,
                 "rejected": guardian_rejected,
+                "observations": guardian_observations,
             },
             "normalized_findings": proof_confirmed}
 
@@ -4229,6 +4242,8 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
     }
     structured_guardian_accepted = []
     structured_guardian_rejected = []
+    structured_guardian_observations = list(
+        evidence.get("finding_validation", {}).get("observations", []))
     normalized_by_path = {
         str(nf.get("raw_finding_path") or nf.get("evidence_file") or ""): nf
         for nf in evidence.get("normalized_findings", [])
@@ -4247,6 +4262,16 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
                 rel = str(finding_path)
             if rel in normalized_by_path:
                 normalized_structured.append(normalized_by_path[rel])
+        elif verdict.result == DEMOTED or verdict.level == 1:
+            # v9.2: demotions/L1 garbage hits become observations, not
+            # rejections; they must not close cells nor poison the batch.
+            structured_guardian_observations.append({
+                "id": item.get("id") or finding_path.parent.name,
+                "path": str(finding_path),
+                "finding": item.get("finding") or {},
+                "outcome": "observation",
+                "reasons": [f"guardian:{verdict.result}:L{verdict.level}:{verdict.reason}"],
+            })
         else:
             structured_guardian_rejected.append({
                 "id": item.get("id") or finding_path.parent.name,
@@ -4556,11 +4581,13 @@ def _conclude(marker, evidence, wd, state, authorized_hosts, turn, verify_fn=Non
             "accepted": len(structured_guardian_accepted),
             "rejected": len(evidence.get("finding_validation", {}).get("rejected", []))
                         + len(structured_guardian_rejected),
+            "observations": len(structured_guardian_observations),
         },
         "finding_validation": {
             "accepted": evidence.get("finding_validation", {}).get("accepted", []),
             "rejected": evidence.get("finding_validation", {}).get("rejected", [])
                         + structured_guardian_rejected,
+            "observations": structured_guardian_observations,
         },
         "final_report_path": final_report_path,
         "final_report_status": final_report_status,

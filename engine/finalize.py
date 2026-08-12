@@ -25,7 +25,12 @@ try:  # Support both ``python -m engine.finalize`` and direct repo CLI use.
     from .project_state import ProjectStateError, ProjectStateStore, _default_state
     from .data_hygiene import sensitive_kinds
     from .exploration import validate_intuition_exploration
-    from .reporting.render_md import render_final_report
+    from .reporting.decision import decide_canonical_report, gate_outcomes
+    from .reporting.observations import (
+        build_observation_records,
+        write_observations_json,
+    )
+    from .reporting.render_md import render_final_report, render_observation_report
     from .reporting.validate import validate_run_artifacts
     from .run_authority import (
         canonical_digest,
@@ -49,7 +54,11 @@ except ImportError:  # pragma: no cover - exercised by subprocess CLI tests
     from project_state import ProjectStateError, ProjectStateStore, _default_state
     from data_hygiene import sensitive_kinds
     from exploration import validate_intuition_exploration
-    from reporting.render_md import render_final_report
+    from reporting.decision import decide_canonical_report, gate_outcomes
+    from reporting.observations import (build_observation_records,
+                                        write_observations_json)
+    from reporting.render_md import (render_final_report,
+                                     render_observation_report)
     from reporting.validate import validate_run_artifacts
     from run_authority import (
         canonical_digest,
@@ -96,6 +105,8 @@ _DERIVED_RUN_FILES = {
     "finding_validation.json",
     "miss-attribution.json",
     "next-run-agenda.json",
+    "observations.json",
+    "observation_report.md",
     "submission_status.json",
     "summary.json",
     "project_state_commit.json",
@@ -798,13 +809,6 @@ def _recover_pending_project_transactions(
         _write_journal(authority, journal)
 
 
-def _gate_pass(validation: dict[str, Any], key: str, fallback: bool) -> bool:
-    gate = validation.get(key)
-    if isinstance(gate, dict):
-        return gate.get("result") == "pass"
-    return fallback
-
-
 def _canonical_report_items(
     validation: dict[str, Any],
     *,
@@ -870,6 +874,22 @@ def _restore_canonical_report(
         "final_report.md" if status == "complete" else "draft_report.md")
     atomic_write_bytes(destination, payload, root=run)
     return status == "complete"
+
+
+def _project_observation_artifacts(
+    *,
+    snapshot_run: pathlib.Path,
+    run: pathlib.Path,
+    authority: pathlib.Path,
+) -> None:
+    """Project code-rendered observation artifacts from the frozen snapshot."""
+    for name in ("observations.json", "observation_report.md"):
+        source = snapshot_run / name
+        if source.is_file() and not source.is_symlink():
+            atomic_write_bytes(
+                run / name,
+                _read_regular_bytes(source, trusted_root=authority),
+                root=run)
 
 
 def finalize_run(
@@ -1048,14 +1068,7 @@ def finalize_run(
         # validation projection before it is used as a receipt artifact.
         atomic_write_json(validation_path, validation, root=authority)
 
-        proof_pass = _gate_pass(
-            validation, "proof_gate",
-            not validation.get("ingestion_errors") and not validation.get("proof_pending_or_rejected"),
-        )
-        closure_pass = _gate_pass(
-            validation, "closure_gate",
-            int(validation.get("exit_code", 3)) == 0,
-        )
+        proof_pass, closure_pass = gate_outcomes(validation)
         frozen_runtime_closure = journal.get("runtime_closure_pass")
         if frozen_runtime_closure is not None:
             closure_pass = bool(closure_pass and frozen_runtime_closure)
@@ -1130,32 +1143,42 @@ def finalize_run(
             summary_status = str(validation.get("status") or "invalid")
             report_items = _canonical_report_items(
                 validation, snapshot_run=snapshot_run, authority=authority)
-            canonical_report_status = "not_generated"
+            # v9.2: the final/draft/none decision is shared byte-for-byte
+            # with the Direct diagnostic path (skill_runtime report).
+            canonical_report_status, report_name = decide_canonical_report(
+                proof_pass=proof_pass,
+                closure_pass=closure_pass,
+                exit_code=int(validation.get("exit_code", 3)),
+                report_items=report_items,
+            )
             canonical_report_path: pathlib.Path | None = None
-            if (proof_pass and closure_pass
-                    and int(validation.get("exit_code", 3)) == 0):
-                canonical_report_status = "complete"
-                canonical_report_path = snapshot_run / "final_report.md"
+            if report_name is not None:
+                canonical_report_path = snapshot_run / report_name
                 render_final_report(
                     report_items,
                     canonical_report_path,
                     target_name=str(manifest_value.get("primary_target") or "目标"),
-                    status="complete",
-                )
-            elif proof_pass and report_items:
-                canonical_report_status = "draft_incomplete"
-                canonical_report_path = snapshot_run / "draft_report.md"
-                render_final_report(
-                    report_items,
-                    canonical_report_path,
-                    target_name=str(manifest_value.get("primary_target") or "目标"),
-                    status="draft_incomplete",
-                    session_gate=validation.get("closure_gate") or {},
+                    status=canonical_report_status,
+                    **({"session_gate": validation.get("closure_gate") or {}}
+                       if canonical_report_status == "draft_incomplete" else {}),
                 )
             canonical_report_sha256 = (
                 hashlib.sha256(_read_regular_bytes(
                     canonical_report_path, trusted_root=authority)).hexdigest()
                 if canonical_report_path is not None else "")
+            # v9.2: phenomenon-level observations render into the snapshot and
+            # project to the run dir.  They never enter receipt artifacts or
+            # ProjectState inputs.
+            observation_items = list(validation.get("observations") or [])
+            if observation_items:
+                write_observations_json(
+                    snapshot_run, observation_items, root=authority)
+                render_observation_report(
+                    build_observation_records(snapshot_run, observation_items),
+                    snapshot_run / "observation_report.md",
+                    target_name=str(manifest_value.get("primary_target") or "目标"),
+                    status="diagnostic",
+                )
             summary = {
                 "schema_version": 2,
                 "atoolkit_version": __version__,
@@ -1255,6 +1278,8 @@ def finalize_run(
         atomic_write_json(run / "summary.json", summary, root=run)
         canonical_report_complete = _restore_canonical_report(
             run=run, authority=authority, summary=summary)
+        _project_observation_artifacts(
+            snapshot_run=snapshot_run, run=run, authority=authority)
 
         receipt_path = run / "run_receipt.json"
         anchor_path = authority / "receipts" / f"{session_id}.json"

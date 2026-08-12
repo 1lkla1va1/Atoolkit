@@ -168,20 +168,51 @@ def test_later_negative_does_not_silently_erase_confirmed_truth(tmp_path):
 
 
 def test_error_only_and_unproven_credential_leak_are_submission_ineligible(tmp_path):
+    # v9.2 three-outcome gate: phenomenon-level findings with otherwise valid
+    # evidence are demoted to observations — never rejected, never poisoning
+    # the batch-atomic gate.  The specialized boundary proofs still clear them.
     fdir = _idor_fixture(tmp_path)
+
     finding = load_finding(fdir / "finding.json")
     finding["title"] = "Type confusion returns HTTP 500"
     finding["vuln_type"] = "type-confusion"
-    result = validate_finding(finding, fdir / "finding.json", tmp_path)
+    finding["verification"]["evidence_type"] = "response_differential"
+    finding["proof_packets"][0]["phase"] = "baseline"
+    finding["proof_packets"][1]["phase"] = "exploit"
+    result = validate_finding(
+        finding, fdir / "finding.json", tmp_path,
+        authorized_hosts=["https://t.example/"])
     assert not result.ok
+    assert result.outcome == "observation"
+    assert "error_stack" in result.phenomenon_classes
     assert any("error-only response" in reason for reason in result.reasons)
 
     finding = load_finding(fdir / "finding.json")
     finding["title"] = "Current user token leak"
     finding["vuln_type"] = "token disclosure"
-    result = validate_finding(finding, fdir / "finding.json", tmp_path)
+    finding["verification"]["evidence_type"] = "response_differential"
+    finding["proof_packets"][0]["phase"] = "baseline"
+    finding["proof_packets"][1]["phase"] = "exploit"
+    result = validate_finding(
+        finding, fdir / "finding.json", tmp_path,
+        authorized_hosts=["https://t.example/"])
     assert not result.ok
+    assert result.outcome == "observation"
+    assert "credential_echo_unproven" in result.phenomenon_classes
     assert any("cross-boundary use proof" in reason for reason in result.reasons)
+
+    # Anti-laundering: a hard validation failure stays a rejection even when
+    # the finding text matches a phenomenon class.
+    finding = load_finding(fdir / "finding.json")
+    finding["title"] = "Type confusion returns HTTP 500"
+    finding["vuln_type"] = "type-confusion"
+    finding["severity"] = "P4"
+    result = validate_finding(
+        finding, fdir / "finding.json", tmp_path,
+        authorized_hosts=["https://t.example/"])
+    assert not result.ok
+    assert result.outcome != "observation"
+    assert not result.phenomenon_classes
 
 
 def test_mixed_finding_batch_attributes_every_suppressed_package(tmp_path):

@@ -199,6 +199,8 @@ def guardian_check_finding(
         authorized_hosts=authorized_hosts, context=context)
     sev = str(finding.get("severity") or "").upper()
     if not validation.ok:
+        if getattr(validation, "outcome", "") == "observation":
+            return Verdict(DEMOTED, 1, "phenomenon-only root: " + "; ".join(validation.reasons), sev)
         return Verdict(REJECTED, 2, "structured finding invalid: " + "; ".join(validation.reasons), sev)
 
     risk = finding.get("risk") or {}

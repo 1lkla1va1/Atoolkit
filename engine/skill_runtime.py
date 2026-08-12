@@ -12,13 +12,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import re
 import sys
+import time
 from typing import Any, Iterable
 
 try:
     from .blocker import RECOVERABLE, resolve_blocker
+    from .enforce import ACCEPTED, DEMOTED, guardian_check_finding
     from .dynamic_execution import (
         EXECUTION_CONTRACT_VERSION,
         DynamicExecutionError,
@@ -51,6 +54,17 @@ try:
     from .planner import plan_surfaces
     from .project_state import canonical_asset
     from .reporting.collect import collect_structured_findings
+    from .reporting.decision import decide_canonical_report, gate_outcomes
+    from .reporting.observations import (
+        build_observation_records,
+        write_observations_json,
+    )
+    from .reporting.render_md import (
+        render_final_report,
+        render_observation_report,
+    )
+    from .reporting.schema import load_finding
+    from .reporting.validate import validate_run_artifacts
     from .runtime_manifest import inspect_workspace_instructions
     from .safe_io import (
         atomic_write_json,
@@ -69,6 +83,7 @@ try:
     from .vuln_classes import exact_vc, norm_vc
 except ImportError:  # pragma: no cover - script execution fallback
     from blocker import RECOVERABLE, resolve_blocker
+    from enforce import ACCEPTED, DEMOTED, guardian_check_finding
     from dynamic_execution import (EXECUTION_CONTRACT_VERSION,
                                    DynamicExecutionError,
                                    build_execution_projection,
@@ -87,6 +102,13 @@ except ImportError:  # pragma: no cover - script execution fallback
     from planner import plan_surfaces
     from project_state import canonical_asset
     from reporting.collect import collect_structured_findings
+    from reporting.decision import decide_canonical_report, gate_outcomes
+    from reporting.observations import (build_observation_records,
+                                        write_observations_json)
+    from reporting.render_md import (render_final_report,
+                                     render_observation_report)
+    from reporting.schema import load_finding
+    from reporting.validate import validate_run_artifacts
     from runtime_manifest import inspect_workspace_instructions
     from safe_io import (atomic_write_json, create_json_exclusive,
                          ensure_directory, safe_read_bytes, safe_read_text)
@@ -112,10 +134,64 @@ DIRECT_QUEUE_LIMIT = 16
 DIRECT_HINT_CARD_LIMIT = 4
 DIRECT_RESERVED_ARTIFACTS = (
     "final_report.md",
+    "draft_report.md",
+    "observation_report.md",
     "summary.json",
     "delivery_status.json",
     "submission_status.json",
 )
+
+
+def _rendered_artifact_hashes(run: pathlib.Path) -> dict[str, str]:
+    """Read code-rendered artifact hashes recorded in runtime-status.json."""
+    status_path = run / "runtime-status.json"
+    if not status_path.is_file() or status_path.is_symlink():
+        return {}
+    try:
+        status = _load_json(status_path, root=run)
+    except SkillRuntimeError:
+        return {}
+    rendered = status.get("rendered_artifacts") if isinstance(status, dict) else None
+    if not isinstance(rendered, dict):
+        return {}
+    return {str(name): str(digest) for name, digest in rendered.items()}
+
+
+def _quarantine_reserved_artifacts(
+    run: pathlib.Path, rendered_hashes: dict[str, str],
+) -> list[str]:
+    """Move hand-written reserved artifacts into state/quarantine/.
+
+    A reserved file whose sha256 matches the hash recorded by a previous
+    code render is a legitimate projection and is left in place.  Everything
+    else is renamed (never deleted) so it stays auditable and recoverable.
+    """
+    quarantined: list[str] = []
+    for name in DIRECT_RESERVED_ARTIFACTS:
+        candidate = run / name
+        if candidate.is_symlink():
+            suspicious = True
+        elif not candidate.exists():
+            continue
+        elif candidate.is_file():
+            digest = hashlib.sha256(
+                safe_read_bytes(candidate, root=run)).hexdigest()
+            suspicious = rendered_hashes.get(name) != digest
+        else:
+            suspicious = True
+        if not suspicious:
+            continue
+        quarantine_dir = run / "state" / "quarantine"
+        ensure_directory(quarantine_dir, root=run)
+        stamp = int(time.time())
+        destination = quarantine_dir / f"{name}.agent.{stamp}.md"
+        counter = 0
+        while destination.exists():
+            counter += 1
+            destination = quarantine_dir / f"{name}.agent.{stamp}.{counter}.md"
+        os.replace(candidate, destination)
+        quarantined.append(name)
+    return quarantined
 
 
 def preflight_direct_run(
@@ -493,10 +569,12 @@ def initialize_direct_run(
         "schema_version": "1.1", "candidates": [],
     }, root=run, reject_leaf_symlink=True)
     execution_projection = write_execution_projection(run, ledger, [])
+    # execution-queue.json keeps the Host-owned projection shape written by
+    # write_execution_projection; the richer model-facing queue only lives in
+    # the returned status dict.  Overwriting the file here used to desync it
+    # from the closure gate's recomputed projection
+    # (execution_projection_mismatch after any checkpoint/init).
     queue = _queue_from_ledger(ledger, cards, execution_projection)
-    atomic_write_json(run / "execution-queue.json", {
-        "schema_version": 1, "queue": queue,
-    }, root=run, reject_leaf_symlink=True)
     threat_coverage = None
     if normalized_threat_model is not None:
         threat_coverage = derive_threat_coverage(
@@ -831,9 +909,41 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     target = str(ledger.metadata.get("target") or "").strip()
     collected = collect_structured_findings(
         run, authorized_hosts=[target] if target else None)
+    # v9.2: wire the Guardian gate into the Skill checkpoint path, mirroring
+    # validate_run_artifacts.  Demotions (incl. L1 garbage-title hits) become
+    # observations — they never inflate proof_repair_required and never block
+    # report_ready; hard rejections keep their repair semantics.
+    guardian_hosts = [target] if target else None
+    guardian_accepted: list[dict[str, Any]] = []
+    observation_items: list[dict[str, Any]] = [
+        dict(item) for item in (collected.get("observations") or [])]
+    rejected_findings: list[dict[str, Any]] = list(collected.get("rejected") or [])
     accepted_by_path: dict[str, dict[str, Any]] = {}
-    for accepted, normalized in zip(collected.get("accepted") or [], collected.get("normalized") or []):
-        accepted_by_path[str(pathlib.Path(accepted["path"]).resolve())] = normalized
+    for item, normalized in zip(
+            collected.get("accepted") or [], collected.get("normalized") or []):
+        path = pathlib.Path(str(item.get("path") or ""))
+        verdict = guardian_check_finding(
+            item.get("finding") or {}, path.parent,
+            authorized_hosts=guardian_hosts, context=None)
+        if verdict.result == ACCEPTED:
+            guardian_accepted.append(item)
+            accepted_by_path[str(path.resolve())] = normalized
+        elif verdict.result == DEMOTED or verdict.level == 1:
+            observation_items.append({
+                "id": item.get("id"),
+                "path": str(path),
+                "finding": item.get("finding") or {},
+                "outcome": "observation",
+                "reasons": [
+                    f"guardian:{verdict.result}:L{verdict.level}:{verdict.reason}"],
+            })
+        else:
+            rejected_findings.append({
+                "id": item.get("id"),
+                "path": str(path),
+                "reasons": [
+                    f"guardian:{verdict.result}:L{verdict.level}:{verdict.reason}"],
+            })
 
     conflicts: list[dict[str, Any]] = []
     for surface in ledger.surfaces:
@@ -1000,7 +1110,7 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     execution_events, execution_errors = _execution_events_from_observations(
         run, ledger, observations)
     rejected_execution_surfaces = rejected_finding_surface_ids(
-        run, ledger, collected.get("rejected") or [])
+        run, ledger, rejected_findings)
     execution_projection = build_execution_projection(
         ledger, execution_events,
         rejected_surface_ids=rejected_execution_surfaces)
@@ -1013,18 +1123,20 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     execution_projection = write_execution_projection(
         run, ledger, execution_events,
         rejected_surface_ids=rejected_execution_surfaces)
+    # execution-queue.json keeps the Host-owned projection shape written by
+    # write_execution_projection; the richer model-facing queue only lives in
+    # the checkpoint dict.  Overwriting the file here used to desync it from
+    # the closure gate's recomputed projection
+    # (execution_projection_mismatch after any checkpoint).
     queue = _queue_from_ledger(ledger, cards, execution_projection)
-    atomic_write_json(run / "execution-queue.json", {
-        "schema_version": 1, "queue": queue,
-    }, root=run, reject_leaf_symlink=True)
-    stale = _projection_stale(run, len(collected.get("accepted") or []))
-    reserved_violations = [
-        name for name in DIRECT_RESERVED_ARTIFACTS if (run / name).exists()
-    ]
-    rejected_details = _rejected_finding_details(
-        run, list(collected.get("rejected") or []))
+    stale = _projection_stale(run, len(guardian_accepted))
+    # v9.2: hand-written reserved artifacts are quarantined (never deleted);
+    # code-rendered projections whose hash matches runtime-status.json stay.
+    rendered_hashes = _rendered_artifact_hashes(run)
+    reserved_violations = _quarantine_reserved_artifacts(run, rendered_hashes)
+    rejected_details = _rejected_finding_details(run, rejected_findings)
     proof_repair_required = (
-        len(collected.get("rejected") or [])
+        len(rejected_findings)
         + len(collected.get("ingestion_errors") or []))
     threat_coverage = None
     if str(ledger.metadata.get("planning_mode") or "") == "threat_model":
@@ -1036,9 +1148,9 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     status = _runtime_status(
         run,
         ledger,
-        accepted_findings=len(collected.get("accepted") or []),
+        accepted_findings=len(guardian_accepted),
         rejected_findings=(
-            len(collected.get("rejected") or [])
+            len(rejected_findings)
             + len(collected.get("ingestion_errors") or [])),
         projection_stale=stale,
         observation_errors=len(observation_errors) + len(execution_errors),
@@ -1046,6 +1158,10 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         execution_projection=execution_projection,
         reserved_artifact_violations=len(reserved_violations),
     )
+    if rendered_hashes:
+        # Preserve the report-command verification hook across status rewrites.
+        status["rendered_artifacts"] = rendered_hashes
+    write_observations_json(run, observation_items, root=run)
     checkpoint = {
         "schema_version": 1,
         **status,
@@ -1055,11 +1171,12 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         "execution_queue": queue,
         "execution": execution_projection,
         "finding_validation": {
-            "accepted": len(collected.get("accepted") or []),
-            "rejected": len(collected.get("rejected") or []),
+            "accepted": len(guardian_accepted),
+            "rejected": len(rejected_findings),
             "rejected_items": rejected_details,
             "ingestion_errors": collected.get("ingestion_errors") or [],
             "proof_repair_required": proof_repair_required,
+            "observations": len(observation_items),
         },
         "reserved_artifact_violations": reserved_violations,
         **({"threat_coverage": threat_coverage} if threat_coverage is not None else {}),
@@ -1069,6 +1186,155 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     atomic_write_json(run / "runtime-status.json", status, root=run,
                       reject_leaf_symlink=True)
     return checkpoint
+
+
+def _report_target_name(run: pathlib.Path) -> str:
+    ledger_path = run / "coverage-ledger.json"
+    if ledger_path.is_file() and not ledger_path.is_symlink():
+        try:
+            metadata = _load_json(ledger_path, root=run).get("metadata") or {}
+            target = str(metadata.get("target") or "").strip()
+            if target:
+                return target
+        except (SkillRuntimeError, AttributeError):
+            pass
+    manifest_path = run / "run_manifest.json"
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        try:
+            manifest = _load_json(manifest_path, root=run)
+            target = str(manifest.get("primary_target") or "").strip()
+            if target:
+                return target
+        except (SkillRuntimeError, AttributeError):
+            pass
+    return "目标"
+
+
+def _live_report_items(
+    run: pathlib.Path, validation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Reload proof-confirmed Finding packages from the live run dir.
+
+    Diagnostic mode has no authority snapshot; ``validate_run_artifacts``
+    already filtered ``proof_confirmed``/``normalized_findings`` down to the
+    same guardian-accepted set, so the pairing is implicit in the validation
+    dict itself.
+    """
+    items: list[dict[str, Any]] = []
+    for record in validation.get("proof_confirmed") or []:
+        if not isinstance(record, dict):
+            continue
+        path = pathlib.Path(str(record.get("path") or "")).resolve(strict=False)
+        try:
+            path.relative_to(run)
+        except ValueError as exc:
+            raise SkillRuntimeError(
+                f"proof-confirmed report path escapes run dir: {path}") from exc
+        try:
+            finding = load_finding(path)
+        except ValueError as exc:
+            raise SkillRuntimeError(
+                f"proof-confirmed finding is invalid: {path}: {exc}") from exc
+        items.append({"id": record.get("id"), "path": str(path), "finding": finding})
+    return items
+
+
+def _write_rendered_status(run: pathlib.Path, rendered: dict[str, str]) -> None:
+    status_path = run / "runtime-status.json"
+    status: dict[str, Any] = {}
+    if status_path.is_file() and not status_path.is_symlink():
+        try:
+            value = _load_json(status_path, root=run)
+            if isinstance(value, dict):
+                status = value
+        except SkillRuntimeError:
+            status = {}
+    if not status:
+        status = {
+            "schema_version": 1,
+            "mode": "direct_diagnostic",
+            "run_dir": str(run),
+            "authority_trusted": False,
+            "delivery_eligible": False,
+        }
+    status["rendered_artifacts"] = rendered
+    atomic_write_json(status_path, status, root=run, reject_leaf_symlink=True)
+
+
+def report_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
+    """Render the canonical vuln report and observation report for a Direct run.
+
+    The final/draft/none decision shares ``decide_canonical_report`` with the
+    authority finalizer byte-for-byte; every artifact here stays diagnostic.
+    Exit semantics are always-success: proof/closure failures only change the
+    decision, never the exit code.
+    """
+    run = run_dir.resolve()
+    rendered_before = _rendered_artifact_hashes(run)
+    quarantined = _quarantine_reserved_artifacts(run, rendered_before)
+
+    validation = validate_run_artifacts(run, write_output=False)
+    proof_pass, closure_pass = gate_outcomes(validation)
+    report_items = _live_report_items(run, validation)
+    decision, report_name = decide_canonical_report(
+        proof_pass=proof_pass,
+        closure_pass=closure_pass,
+        exit_code=int(validation.get("exit_code", 3)),
+        report_items=report_items,
+    )
+    target_name = _report_target_name(run)
+
+    rendered: dict[str, str] = {}
+    if report_name is not None:
+        report_status = (
+            "complete" if decision == "complete" else "draft_incomplete")
+        kwargs: dict[str, Any] = {}
+        if report_status == "draft_incomplete":
+            kwargs["session_gate"] = validation.get("closure_gate") or {}
+        path = render_final_report(
+            report_items, run / report_name, target_name=target_name,
+            status=report_status, **kwargs)
+        rendered[report_name] = hashlib.sha256(
+            safe_read_bytes(path, root=run)).hexdigest()
+
+    observation_items = list(validation.get("observations") or [])
+    write_observations_json(run, observation_items, root=run)
+    if observation_items:
+        path = render_observation_report(
+            build_observation_records(run, observation_items),
+            run / "observation_report.md", target_name=target_name,
+            status="diagnostic")
+        rendered["observation_report.md"] = hashlib.sha256(
+            safe_read_bytes(path, root=run)).hexdigest()
+
+    # Stale code-rendered projections from an earlier decision are removed.
+    # Quarantine above already relocated every non-matching file, so anything
+    # left behind under a reserved report name is provably code-rendered.
+    for name in ("final_report.md", "draft_report.md", "observation_report.md"):
+        stale = run / name
+        if name not in rendered and stale.is_file() and not stale.is_symlink():
+            stale.unlink()
+
+    _write_rendered_status(run, rendered)
+    summary_line = (
+        f"report: decision={decision} findings={len(report_items)} "
+        f"observations={len(observation_items)} "
+        f"quarantined={quarantined or []}")
+    print(summary_line)
+    return {
+        "schema_version": 1,
+        "mode": "direct_diagnostic",
+        "authority_trusted": False,
+        "delivery_eligible": False,
+        "validation_status": validation.get("status"),
+        "decision": decision,
+        "report": report_name or "",
+        "findings": len(report_items),
+        "observations": len(observation_items),
+        "quarantined": quarantined,
+        "rendered_artifacts": rendered,
+        "summary": summary_line,
+    }
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1095,6 +1361,8 @@ def _parser() -> argparse.ArgumentParser:
     observe.add_argument("--input", required=True, help="observation JSON file or - for stdin")
     checkpoint = sub.add_parser("checkpoint")
     checkpoint.add_argument("--run-dir", required=True, type=pathlib.Path)
+    report = sub.add_parser("report")
+    report.add_argument("--run-dir", required=True, type=pathlib.Path)
     return parser
 
 
@@ -1122,6 +1390,8 @@ def main(argv: list[str] | None = None) -> int:
             result = record_observation(
                 run_dir=args.run_dir, agent_id=args.agent_id,
                 observation=observation)
+        elif args.command == "report":
+            result = report_direct_run(args.run_dir)
         else:
             result = checkpoint_direct_run(args.run_dir)
     except Exception as exc:  # noqa: BLE001
@@ -1148,5 +1418,6 @@ __all__ = [
     "initialize_direct_run",
     "record_observation",
     "checkpoint_direct_run",
+    "report_direct_run",
     "DIRECT_QUEUE_LIMIT",
 ]

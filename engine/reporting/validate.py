@@ -48,6 +48,18 @@ except ImportError:  # pragma: no cover - direct package fallback
     from safe_io import atomic_write_json, safe_read_bytes, safe_read_text
 
 from .schema import normalize_finding, resolve_finding_file
+try:
+    from ..vuln_classes import (
+        CONSEQUENCE_BOUNDARY_KINDS,
+        PHENOMENON_CHAIN_PROOF,
+        classify_phenomenon,
+    )
+except ImportError:  # pragma: no cover - flat engine/ on sys.path
+    from vuln_classes import (
+        CONSEQUENCE_BOUNDARY_KINDS,
+        PHENOMENON_CHAIN_PROOF,
+        classify_phenomenon,
+    )
 
 SEVERITIES = {"P1", "P2", "P3"}
 SPECULATION = ("可能", "疑似", "理论上", "猜测", "推测", "也许", "或许", "might", "maybe", "probably")
@@ -113,11 +125,25 @@ class ValidationResult:
     reasons: list[str] = field(default_factory=list)
     finding: dict[str, Any] | None = None
     normalized: dict[str, Any] | None = None
+    # v9.2 three-outcome gate: when ``ok`` is False, ``outcome`` distinguishes
+    # a hard rejection (default) from a phenomenon demotion ("observation").
+    outcome: str = ""
+    phenomenon_classes: list[str] = field(default_factory=list)
+
+    @property
+    def result_outcome(self) -> str:
+        if self.ok:
+            return "accepted"
+        return self.outcome or "rejected"
 
     def to_dict(self) -> dict[str, Any]:
         out = {"id": self.id, "path": self.path}
         if self.reasons:
             out["reasons"] = self.reasons
+        if not self.ok:
+            out["outcome"] = self.result_outcome
+        if self.phenomenon_classes:
+            out["phenomenon_classes"] = list(self.phenomenon_classes)
         if isinstance(self.finding, dict):
             out.update(_finding_target_projection(self.finding))
         return out
@@ -672,15 +698,85 @@ def _validate_claims(
         reasons.append("absolute impact wording is not a finite observed result")
 
 
-def _validate_submission_policy(
-    finding: dict[str, Any], packets: list[dict[str, Any]],
-    finding_dir: pathlib.Path, run_base: pathlib.Path, reasons: list[str],
-) -> None:
-    """Reject phenomenon-only roots before they can become SRC truth.
+def _security_boundary_proven(
+    verification: dict[str, Any], finding_dir: pathlib.Path,
+    run_base: pathlib.Path,
+) -> tuple[bool, list[str]]:
+    """Check verification.security_boundary is a complete consequence proof."""
+    boundary = verification.get("security_boundary")
+    if not isinstance(boundary, dict):
+        return False, ["error-only response requires a proven security_boundary result"]
+    kind = str(boundary.get("kind") or "").strip().lower()
+    refs = boundary.get("proof_refs") or []
+    marker = str(boundary.get("marker") or "").strip()
+    if (kind not in CONSEQUENCE_BOUNDARY_KINDS
+            or not isinstance(refs, list) or not refs or len(marker) < 4):
+        return False, ["security_boundary requires kind, proof_refs and marker"]
+    probe: list[str] = []
+    resolved = [
+        _exists(finding_dir, ref, run_base, probe,
+                f"verification.security_boundary.proof_refs[{index}]")
+        for index, ref in enumerate(refs)
+    ]
+    if probe:
+        return False, probe
+    if not any(path and marker in _read_text(path) for path in resolved):
+        return False, ["security_boundary marker not found in proof_refs"]
+    return True, []
 
-    Structured proof may show that a response changed while still failing to
-    show a security boundary break.  These rules encode the repository's
-    report policy independently of model wording and Markdown rendering.
+
+def _credential_boundary_proven(
+    verification: dict[str, Any], packets: list[dict[str, Any]],
+    finding_dir: pathlib.Path, run_base: pathlib.Path,
+) -> tuple[bool, list[str]]:
+    """Check verification.credential_boundary proves cross-boundary use."""
+    boundary = verification.get("credential_boundary")
+    if not isinstance(boundary, dict):
+        return False, ["credential exposure requires cross-boundary use proof"]
+    status = str(boundary.get("status") or "").strip().lower()
+    refs = boundary.get("proof_packet_ids") or []
+    marker = str(boundary.get("outcome_marker") or "").strip()
+    if (status not in {"cross_boundary_use_proven",
+                       "privileged_credential_exposed"}
+            or not isinstance(refs, list) or not refs or len(marker) < 4):
+        return False, ["credential_boundary proof is incomplete"]
+    packet_map = _packet_name_map(
+        packets, finding_dir, run_base)
+    if any(str(ref) not in packet_map for ref in refs):
+        return False, ["credential_boundary references unknown proof packets"]
+    if not any(
+            marker in _read_text(packet_map[str(ref)]["response"])
+            for ref in refs):
+        return False, ["credential outcome_marker not found in proof responses"]
+    if status == "cross_boundary_use_proven":
+        source_identity = str(
+            boundary.get("source_identity") or "").strip()
+        consumer_identity = str(
+            boundary.get("consumer_identity") or "").strip()
+        if (not source_identity or not consumer_identity
+                or source_identity == consumer_identity):
+            return False, ["cross-boundary credential use requires distinct identities"]
+    elif not str(boundary.get("privilege_scope") or "").strip():
+        return False, ["privileged credential exposure requires privilege_scope"]
+    return True, []
+
+
+def _classify_phenomenon_demotions(
+    finding: dict[str, Any], packets: list[dict[str, Any]],
+    finding_dir: pathlib.Path, run_base: pathlib.Path,
+) -> list[dict[str, Any]]:
+    """Classify phenomenon-only roots into demotions — never hard rejections.
+
+    v9.2 three-outcome gate: a finding with valid evidence but phenomenon-level
+    impact is demoted to a run-scoped observation.  Demotions are NOT appended
+    to validation ``reasons``: observations bypass the batch-atomic gate, so
+    one piece of noise cannot poison every real finding in the run.  A proven
+    consequence chain (or the class's specialized boundary proof) keeps the
+    finding SRC-eligible.  This converges the historical conditional gates
+    (rate-limit/open-redirect/error-only/credential) and the noise-root
+    keyword gate into one mechanism, and closes the weak-crypto/public-key
+    blind spot.  Matching spans title + vuln_type + risk.summary +
+    risk.proven_impact, so title rewording alone cannot bypass it.
     """
     risk = finding.get("risk") if isinstance(finding.get("risk"), dict) else {}
     verification = (
@@ -693,74 +789,35 @@ def _validate_submission_policy(
         finding.get("title"), finding.get("vuln_type"),
         risk.get("summary"), risk.get("proven_impact"),
     ))
-    if SUBMISSION_NOISE_ROOT.search(text):
-        reasons.append("submission_policy: phenomenon-only noise root is not SRC eligible")
-    if RATE_LIMIT_ROOT.search(text) and str(chain.get("status") or "") != "proven":
-        reasons.append(
-            "submission_policy: rate-limit weakness requires a proven downstream security result")
-    if OPEN_REDIRECT_ROOT.search(text) and str(chain.get("status") or "") != "proven":
-        reasons.append(
-            "submission_policy: open redirect requires a proven downstream security result")
-    if ERROR_ONLY_ROOT.search(text):
-        boundary = verification.get("security_boundary")
-        if not isinstance(boundary, dict):
-            reasons.append(
-                "submission_policy: error-only response requires a proven security_boundary result")
-        else:
-            kind = str(boundary.get("kind") or "").strip().lower()
-            refs = boundary.get("proof_refs") or []
-            marker = str(boundary.get("marker") or "").strip()
-            if (kind not in {"data_read", "state_change", "code_execution",
-                             "authorization_bypass", "trusted_secret_use"}
-                    or not isinstance(refs, list) or not refs or len(marker) < 4):
-                reasons.append(
-                    "submission_policy: security_boundary requires kind, proof_refs and marker")
-            else:
-                resolved = [
-                    _exists(finding_dir, ref, run_base, reasons,
-                            f"verification.security_boundary.proof_refs[{index}]")
-                    for index, ref in enumerate(refs)
-                ]
-                if not any(path and marker in _read_text(path) for path in resolved):
-                    reasons.append(
-                        "submission_policy: security_boundary marker not found in proof_refs")
-    if CREDENTIAL_LEAK_ROOT.search(text):
-        boundary = verification.get("credential_boundary")
-        if not isinstance(boundary, dict):
-            reasons.append(
-                "submission_policy: credential exposure requires cross-boundary use proof")
-        else:
-            status = str(boundary.get("status") or "").strip().lower()
-            refs = boundary.get("proof_packet_ids") or []
-            marker = str(boundary.get("outcome_marker") or "").strip()
-            if (status not in {"cross_boundary_use_proven",
-                               "privileged_credential_exposed"}
-                    or not isinstance(refs, list) or not refs or len(marker) < 4):
-                reasons.append(
-                    "submission_policy: credential_boundary proof is incomplete")
-            else:
-                packet_map = _packet_name_map(
-                    packets, finding_dir, run_base)
-                if any(str(ref) not in packet_map for ref in refs):
-                    reasons.append(
-                        "submission_policy: credential_boundary references unknown proof packets")
-                elif not any(
-                        marker in _read_text(packet_map[str(ref)]["response"])
-                        for ref in refs):
-                    reasons.append(
-                        "submission_policy: credential outcome_marker not found in proof responses")
-                if status == "cross_boundary_use_proven":
-                    source_identity = str(
-                        boundary.get("source_identity") or "").strip()
-                    consumer_identity = str(
-                        boundary.get("consumer_identity") or "").strip()
-                    if (not source_identity or not consumer_identity
-                            or source_identity == consumer_identity):
-                        reasons.append(
-                            "submission_policy: cross-boundary credential use requires distinct identities")
-                elif not str(boundary.get("privilege_scope") or "").strip():
-                    reasons.append(
-                        "submission_policy: privileged credential exposure requires privilege_scope")
+    classes = classify_phenomenon(text)
+    if not classes:
+        return []
+    chain_proven = str(chain.get("status") or "") == "proven"
+    demotions: list[dict[str, Any]] = []
+    for cls in classes:
+        if cls in PHENOMENON_CHAIN_PROOF:
+            if chain_proven:
+                continue
+            details = [
+                "phenomenon-only root requires a proven consequence chain "
+                "(chain_assessment.status=proven); demoted to observation"]
+        elif cls == "error_stack":
+            boundary_ok, details = _security_boundary_proven(
+                verification, finding_dir, run_base)
+            if boundary_ok:
+                continue
+        elif cls == "credential_echo_unproven":
+            boundary_ok, details = _credential_boundary_proven(
+                verification, packets, finding_dir, run_base)
+            if boundary_ok:
+                continue
+        else:  # pragma: no cover - taxonomy drift guard
+            continue
+        demotions.append({
+            "phenomenon_class": cls,
+            "reason": f"submission_policy[{cls}]: " + "; ".join(details),
+        })
+    return demotions
 
 
 def _validate_chain(
@@ -1527,8 +1584,8 @@ def validate_finding(
     _validate_verification(finding, packets, finding_dir, run_base, reasons)
     _validate_chain(finding, finding_dir, run_base, reasons)
     _validate_claims(finding, packets, finding_dir, run_base, reasons)
-    _validate_submission_policy(
-        finding, packets, finding_dir, run_base, reasons)
+    demotions = _classify_phenomenon_demotions(
+        finding, packets, finding_dir, run_base)
 
     poc = finding.get("poc") if isinstance(finding.get("poc"), dict) else {}
     steps = finding.get("manual_burp_replay")
@@ -1570,6 +1627,17 @@ def validate_finding(
             for i, ref in enumerate(helpers):
                 _exists(finding_dir, ref, run_base, reasons, f"crypto_chain.helper_files[{i}]")
 
+    # v9.2 three-outcome gate: hard validation failures stay rejections and
+    # keep their batch-atomic semantics; phenomenon demotions only apply when
+    # the evidence itself is otherwise valid, so a malformed package can never
+    # launder itself into the observation bucket.
+    outcome = ""
+    phenomenon_classes: list[str] = []
+    if not reasons and demotions:
+        outcome = "observation"
+        phenomenon_classes = [str(d["phenomenon_class"]) for d in demotions]
+        reasons.extend(str(d["reason"]) for d in demotions)
+
     normalized = None if reasons else normalize_finding(
         finding, finding_file, run_base,
         exact_cell_bindings=exact_cell_bindings,
@@ -1581,6 +1649,8 @@ def validate_finding(
         reasons=reasons,
         finding=finding,
         normalized=normalized,
+        outcome=outcome,
+        phenomenon_classes=phenomenon_classes,
     )
 
 
@@ -1591,14 +1661,19 @@ def validate_findings(
     *,
     context: ValidationContext | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    accepted, rejected = [], []
+    accepted, rejected, observations = [], [], []
     for item in items:
         finding = item.get("finding", item)
         path = item.get("path") or finding.get("_finding_path") or ""
         res = validate_finding(
             finding, path, run_dir, authorized_hosts=authorized_hosts, context=context)
-        (accepted if res.ok else rejected).append(res.to_dict())
-    return {"accepted": accepted, "rejected": rejected}
+        if res.ok:
+            accepted.append(res.to_dict())
+        elif res.outcome == "observation":
+            observations.append(res.to_dict())
+        else:
+            rejected.append(res.to_dict())
+    return {"accepted": accepted, "rejected": rejected, "observations": observations}
 
 
 def _sha256_file(path: pathlib.Path) -> str:
@@ -3509,10 +3584,10 @@ def validate_run_artifacts(
     """
     from .collect import collect_structured_findings
     try:
-        from ..enforce import ACCEPTED, guardian_check_finding
+        from ..enforce import ACCEPTED, DEMOTED, guardian_check_finding
         from ..version import __version__
     except ImportError:  # pragma: no cover
-        from enforce import ACCEPTED, guardian_check_finding
+        from enforce import ACCEPTED, DEMOTED, guardian_check_finding
         from version import __version__
 
     base = pathlib.Path(run_dir).resolve()
@@ -3536,6 +3611,7 @@ def validate_run_artifacts(
     )
     ingestion_errors = [*preflight_errors, *list(collected.get("ingestion_errors") or [])]
     rejected = list(collected.get("rejected") or [])
+    observations = [dict(item) for item in (collected.get("observations") or [])]
     confirmed: list[dict[str, Any]] = []
     normalized_confirmed: list[dict[str, Any]] = []
     accepted_paths: set[str] = set()
@@ -3548,6 +3624,15 @@ def validate_run_artifacts(
         if verdict.result == ACCEPTED:
             confirmed.append({"id": item.get("id"), "path": str(path)})
             accepted_paths.add(str(path.resolve()))
+        elif verdict.result == DEMOTED or verdict.level == 1:
+            # v9.2: guardian demotions and L1 garbage-title hits demote to
+            # observations; they never trigger the batch-atomic gate.
+            observations.append({
+                "id": item.get("id"), "path": str(path),
+                "finding": item.get("finding") or {},
+                "outcome": "observation",
+                "reasons": [f"guardian:{verdict.result}:L{verdict.level}:{verdict.reason}"],
+            })
         else:
             rejected.append({
                 "id": item.get("id"), "path": str(path),
@@ -3677,6 +3762,7 @@ def validate_run_artifacts(
         **(collected.get("counts") or {}),
         "proof_confirmed": len(confirmed),
         "rejected": len(rejected),
+        "observations": len(observations),
         "ingestion_errors": len(ingestion_errors),
     }
     result: dict[str, Any] = {
@@ -3696,6 +3782,7 @@ def validate_run_artifacts(
         "proof_confirmed": confirmed,
         "normalized_findings": normalized_confirmed,
         "proof_pending_or_rejected": rejected,
+        "observations": observations,
         "ingestion_errors": ingestion_errors,
         "warnings": list(collected.get("warnings") or []),
         "artifact_hashes": artifact_hashes,

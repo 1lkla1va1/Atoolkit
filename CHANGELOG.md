@@ -1,5 +1,15 @@
 # Changelog
 
+## 9.2.0 - 2026-08-12
+
+- 报告出口收口：新增 `python3 -m engine.skill_runtime report --run-dir <run>`，Direct/Skill 模式的最终报告只能由代码从验证通过的 Finding 渲染；手写 `final_report.md`/`draft_report.md`/`observation_report.md` 在 checkpoint 与 report 两个时机被 quarantine（移入 `state/quarantine/`，不删除），渲染结果 sha256 写入 `runtime-status.json` 的 `rendered_artifacts` 供人工验真。裸 Direct 模式无法防止 report 之后的再次手写，完全闭合仍需 Wrapped Skill。
+- Finding 三分类 outcome（accepted/rejected/observation）：命中现象分类（CORS/弱加密/公钥/安全头/版本/SSL 配置/限频/开放重定向/目录列举/报错/自有凭据回显等，`vuln_classes.PHENOMENON_PATTERNS`）且无已证后果链的 Finding 自动降级为 observation，进 `observations.json` 与 `observation_report.md`（不含 P1-P3 严重度），不触发批次原子门、不计入 proof repair、不进 ProjectState；`chain_assessment.status=proven` 且链到已证后果的现象类 Finding 仍可 accepted。
+- **语义变化明示**：rate-limit/open-redirect 无链、error-only 无 security_boundary、凭据回显无跨边界使用证明、以及 CORS/sourcemap/安全头/版本/SSL 等原 noise-root 命中，由 rejected（触发批次原子连坐）改为降级 observation；硬校验（证据/授权/格式）失败仍 rejected 且连坐语义不变。弱加密/公钥类盲区（RSA1_5/JWT alg/证书过期/混合内容）纳入现象分类。
+- 报告三态决策（complete/draft/not_generated）抽取为 `engine/reporting/decision.py` 共享实现，finalizer 与 skill_runtime report 逐字节一致；Direct checkpoint 的 finding 收集路径接入 Guardian 八级门（demoted 映射为 observation）。
+- 修复 pre-existing 缺陷：Direct init/checkpoint 不再用模型视图覆写 Host 的 `execution-queue.json` 投影（此前必现 `execution_projection_mismatch`，导致 checkpoint 后 closure 恒失败）。
+- AGENTS.md 同步：§0.1 报告所有权含观察报告与 report 命令、§1 垃圾洞清单改为"默认降级观察报告"并扩列弱加密/公钥、§8 补现象分类与后果链升级条件、§11 终态自检补报告 hash 验真；底部历史变更注释移除（`design/迭代方案/` 已存档），文件 49.3KB → 45.6KB。
+- 新增 v9.2 发布门合同测试（现象降级/升级、改写绕过、批原子隔离、防洗白、checkpoint Guardian、quarantine、三态一致性、观察渲染、checkpoint→validate 投影一致性回归）。
+
 ## 9.1.0 - 2026-07-20
 
 - 新增 `--continue-from-run`：重算并校验 prior validation/attribution/agenda，将 diagnostic `continuation-input.json` 绑定进新 Run manifest；不伪造 containment，也不提升 ProjectState/submission authority。

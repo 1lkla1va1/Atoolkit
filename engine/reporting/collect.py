@@ -124,6 +124,7 @@ def collect_structured_findings(
     base = pathlib.Path(run_dir).resolve()
     accepted: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
+    observations: list[dict[str, Any]] = []
     normalized: list[dict[str, Any]] = []
     finding_objs: list[dict[str, Any]] = []
     ingestion_errors: list[dict[str, Any]] = []
@@ -197,6 +198,13 @@ def collect_structured_findings(
             accepted.append(item)
             finding_objs.append(item)
             normalized.append(result.normalized or normalize_finding(finding, path, base))
+        elif result.outcome == "observation":
+            # v9.2 three-outcome gate: phenomenon-only roots are demoted, not
+            # rejected.  They bypass the batch-atomic gate and never become
+            # project truth, but stay auditable for the observation report.
+            observation = result.to_dict()
+            observation["finding"] = finding
+            observations.append(observation)
         else:
             rejected.append(result.to_dict())
 
@@ -204,6 +212,7 @@ def collect_structured_findings(
         **discovery["counts"],
         "accepted": len(accepted),
         "rejected": len(rejected),
+        "observations": len(observations),
         "ingestion_errors": len(ingestion_errors),
     }
     return {
@@ -212,6 +221,7 @@ def collect_structured_findings(
         "schema_valid": accepted,
         "proof_pending": [],
         "rejected": rejected,
+        "observations": observations,
         "normalized": normalized,
         "finding_objs": finding_objs,
         "discovery": discovery,

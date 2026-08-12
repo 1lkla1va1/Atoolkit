@@ -229,3 +229,79 @@ def vc_matches(vc: str, group: str) -> bool:
 def is_chainable(vc: str) -> bool:
     """Check if vuln_class supports chain exploitation."""
     return norm_vc(vc) in CHAINABLE_GROUPS
+
+
+# ---------------------------------------------------------------------------
+# Phenomenon classes (v9.2) — single source for the reporting three-outcome
+# gate in reporting/validate.py.  Code constants + contract tests.
+# ---------------------------------------------------------------------------
+# A "phenomenon" is an observable configuration/signal that is not, by
+# itself, a proven security-boundary break.  Findings classified here need a
+# proven consequence chain to stay SRC-eligible; otherwise they are demoted
+# to run-scoped observations instead of being rejected, so one piece of
+# noise can neither poison the batch-atomic gate nor ride into the final
+# report.  Classification matches against title + vuln_type + risk.summary +
+# risk.proven_impact, so rewording a title alone cannot bypass it.
+
+PHENOMENON_PATTERNS: dict[str, re.Pattern] = {
+    "cors_misconfig": re.compile(
+        r"\bCORS\b|跨域|access[- ]?control[- ]?allow", re.I),
+    "sourcemap_leak": re.compile(
+        r"source\s*map|sourcemap|\.map\b", re.I),
+    "missing_security_header": re.compile(
+        r"x-frame-options|\bCSP\b|\bHSTS\b|安全响应?头", re.I),
+    "version_disclosure": re.compile(
+        r"版本号|中间件指纹|组件指纹", re.I),
+    "self_xss": re.compile(
+        r"self[- ]?xss", re.I),
+    "ssl_tls_config": re.compile(
+        r"\bSSL\b|\bTLS\b|证书过期|混合内容|mixed[- ]?content|"
+        r"加密套件|cipher[- ]?suite", re.I),
+    "directory_listing": re.compile(
+        r"目录列举|directory[- ]?listing", re.I),
+    "error_stack": re.compile(
+        r"报错堆栈|stack\s*trace|类型混淆|type\s*confusion|未处理异常|"
+        r"unhandled\s+exception|internal\s+server\s*error|\b500\b|报错", re.I),
+    "rate_limit_absent": re.compile(
+        r"rate[- ]?limit|限频|速率限制|频率限制", re.I),
+    "open_redirect_unproven": re.compile(
+        r"open[- ]?redirect|开放重定向|任意跳转", re.I),
+    "weak_crypto": re.compile(
+        r"弱算法|弱加密|rsa1[_-]?5|weak[- ]?(?:crypto|cipher|algorithm|"
+        r"encryption)|不安全的?(?:加密|哈希)算法|jwt.{0,12}(?:alg|算法)", re.I),
+    "public_key_disclosure": re.compile(
+        r"公钥|public[- ]?key|jwks", re.I),
+    "credential_echo_unproven": re.compile(
+        r"(?:(?:token|cookie|api[-_ ]?key|credential|session|凭据|令牌|密钥|会话)"
+        r".{0,20}(?:leak|expos|disclos|泄露|暴露|回显)|"
+        r"(?:leak|expos|disclos|泄露|暴露|回显).{0,20}"
+        r"(?:token|cookie|api[-_ ]?key|credential|session|凭据|令牌|密钥|会话))",
+        re.I),
+}
+
+# Classes whose consequence proof is a specialized structured gate in
+# reporting/validate.py (security_boundary / credential_boundary), not merely
+# chain_assessment.status=proven.
+PHENOMENON_SPECIAL_PROOF: frozenset = frozenset({
+    "error_stack", "credential_echo_unproven",
+})
+# Every other class (including the historical rate-limit/open-redirect
+# conditional gates) is cleared by chain_assessment.status=proven.
+PHENOMENON_CHAIN_PROOF: frozenset = frozenset(
+    set(PHENOMENON_PATTERNS) - PHENOMENON_SPECIAL_PROOF)
+
+# Security-boundary break kinds that count as a proven consequence.
+CONSEQUENCE_BOUNDARY_KINDS: frozenset = frozenset({
+    "data_read", "state_change", "code_execution",
+    "authorization_bypass", "trusted_secret_use", "fund_change",
+})
+
+
+def classify_phenomenon(text: str) -> list[str]:
+    """Return every phenomenon class whose pattern matches ``text``."""
+    if not text:
+        return []
+    return [
+        name for name, pattern in PHENOMENON_PATTERNS.items()
+        if pattern.search(text)
+    ]
