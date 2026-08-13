@@ -61,6 +61,9 @@ def test_live_run_is_fail_closed_without_explicit_egress_acceptance() -> None:
             "--target", "https://t.example/login/",
             "--authz", "authorized fixture",
             "--ad-hoc",
+            # v9.3: live runs must explicitly attest the Codex channel first;
+            # this test exercises the egress gate that comes after it.
+            "--via", "codex",
         ],
         cwd=run.ROOT,
         capture_output=True,

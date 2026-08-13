@@ -772,6 +772,7 @@ def create_run_manifest(
     canonical_report_required: bool = False,
     run_phase: str = "single",
     phase_parent: dict[str, Any] | None = None,
+    derived_scopes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Create the immutable-start provenance record and write it atomically."""
     run_base = _absolute_lexical(run_dir)
@@ -874,6 +875,13 @@ def create_run_manifest(
         "submission_contract_version": 1,
         "authz_sha256": sha256_text(authz),
     }
+    normalized_derived = normalize_authorized_scopes([
+        str(value) for value in (derived_scopes or []) if str(value).strip()])
+    if normalized_derived:
+        # Optional v9.3 evidence-scope policy (not an identity field): proof
+        # packets may target these derived assets when the finding declares an
+        # in-scope issuing endpoint via verification.issued_by.
+        requested["derived_scopes"] = normalized_derived
     manifest_path = run_base / "run_manifest.json"
     if manifest_path.is_file():
         existing = load_manifest(manifest_path)

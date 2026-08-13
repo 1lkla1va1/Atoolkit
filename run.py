@@ -1786,6 +1786,13 @@ def main():
                     help="--identity 凭据的注入方式：cookie→Cookie 头；bearer→Authorization: Bearer")
     ap.add_argument("--model", default="gpt-5.5", help="模型名（换模型只改这里）")
     ap.add_argument("--allow", action="append", default=[], help="额外授权 host（可多次）")
+    ap.add_argument("--allow-derived", action="append", default=[],
+                    help="派生资产 host/URL（OSS bucket、CDN 等，可多次）；仅允许作为证据包目标，"
+                         "且 finding 必须声明 verification.issued_by 在册签发端点（v9.3）")
+    ap.add_argument("--via", choices=["codex"], default="",
+                    help="显式声明 Engine 运行通道（v9.3）。真实运行会拉起外部 codex/gpt 后端，"
+                         "仅 Codex CLI 环境可传 --via codex（或设 ATOOLKIT_VIA=codex）；"
+                         "QoderWork/ZCode 等 IDE 禁止走本入口，改用 engine.skill_runtime")
     ap.add_argument("--base-path", default="",
                     help="显式应用根路径（如 /range/pentest/shop/）；不从 target 的 /login/ 等入口猜测")
     ap.add_argument("--allow-path", action="append", default=[],
@@ -1892,6 +1899,17 @@ def main():
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["ok"] else 1
+    # v9.3 运行环境路由：run.py 的真实运行路径会实例化 CodexAdapter，拉起外部
+    # codex/gpt 后端（计费与数据出站与当前 IDE 无关）。QoderWork/ZCode 等 IDE 的
+    # agent 读到 AGENTS.md 后误跑本入口是实跑事故来源，因此 live run 必须显式
+    # 声明运行通道；dry-run/audit/submission/score 不实例化适配器，不受影响。
+    if not args.dry_run and args.via != "codex" and os.environ.get("ATOOLKIT_VIA") != "codex":
+        ap.error(
+            "Engine Mode 真实运行仅服务 Codex CLI（会拉起外部 codex/gpt 后端）。"
+            "确认你在 Codex 环境 → 加 --via codex（或 export ATOOLKIT_VIA=codex）；"
+            "QoderWork/ZCode/其他 IDE → 禁止本入口，改用 Direct 模式："
+            "python3 -m engine.skill_runtime preflight/init/observe/checkpoint/scope/report"
+        )
     # 非 self-check：--target 必填（argparse 层已放宽为非 required 以放行 --self-check）。
     if not args.target:
         ap.error("--target 为必填（自检门用 --self-check，可不带该参数）")
@@ -2016,6 +2034,10 @@ def main():
     if any(parse_authorized_scope(scope) is None for scope in raw_scopes):
         ap.error("--allow 必须是合法的 host、host:port、*.domain 或 http(s) URL")
     hosts = normalize_authorized_scopes(raw_scopes)
+    derived_hosts = normalize_authorized_scopes([
+        str(value) for value in args.allow_derived if str(value).strip()])
+    if len(derived_hosts) != len([v for v in args.allow_derived if str(v).strip()]):
+        ap.error("--allow-derived 必须是合法的 host、host:port、*.domain 或 http(s) URL")
     try:
         allow_paths = [normalize_explicit_base_path(value) for value in args.allow_path]
         deny_paths = [normalize_explicit_base_path(value) for value in args.deny_path]
@@ -2508,6 +2530,7 @@ def main():
         "deny_paths": deny_paths,
         "authorization_assurance": authorization_assurance,
         "target_fingerprint": target_fingerprint,
+        "derived_scopes": derived_hosts,
         "execution_provenance": {
             **execution_provenance,
             "adapter": str(getattr(adapter, "name", "unknown") or "unknown"),

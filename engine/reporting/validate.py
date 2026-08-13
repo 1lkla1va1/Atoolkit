@@ -200,6 +200,7 @@ class ValidationContext:
 
     primary_target: str = ""
     authorized_scopes: tuple[str, ...] = ()
+    derived_scopes: tuple[str, ...] = ()
     manifest: dict[str, Any] | None = None
     manifest_path: pathlib.Path | None = None
 
@@ -209,9 +210,11 @@ class ValidationContext:
     ) -> "ValidationContext":
         primary = str(manifest.get("primary_target") or "").strip()
         scopes = tuple(normalize_authorized_scopes(list(manifest.get("authorized_scopes") or [])))
+        derived = tuple(normalize_authorized_scopes(list(manifest.get("derived_scopes") or [])))
         return cls(
             primary_target=primary,
             authorized_scopes=scopes,
+            derived_scopes=derived,
             manifest=manifest,
             manifest_path=pathlib.Path(manifest_path).resolve() if manifest_path else None,
         )
@@ -232,6 +235,10 @@ class ValidationContext:
     def allows(self, target: str) -> bool:
         url = self.target_url(target)
         return bool(url and self.authorized_scopes and is_authorized_url(url, list(self.authorized_scopes)))
+
+    def allows_derived(self, target: str) -> bool:
+        url = self.target_url(target)
+        return bool(url and self.derived_scopes and is_authorized_url(url, list(self.derived_scopes)))
 
 
 def _target_allowed(
@@ -268,6 +275,69 @@ def _request_target_allowed(path: pathlib.Path, context: ValidationContext) -> b
     primary = urlparse(context.primary_target)
     scheme = primary.scheme or "https"
     return context.allows(f"{scheme}://{host_match.group(1)}{raw_target}")
+
+
+def _request_url(path: pathlib.Path, context: ValidationContext) -> str:
+    """Resolve the absolute URL a request packet targets ('' when not a request)."""
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    first = re.search(
+        r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)\s+HTTP/", text, re.I | re.M)
+    if not first:
+        return ""
+    raw_target = first.group(2)
+    if urlparse(raw_target).scheme in {"http", "https"}:
+        return raw_target
+    host_match = re.search(r"^Host:\s*([^\s]+)\s*$", text, re.I | re.M)
+    if not host_match:
+        return ""
+    primary = urlparse(context.primary_target)
+    scheme = primary.scheme or "https"
+    return f"{scheme}://{host_match.group(1)}{raw_target}"
+
+
+def _finding_issued_by(finding: dict[str, Any]) -> str:
+    verification = finding.get("verification")
+    if isinstance(verification, dict):
+        return str(verification.get("issued_by") or "").strip()
+    return ""
+
+
+def _derived_packet_allowed(
+    req: pathlib.Path,
+    finding: dict[str, Any],
+    derived_hosts: list[str] | None,
+    context: ValidationContext | None,
+    authorized_hosts: list[str] | None = None,
+) -> bool:
+    """v9.3 derived assets: a proof packet may target derived infrastructure
+    (OSS bucket/CDN/...) only when the finding declares an in-scope issuing
+    endpoint via ``verification.issued_by``."""
+    if context is not None:
+        url = _request_url(req, context)
+        if not url or not context.allows_derived(url):
+            return False
+        issued_by = _finding_issued_by(finding)
+        return bool(issued_by) and context.allows(issued_by)
+    if not derived_hosts:
+        return False
+    text = req.read_text(encoding="utf-8", errors="ignore")
+    first = re.search(
+        r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)\s+HTTP/", text, re.I | re.M)
+    if not first:
+        return False
+    url = first.group(2)
+    if urlparse(url).scheme not in {"http", "https"}:
+        return False
+    if not is_authorized_url(url, derived_hosts):
+        return False
+    issued_by = _finding_issued_by(finding)
+    if not issued_by:
+        return False
+    if urlparse(issued_by).scheme not in {"http", "https"}:
+        return False
+    # The issuing endpoint must itself be authorized whenever a host list is
+    # available; without one (fully legacy runs) there is nothing to check.
+    return not authorized_hosts or is_authorized_url(issued_by, authorized_hosts)
 
 
 def _has_proven_language(text: str) -> bool:
@@ -1492,6 +1562,7 @@ def validate_finding(
     authorized_hosts: list[str] | None = None,
     *,
     context: ValidationContext | None = None,
+    derived_hosts: list[str] | None = None,
 ) -> ValidationResult:
     finding_file = pathlib.Path(finding_path).resolve()
     finding_dir = finding_file.parent
@@ -1567,8 +1638,10 @@ def validate_finding(
         if req:
             packet_files.add(req.name)
             if context is not None and not _request_target_allowed(req, context):
-                reasons.append(
-                    f"proof request target out of authorized scopes: {packet.get('request_file')}")
+                if not _derived_packet_allowed(
+                        req, finding, derived_hosts, context, authorized_hosts):
+                    reasons.append(
+                        f"proof request target out of authorized scopes: {packet.get('request_file')}")
         if resp:
             packet_files.add(resp.name)
         if not str(packet.get("evidence_summary") or "").strip():
@@ -3567,6 +3640,7 @@ def validate_run_artifacts(
     run_dir: str | pathlib.Path,
     *,
     allowed_hosts: list[str] | None = None,
+    derived_hosts: list[str] | None = None,
     allow_empty: bool = False,
     output_path: str | pathlib.Path | None = None,
     expected_authority_dir: str | pathlib.Path | None = None,
@@ -3608,6 +3682,7 @@ def validate_run_artifacts(
         base,
         authorized_hosts=(allowed_hosts or None) if context is None else None,
         context=context,
+        derived_hosts=derived_hosts,
     )
     ingestion_errors = [*preflight_errors, *list(collected.get("ingestion_errors") or [])]
     rejected = list(collected.get("rejected") or [])

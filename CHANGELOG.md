@@ -1,5 +1,14 @@
 # Changelog
 
+## 9.3.0 - 2026-08-13
+
+- 多资产授权收口（修复 gzfsf_172 实证：4 个在册资产 finding 全被 scope 误杀）：Direct 模式 `skill_runtime init/preflight` 新增 `--allow`（可多次）与 `--scope-file`（AUTHZ.md/authz.md Markdown 或 run_scope.json JSON），全部在册资产归一化后写入 ledger `metadata.authorized_scopes`；checkpoint 与 report 的 finding/guardian 校验改用完整列表（旧 run 无该字段时回退单 target，行为不变）。
+- 新增 `python3 -m engine.skill_runtime scope --run-dir <run> --add <url> [--derived <url>] [--reason ...]`：中途扩资产 append-only 通道，去重写入 ledger 并落 `state/scope-audit.jsonl` 审计，无需重开 Run。
+- 派生资产（derived assets）：OSS bucket/CDN/回调域等由在册端点签发凭证触达的第三方基础设施，可登记为派生资产（`--allow-derived` / scope 文件「派生资产」小节 / manifest `derived_scopes`）。派生资产不能作为 finding root target，仅允许作为 proof packet 目标，且 finding 必须声明 `verification.issued_by`（在册签发端点 URL），否则维持拒绝。
+- 运行环境路由（修复非 Codex IDE 误调 codex/gpt-5.5）：`run.py` 真实运行路径必须显式 `--via codex`（或 `ATOOLKIT_VIA=codex`），否则 fail closed 并打印 Direct 模式指引；dry-run/audit/submission/score 不受影响。AGENTS.md 标题去 Codex 中心化，「运行约定」改为运行环境路由块。
+- installer 同步生成单一授权真相与 IDE 薄 shim：workspace 首次安装时生成 `AUTHZ.md`（授权模板，机器可解析 scope/派生资产小节）与 `AGENTS.local.md`（QoderWork/ZCode 通用指针，不含授权细节）；均 create-exclusive，绝不覆盖已有文件。
+- 新增 v9.3 合同测试 9 例（多资产 checkpoint 接受/拒绝、scope 追加+审计+去重、scope 文件双格式解析、派生资产 issued_by 门、run.py 路由防护）。
+
 ## 9.2.1 - 2026-08-13
 
 - 版本信息统一刷新（README/SKILL.md，此前仍为 9.1.0）；新增 `DISCLAIMER.md` 免责声明，README 补设计初衷与授权模板说明。

@@ -53,6 +53,7 @@ try:
     from .orchestrator import CognitiveState
     from .planner import plan_surfaces
     from .project_state import canonical_asset
+    from .host_policy import normalize_authorized_scopes
     from .reporting.collect import collect_structured_findings
     from .reporting.decision import decide_canonical_report, gate_outcomes
     from .reporting.observations import (
@@ -101,6 +102,7 @@ except ImportError:  # pragma: no cover - script execution fallback
     from orchestrator import CognitiveState
     from planner import plan_surfaces
     from project_state import canonical_asset
+    from host_policy import normalize_authorized_scopes
     from reporting.collect import collect_structured_findings
     from reporting.decision import decide_canonical_report, gate_outcomes
     from reporting.observations import (build_observation_records,
@@ -200,6 +202,9 @@ def preflight_direct_run(
     target: str,
     workspace_root: pathlib.Path | None = None,
     require_instruction_match: bool = False,
+    extra_scopes: Iterable[str] | None = None,
+    scope_files: Iterable[pathlib.Path] | None = None,
+    derived_assets: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Create the diagnostic trust boundary before fresh black-box recon.
 
@@ -212,6 +217,8 @@ def preflight_direct_run(
     normalized_target = str(target).strip()
     if not normalized_target:
         raise SkillRuntimeError("Direct preflight requires target")
+    authorized_scopes, derived_scopes = _resolve_scope_inputs(
+        normalized_target, extra_scopes, scope_files, derived_assets)
     instruction_binding: dict[str, Any] | None = None
     if require_instruction_match:
         workspace = workspace_root.resolve() if workspace_root else None
@@ -236,6 +243,8 @@ def preflight_direct_run(
         "mode": "direct_diagnostic",
         "phase": "recon",
         "target": normalized_target,
+        "authorized_scopes": authorized_scopes,
+        "derived_assets": derived_scopes,
         "authority_trusted": False,
         "delivery_eligible": False,
         "execution_contract_version": EXECUTION_CONTRACT_VERSION,
@@ -286,6 +295,104 @@ def _dedupe(values: Iterable[Any]) -> list[str]:
             seen.add(key)
             out.append(text)
     return out
+
+
+_URL_TOKEN = re.compile(r"https?://[^\s)\]>\"'，。；、]+")
+_SCOPE_HEADING = re.compile(r"^#{1,6}\s*(?P<title>.+?)\s*$")
+_SCOPE_JSON_KEYS = ("target_domains", "authorized_scopes", "scopes")
+_DERIVED_JSON_KEYS = ("derived_assets", "derived_scopes")
+
+
+def _markdown_section_urls(text: str, keywords: tuple[str, ...]) -> list[str]:
+    """Collect absolute URLs listed under the first matching Markdown heading."""
+    collect = False
+    found: list[str] = []
+    for line in text.splitlines():
+        heading = _SCOPE_HEADING.match(line.strip())
+        if heading:
+            if collect:
+                break
+            title = heading.group("title").lower()
+            collect = any(keyword in title for keyword in keywords)
+            continue
+        if collect:
+            found.extend(_URL_TOKEN.findall(line))
+    return found
+
+
+def parse_scope_file(path: pathlib.Path) -> tuple[list[str], list[str]]:
+    """Return ``(authorized_scopes, derived_assets)`` from a JSON or Markdown file.
+
+    JSON files (run_scope.json and friends) contribute ``target_domains`` /
+    ``authorized_scopes`` / ``scopes`` and ``derived_assets`` / ``derived_scopes``.
+    Markdown files (AUTHZ.md / authz.md) contribute URLs listed under a heading
+    containing ``scope``/``范围`` and, for derived assets, ``派生资产``/``derived``.
+    """
+    absolute = path.resolve()
+    if not absolute.is_file() or absolute.is_symlink():
+        raise SkillRuntimeError(f"scope file is missing or unsafe: {path}")
+    text = absolute.read_text(encoding="utf-8", errors="ignore")
+    stripped = text.lstrip()
+    scopes: list[str] = []
+    derived: list[str] = []
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise SkillRuntimeError(f"invalid scope file JSON {path}: {exc}") from exc
+        if isinstance(value, list):
+            scopes = [str(item) for item in value]
+        elif isinstance(value, dict):
+            for key in _SCOPE_JSON_KEYS:
+                raw = value.get(key)
+                if isinstance(raw, list):
+                    scopes.extend(str(item) for item in raw)
+            for key in _DERIVED_JSON_KEYS:
+                raw = value.get(key)
+                if isinstance(raw, list):
+                    derived.extend(str(item) for item in raw)
+        else:
+            raise SkillRuntimeError(f"scope file JSON must be object or list: {path}")
+    else:
+        scopes = _markdown_section_urls(text, ("scope", "范围"))
+        derived = _markdown_section_urls(text, ("派生资产", "derived"))
+    return scopes, derived
+
+
+def _resolve_scope_inputs(
+    target: str,
+    extra_scopes: Iterable[str] | None,
+    scope_files: Iterable[pathlib.Path] | None,
+    derived_assets: Iterable[str] | None,
+) -> tuple[list[str], list[str]]:
+    """Normalize primary target + extra scopes + scope files into scope lists."""
+    scopes: list[str] = [str(target or "").strip()]
+    derived: list[str] = [str(item).strip() for item in (derived_assets or [])]
+    scopes.extend(str(item).strip() for item in (extra_scopes or []))
+    for scope_file in scope_files or []:
+        file_scopes, file_derived = parse_scope_file(pathlib.Path(scope_file))
+        scopes.extend(file_scopes)
+        derived.extend(file_derived)
+    normalized = normalize_authorized_scopes([item for item in scopes if item])
+    if not normalized:
+        raise SkillRuntimeError("no valid authorized scope could be derived")
+    return normalized, normalize_authorized_scopes([item for item in derived if item])
+
+
+def _metadata_authorized_scopes(metadata: dict[str, Any]) -> list[str]:
+    """Full authorized scope list from ledger metadata (legacy runs fall back)."""
+    scopes = metadata.get("authorized_scopes")
+    if isinstance(scopes, list) and scopes:
+        return [str(item) for item in scopes]
+    target = str(metadata.get("target") or "").strip()
+    return [target] if target else []
+
+
+def _metadata_derived_assets(metadata: dict[str, Any]) -> list[str]:
+    derived = metadata.get("derived_assets")
+    if isinstance(derived, list):
+        return [str(item) for item in derived]
+    return []
 
 
 def _inventory_rows(path: pathlib.Path | None) -> list[dict[str, Any] | str]:
@@ -472,6 +579,9 @@ def initialize_direct_run(
     threat_model_path: pathlib.Path | None = None,
     workspace_root: pathlib.Path | None = None,
     require_instruction_match: bool = False,
+    extra_scopes: Iterable[str] | None = None,
+    scope_files: Iterable[pathlib.Path] | None = None,
+    derived_assets: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Initialize a diagnostic Direct-Skill ledger and bounded work queue."""
     run = run_dir.resolve()
@@ -480,7 +590,12 @@ def initialize_direct_run(
         target=target,
         workspace_root=workspace_root,
         require_instruction_match=require_instruction_match,
+        extra_scopes=extra_scopes,
+        scope_files=scope_files,
+        derived_assets=derived_assets,
     )
+    authorized_scopes, derived_scopes = _resolve_scope_inputs(
+        target, extra_scopes, scope_files, derived_assets)
     rows = _inventory_rows(inventory_path)
     if recon_dir is not None:
         rows.extend(bootstrap_recon(recon_dir))
@@ -557,6 +672,8 @@ def initialize_direct_run(
     ledger.metadata.update({
         "sid": run.name,
         "target": target,
+        "authorized_scopes": authorized_scopes,
+        "derived_assets": derived_scopes,
         "source": "direct-skill-runtime",
         "authority_trusted": False,
         "planning_mode": planning_mode,
@@ -906,14 +1023,18 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     for observation in observations:
         grouped.setdefault(str(observation.get("surface_id") or ""), []).append(observation)
 
-    target = str(ledger.metadata.get("target") or "").strip()
+    # v9.3: the full authorized scope list (multi-asset runs) is authoritative;
+    # legacy runs without `authorized_scopes` fall back to the single target.
+    scope_hosts = _metadata_authorized_scopes(ledger.metadata)
     collected = collect_structured_findings(
-        run, authorized_hosts=[target] if target else None)
+        run,
+        authorized_hosts=scope_hosts or None,
+        derived_hosts=_metadata_derived_assets(ledger.metadata) or None)
     # v9.2: wire the Guardian gate into the Skill checkpoint path, mirroring
     # validate_run_artifacts.  Demotions (incl. L1 garbage-title hits) become
     # observations — they never inflate proof_repair_required and never block
     # report_ready; hard rejections keep their repair semantics.
-    guardian_hosts = [target] if target else None
+    guardian_hosts = scope_hosts or None
     guardian_accepted: list[dict[str, Any]] = []
     observation_items: list[dict[str, Any]] = [
         dict(item) for item in (collected.get("observations") or [])]
@@ -1188,6 +1309,64 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     return checkpoint
 
 
+def scope_direct_run(
+    run_dir: pathlib.Path,
+    *,
+    add: Iterable[str] | None = None,
+    derived: Iterable[str] | None = None,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Append authorized scopes / derived assets to an initialized Direct run.
+
+    v9.3: mid-run asset expansion (new port, newly approved host) used to be
+    impossible without restarting the run — findings on the new asset were
+    rejected at checkpoint.  Scopes are append-only and every change leaves an
+    audit line in ``state/scope-audit.jsonl``.
+    """
+    run = run_dir.resolve()
+    ledger_path = run / "coverage-ledger.json"
+    if not ledger_path.is_file() or ledger_path.is_symlink():
+        raise SkillRuntimeError(
+            "scope requires an initialized run (coverage-ledger.json missing); "
+            "run skill_runtime init first")
+    ledger = CoverageLedger.load(ledger_path)
+    added_scopes = normalize_authorized_scopes(
+        [str(item).strip() for item in (add or []) if str(item).strip()])
+    added_derived = normalize_authorized_scopes(
+        [str(item).strip() for item in (derived or []) if str(item).strip()])
+    if not added_scopes and not added_derived:
+        raise SkillRuntimeError("scope requires at least one valid --add/--derived URL")
+    current_scopes = _metadata_authorized_scopes(ledger.metadata)
+    current_derived = _metadata_derived_assets(ledger.metadata)
+    new_scopes = [item for item in added_scopes if item not in current_scopes]
+    new_derived = [item for item in added_derived if item not in current_derived]
+    ledger.metadata["authorized_scopes"] = current_scopes + new_scopes
+    ledger.metadata["derived_assets"] = current_derived + new_derived
+    ledger.save(ledger_path)
+    audit_entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "added_scopes": new_scopes,
+        "added_derived": new_derived,
+        "reason": str(reason or "").strip(),
+        "actor": "skill_runtime scope",
+    }
+    ensure_directory(run / "state", root=run)
+    audit_path = run / "state" / "scope-audit.jsonl"
+    if audit_path.is_symlink():
+        raise SkillRuntimeError("scope audit log is a symlink; refusing to append")
+    with audit_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(audit_entry, ensure_ascii=False) + "\n")
+    return {
+        "schema_version": 1,
+        "mode": "direct_diagnostic",
+        "authorized_scopes": ledger.metadata["authorized_scopes"],
+        "derived_assets": ledger.metadata["derived_assets"],
+        "added_scopes": new_scopes,
+        "added_derived": new_derived,
+        "audit_log": str(audit_path),
+    }
+
+
 def _report_target_name(run: pathlib.Path) -> str:
     ledger_path = run / "coverage-ledger.json"
     if ledger_path.is_file() and not ledger_path.is_symlink():
@@ -1273,7 +1452,22 @@ def report_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     rendered_before = _rendered_artifact_hashes(run)
     quarantined = _quarantine_reserved_artifacts(run, rendered_before)
 
-    validation = validate_run_artifacts(run, write_output=False)
+    # v9.3: report-time validation honors the full multi-asset scope recorded
+    # at init (legacy runs fall back to the single registered target).
+    report_scopes: list[str] = []
+    report_derived: list[str] = []
+    ledger_path = run / "coverage-ledger.json"
+    if ledger_path.is_file() and not ledger_path.is_symlink():
+        try:
+            ledger_metadata = _load_json(ledger_path, root=run).get("metadata") or {}
+            report_scopes = _metadata_authorized_scopes(ledger_metadata)
+            report_derived = _metadata_derived_assets(ledger_metadata)
+        except (SkillRuntimeError, AttributeError):
+            report_scopes, report_derived = [], []
+    validation = validate_run_artifacts(
+        run, write_output=False,
+        allowed_hosts=report_scopes or None,
+        derived_hosts=report_derived or None)
     proof_pass, closure_pass = gate_outcomes(validation)
     report_items = _live_report_items(run, validation)
     decision, report_name = decide_canonical_report(
@@ -1346,10 +1540,24 @@ def _parser() -> argparse.ArgumentParser:
     preflight = sub.add_parser("preflight")
     preflight.add_argument("--run-dir", required=True, type=pathlib.Path)
     preflight.add_argument("--target", required=True)
+    preflight.add_argument("--allow", action="append", default=[],
+                           help="额外授权资产 URL/host（可多次，v9.3）")
+    preflight.add_argument("--scope-file", action="append", default=[],
+                           type=pathlib.Path,
+                           help="授权 scope 文件（AUTHZ.md/authz.md 或 JSON，可多次，v9.3）")
+    preflight.add_argument("--allow-derived", action="append", default=[],
+                           help="派生资产 URL/host（OSS/CDN 等，仅作证据目标，可多次，v9.3）")
     preflight.add_argument("--workspace-root", type=pathlib.Path)
     init = sub.add_parser("init")
     init.add_argument("--run-dir", required=True, type=pathlib.Path)
     init.add_argument("--target", required=True)
+    init.add_argument("--allow", action="append", default=[],
+                      help="额外授权资产 URL/host（可多次，v9.3）")
+    init.add_argument("--scope-file", action="append", default=[],
+                      type=pathlib.Path,
+                      help="授权 scope 文件（AUTHZ.md/authz.md 或 JSON，可多次，v9.3）")
+    init.add_argument("--allow-derived", action="append", default=[],
+                      help="派生资产 URL/host（OSS/CDN 等，仅作证据目标，可多次，v9.3）")
     init.add_argument("--inventory", type=pathlib.Path)
     init.add_argument("--recon-dir", type=pathlib.Path)
     init.add_argument("--feature-graph", type=pathlib.Path)
@@ -1361,6 +1569,13 @@ def _parser() -> argparse.ArgumentParser:
     observe.add_argument("--input", required=True, help="observation JSON file or - for stdin")
     checkpoint = sub.add_parser("checkpoint")
     checkpoint.add_argument("--run-dir", required=True, type=pathlib.Path)
+    scope = sub.add_parser("scope")
+    scope.add_argument("--run-dir", required=True, type=pathlib.Path)
+    scope.add_argument("--add", action="append", default=[],
+                       help="追加授权资产 URL/host（可多次，append-only）")
+    scope.add_argument("--derived", action="append", default=[],
+                       help="追加派生资产 URL/host（可多次，append-only）")
+    scope.add_argument("--reason", default="", help="追加原因（写入审计日志）")
     report = sub.add_parser("report")
     report.add_argument("--run-dir", required=True, type=pathlib.Path)
     return parser
@@ -1373,7 +1588,9 @@ def main(argv: list[str] | None = None) -> int:
             result = preflight_direct_run(
                 run_dir=args.run_dir, target=args.target,
                 workspace_root=args.workspace_root,
-                require_instruction_match=True)
+                require_instruction_match=True,
+                extra_scopes=args.allow, scope_files=args.scope_file,
+                derived_assets=args.allow_derived)
         elif args.command == "init":
             result = initialize_direct_run(
                 run_dir=args.run_dir, target=args.target,
@@ -1381,7 +1598,9 @@ def main(argv: list[str] | None = None) -> int:
                 feature_graph_path=args.feature_graph,
                 threat_model_path=args.threat_model,
                 workspace_root=args.workspace_root,
-                require_instruction_match=True)
+                require_instruction_match=True,
+                extra_scopes=args.allow, scope_files=args.scope_file,
+                derived_assets=args.allow_derived)
         elif args.command == "observe":
             if args.input == "-":
                 observation = json.load(sys.stdin)
@@ -1390,6 +1609,10 @@ def main(argv: list[str] | None = None) -> int:
             result = record_observation(
                 run_dir=args.run_dir, agent_id=args.agent_id,
                 observation=observation)
+        elif args.command == "scope":
+            result = scope_direct_run(
+                args.run_dir, add=args.add, derived=args.derived,
+                reason=args.reason)
         elif args.command == "report":
             result = report_direct_run(args.run_dir)
         else:
@@ -1419,5 +1642,7 @@ __all__ = [
     "record_observation",
     "checkpoint_direct_run",
     "report_direct_run",
+    "scope_direct_run",
+    "parse_scope_file",
     "DIRECT_QUEUE_LIMIT",
 ]

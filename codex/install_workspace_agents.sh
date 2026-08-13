@@ -201,3 +201,69 @@ finally:
 
 print(f"installed Atoolkit AGENTS.md -> {workspace}/{destination}")
 PY
+
+# v9.3: 单一授权真相 + IDE 薄 shim。两个文件只在不存在时生成（create-exclusive），
+# 绝不覆盖用户已有内容；生成失败不阻塞主安装。
+python3 - "$WORKSPACE" <<'PY'
+from __future__ import annotations
+
+import os
+import sys
+
+workspace = sys.argv[1]
+
+AUTHZ_TEMPLATE = """# 授权声明（AUTHZ.md · 单一授权真相）
+
+> 本文件是 Atoolkit 唯一由人维护的授权文件。各 IDE 的授权 shim 只指向本文件；
+> 每个 Run 的 runs/<sid>/authz.md 可从本文件复制并按 Run 收窄。
+> `engine.skill_runtime init --scope-file AUTHZ.md` 会机器消费下方 scope 列表。
+
+## 授权 Scope（在册资产，超出即停）
+- <https://target.example/ 或 host:port，每行一个>
+
+## 派生资产（derived assets：仅在册端点签发凭证/流程触达时才可作为证据目标）
+- <如 https://<bucket>.oss-cn-beijing.aliyuncs.com/ ，无则删除本节>
+
+## 授权依据与有效期
+- 依据：<SRC 平台/项目规则/合同编号>
+- 有效期：<起止日期>
+
+## 预授权动作
+- 对上述 scope 的黑盒安全测试：发送/修改 HTTP 请求、参数 fuzz、认证/验证码
+  绕过测试、多账号越权对比、OOB 回连（仅自建回连服务器）、写入 runs/ 产物。
+- 中途扩资产：`python3 -m engine.skill_runtime scope --run-dir <run> --add <url> --reason <原因>`。
+
+## 边界（立即停手并标 NEED_INPUT）
+- 超出 scope 的任何资产（派生资产仅限验证在册端点签发的凭证/流程）
+- 破坏性/不可逆操作：删数据、关服务、DoS、压测式爆破
+"""
+
+SHIM_TEMPLATE = """# 持久授权与运行约定（IDE shim · 由 Atoolkit installer 生成）
+
+> 本文件是薄指针，授权细节只维护一份——AUTHZ.md。修改授权请改 AUTHZ.md，不要改本文件。
+
+- 测试纪律与报告标准：遵循同目录 AGENTS.md（Atoolkit 指挥官文件）。
+- 授权范围：以同目录 AUTHZ.md 的「授权 Scope / 派生资产」为准；scope 内动作
+  均已预授权，无需逐条确认；越界或破坏性操作立即停手并标记 NEED_INPUT。
+- 运行模式：本环境禁止 `python3 run.py`（Engine Mode 会拉起外部 codex/gpt 后端）；
+  只走 Direct 模式六命令：preflight / init / observe / checkpoint / scope / report
+  （`python3 -m engine.skill_runtime <cmd> --run-dir <run>`）。
+"""
+
+
+def create_exclusive(name: str, content: str) -> str:
+    path = os.path.join(workspace, name)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return f"kept existing {name}"
+    except OSError as exc:
+        return f"skipped {name}: {exc}"
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return f"generated {name}"
+
+
+print(create_exclusive("AUTHZ.md", AUTHZ_TEMPLATE))
+print(create_exclusive("AGENTS.local.md", SHIM_TEMPLATE))
+PY

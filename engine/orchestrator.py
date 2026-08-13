@@ -3033,7 +3033,8 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
                 planning_mode: str = "legacy_risk",
                 planning_lineage: dict | None = None,
                 identity_readiness: dict | None = None,
-                continuation_input: dict | None = None) -> dict:
+                continuation_input: dict | None = None,
+                derived_scopes: list[str] | None = None) -> dict:
     """verify_fn(report_md) -> verify.VerifyResult，可选：对 accepted 报告做确定性重放复验。
     owned_ids：本会话自有对象 id，改删类命中其中则自动放行。
     confirm_policy："halt"=改删他人/未知 id 时熔断停手交人工(默认)；"allow"=放行(信任场景)。
@@ -3586,6 +3587,7 @@ def run_session(adapter: ModelAdapter, *, target: str, authz: str, core_skill: s
         canonical_report_required=True,
         run_phase=("attack" if normalized_planning_mode == "threat_model" else "single"),
         phase_parent=(planning_lineage if normalized_planning_mode == "threat_model" else None),
+        derived_scopes=derived_scopes,
     )
 
     # v8.8: an exact, fully terminal project matrix with no pending Intent is

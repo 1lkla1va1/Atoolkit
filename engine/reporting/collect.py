@@ -120,6 +120,7 @@ def collect_structured_findings(
     authorized_hosts: list[str] | None = None,
     *,
     context: Any = None,
+    derived_hosts: list[str] | None = None,
 ) -> dict[str, Any]:
     base = pathlib.Path(run_dir).resolve()
     accepted: list[dict[str, Any]] = []
@@ -192,7 +193,8 @@ def collect_structured_findings(
             })
             continue
         result = validate_finding(
-            finding, path, base, authorized_hosts=authorized_hosts, context=context)
+            finding, path, base, authorized_hosts=authorized_hosts,
+            context=context, derived_hosts=derived_hosts)
         if result.ok:
             item = {"id": result.id, "path": str(path.resolve()), "finding": finding}
             accepted.append(item)
