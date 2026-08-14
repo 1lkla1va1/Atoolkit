@@ -24,6 +24,17 @@ def _clip_file(path: pathlib.Path, limit: int = 1200) -> str:
     return text[:limit].rstrip() + "\n...（已截断，完整内容见证据文件）"
 
 
+def _as_list(value: Any) -> list:
+    """finding 里按 list 渲染的字段，agent 可能写成 str；str 迭代会逐字符拆行，须包成单元素。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return value
+    return [str(value)]
+
+
 def _rel(path: pathlib.Path, root: pathlib.Path) -> str:
     try:
         return path.resolve().relative_to(root.resolve()).as_posix()
@@ -297,7 +308,8 @@ def render_final_report(
                 f"- 假设最终影响：{chain.get('final_impact', '')}",
                 "",
             ])
-        details = (finding.get("recommendation") or {}).get("details") or []
+        recommendation = finding.get("recommendation")
+        details = _as_list((recommendation or {}).get("details") if isinstance(recommendation, dict) else recommendation)
         for detail in details:
             lines.append(f"- {detail}")
         lines.extend(["", "### 漏洞证明", ""])
@@ -313,7 +325,7 @@ def render_final_report(
             for api in apis:
                 lines.append(
                     f"| {api.get('method', '')} | {api.get('path', '')} | "
-                    f"{api.get('purpose', '')} | {', '.join(api.get('risk_params') or [])} |"
+                    f"{api.get('purpose', '')} | {', '.join(str(p) for p in _as_list(api.get('risk_params')))} |"
                 )
             lines.append("")
 
@@ -340,7 +352,7 @@ def render_final_report(
                 f"- iv 来源：{crypto.get('iv_source', '')}",
                 f"- 解密方式：{crypto.get('decrypt_method', '')}",
                 f"- 重加密方式：{crypto.get('reencrypt_method', '')}",
-                f"- 辅助文件：{', '.join(crypto.get('helper_files') or [])}",
+                f"- 辅助文件：{', '.join(str(p) for p in _as_list(crypto.get('helper_files')))}",
                 f"- 安全结论：{crypto.get('security_statement', '')}",
                 "",
             ])
