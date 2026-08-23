@@ -57,7 +57,7 @@
 - Threat Mode 禁止回退到 endpoint × 漏洞类矩阵。运行中新发现的 endpoint/param/threat 只进入下一 Run discovery/Intent，不得动态扩大本轮 frozen denominator。
 - 每个跨账号/跨角色 threat 必须声明 identity requirement。Host 以 credential 指纹而非 label 数量判断独立身份；相同 Cookie/Token 的 `owner`/`peer` 只算一个上下文。缺身份、测试对象或可回查状态时保持 blocked/open，不得写 `not_vulnerable` 或“严格隔离/安全”。
 - Engine Attack 的多身份原始 header 只从 Planning 完成后生成的受限 `identities.json` 按 label 读取；不得混用浏览器共享会话，不得把该文件复制进报告。Finalizer 开始前的恢复若指纹不一致须新开 sid；已有 finalization journal 时 Run 已冻结，继续测试也必须新开 sid。
-- 原始凭据与 PII 只允许存在于权限收紧的凭据/证据包。Planning snapshot 和 Canonical report 使用稳定 `<redacted:kind:hash>`；不得把 Cookie、Authorization、API Key、Token、手机号或邮箱原值复制进 inventory、threat、summary、Finding 散文或对外报告。
+- 原始凭据与 PII 只允许存在于权限收紧的凭据/证据包。Planning snapshot 和 Canonical report 使用稳定 `<redacted:kind:hash>`；不得把 Cookie、Authorization、API Key、Token、手机号或邮箱原值复制进 inventory、threat、summary、Finding 散文或对外报告。**例外（v9.5）**：测试自建账号的明文凭据不受本条脱敏约束——它是测试者自有的审计凭据，必须按 §10「数据即写」登记到 `state/created_data.md`；对外报告引用自建测试账号时可以使用原值。
 - CSRF Finding 必须证明跨来源请求导致受害者状态变化：`state_before → cross_site_request → state_after`，并有不同 Origin、受害者 Cookie、物理跨站发起载体、before/after marker 与 state delta。只有手工设置 Origin/Cookie，或仅“缺 CSRF token”“响应头暴露 token”，都不是已证明 CSRF。
 
 ## 0.3 威胁驱动的动态执行闭环（v8.13）
@@ -414,6 +414,7 @@ Phase 0 侦察应优先覆盖本轮域内的端点——其他域的端点记录
 - **发现即写**：每确认一个漏洞，立即追加一行到 `state/findings_summary.md`（格式：`| 漏洞名 | 端点 | payload | 严重度 |`）
 - **阴性即写**：每完成一个 surface 的阴性判定，追加一行到 `state/negatives_summary.md`（格式：`| surface | vectors | depth_met | status |`）
 - **Session 即写**：登录成功或获取 cookie 后，追加到 `state/session_state.md`（格式：`| 角色 | cookie文件路径 | 登录时间 |`）
+- **数据即写（v9.5 新增）**：测试过程中在目标侧创建的**任何**数据——自助注册账号、通过接口创建的用户/商户/订单/商品/文件/卡券/评论等——必须在创建成功的当轮立即追加到 `state/created_data.md`（格式：`| 类型 | 标识(用户名/ID) | 明文凭据 | 创建接口 | 请求证据路径 | 创建时间 |`）。**测试自建账号的明文密码必须登记**：它是测试者自有的审计凭据，不是目标用户 PII；§0.2 的凭据脱敏条款约束的是目标真实用户凭据和对外报告，不构成豁免登记的理由。后续对该对象的删除/改密/状态变更同样追加一行变更记录。终态时 `created_data.md` 是「本轮在目标上留下了什么」的唯一清单，报告附录必须引用它。
 - **路径即写**：确认 API 路径正确后，追加到 `state/api_paths.md`（格式：`| 功能 | 正确路径 | 来源 |`）
 
 **恢复协议**：如果发现自己不确定之前测试过什么（长对话记忆模糊），**先读 `state/` 目录下的所有文件**再继续测试。以磁盘状态为准，不依赖工作记忆。
