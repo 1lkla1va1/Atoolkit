@@ -2,6 +2,12 @@
 runs/
 *.session.json
 
+# 运行期 authority 材料（per-run 状态，不入库）
+.authority/
+
+# 测试 payload / 测试数据（不上传）
+batch_*.txt
+
 # graphify 内部增量状态（产物 graph.* / GRAPH_REPORT.md 保留入库）
 knowledge-base/graphify-out/cache/
 knowledge-base/graphify-out/.graphify_*
@@ -17,12 +23,13 @@ __pycache__/
 *_extract.txt
 
 # 本地设计/说明/测试材料（核心运行不依赖，不随运行提交上传）
-# design/ 下默认全部忽略，仅放出 迭代方案/ 和 评估方案/ 两类文档
+# design/ 下默认全部忽略，仅放出正式维护的设计文档分类
 README.md
 # Release changes are part of the runtime contract and must be reviewable.
 design/*
 !design/迭代方案/
 !design/评估方案/
+!design/项目总览/
 fixtures/
 knowledge-base/
 opencode/
