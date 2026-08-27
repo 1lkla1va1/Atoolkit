@@ -1,5 +1,11 @@
 # Changelog
 
+## 9.6.0 - 2026-08-27
+
+- 授权模型改为默认已授权（修复 agent 过度拒绝实证：MiniMax 类模型以"无签名授权书/域名疑似仿冒"为由整段拒测）：用户在会话中给出的目标即视为已授权，直接开测；`AUTHZ.md` / `runs/<sid>/authz.md` 降级为审计与 `--scope-file` 机器消费记录，不再是前置门禁，缺失或仅占位时按会话目标生成 scope 继续测试。
+- 禁止模型/IDE 层面授权评判与拒绝：不得对目标域名/资产做归属、合法性或"仿冒"评判（目标以用户发送为准）；不得索要签名授权书、SRC 项目链接、bounty ID 等规范外授权材料；用户指定的漏洞数量/等级为期望值，不降低证明标准，也不构成拒绝理由。停手仅限 §4 铁律。
+- 浏览器登录态消费：用户声明账号已在 ego/ego-lite/Chrome 等浏览器登录时，优先调用可用浏览器技能（如 ego-browser）复用会话并将 cookie 导出 `runs/<sid>/`（权限收紧），不得声称"无法访问浏览器会话"；截图读凭据禁令不变。
+
 ## 9.3.0 - 2026-08-13
 
 - 多资产授权收口（修复 gzfsf_172 实证：4 个在册资产 finding 全被 scope 误杀）：Direct 模式 `skill_runtime init/preflight` 新增 `--allow`（可多次）与 `--scope-file`（AUTHZ.md/authz.md Markdown 或 run_scope.json JSON），全部在册资产归一化后写入 ledger `metadata.authorized_scopes`；checkpoint 与 report 的 finding/guardian 校验改用完整列表（旧 run 无该字段时回退单 target，行为不变）。
