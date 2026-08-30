@@ -23,13 +23,9 @@ __pycache__/
 *_extract.txt
 
 # 本地设计/说明/测试材料（核心运行不依赖，不随运行提交上传）
-# design/ 下默认全部忽略，仅放出正式维护的设计文档分类
 README.md
-# Release changes are part of the runtime contract and must be reviewable.
+# design/ 全部仅保留本地，不跟踪不上传（2026-08-31 起，含历史白名单分类一并移出索引）
 design/*
-!design/迭代方案/
-!design/评估方案/
-!design/项目总览/
 fixtures/
 knowledge-base/
 opencode/
