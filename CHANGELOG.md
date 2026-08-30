@@ -1,5 +1,24 @@
 # Changelog
 
+## 9.8.0 - 2026-08-31
+
+- W0 预算冻结：`init --max-frozen-cells`（默认 20）限制单 Run 冻结分母，超额 surface 进入 `deferred-pool.json`（确定性冻结集，字节级可重放）；validate 新增防作弊闸——deferred 含高价值格且冻结格执行事件率 <80% 时拒绝 complete，防止用 deferred 冒充完成。
+- W1 Direct 归因/续航接线：`checkpoint` 经 `validate_run_artifacts`（`allow_empty=True`，scope 双路来源：manifest `authorized_scopes` 优先、无 manifest 回退 `run_scope.json`）落盘 `finding_validation.json` + `miss-attribution.json` + `next-run-agenda.json` 三件套，返回值新增 `attribution_summary`；`init --continue-from-run <run>` 消费上一 Run 续航（items 在 `_merge_rows` 之前并入 inventory，`continuation-input.json` 落盘，diagnostic 定位不变）；消费失败的陈旧哈希场景提供"对 prior run 重跑 checkpoint 刷新三件套"自愈指引。
+- W2 身份需求前置申报：新增 `engine/identity_requirements.py`，Direct 路径按 planner 风险词表启发式推导（`object-ownership|idor→peer_pair`；`privilege|enum-tamper|auth-flow→role_pair`；`amount-tamper|accounting|business-logic→stateful_owner`；其余 single），Engine 路径从 `build_identity_readiness` 转换；首个网络动作前物化 `identity-requirements.json`（requirement_id/mode/reason_code/count_needed/blocks_cells/human_action），checkpoint 复算并把未满足 cell 标 `identity_blocked`，归因 `cause_code=identity_missing` 与 W1 闭环。
+- `continuation.py` 安全读取上限 2MiB→16MiB（三件套嵌入全量归因所需，显式记录的安全边界放宽）。
+- 附 v9.7.0 未提交内容：模块地图派生视图（`engine/module_map.py` + `map` 子命令，详见 9.7.0 条目）。
+- 新增 17 例测试（W0 预算冻结 5、Direct 归因 round-trip 3、身份需求推导 9），全量 479 passed / 3 skipped。
+- 设计文档：`design/迭代方案/v9.8_难度感知执行与身份供给管线.md`（含对抗性审查修订附录 R1-R12）。
+- 本期未含（分期或条件项）：W3 身份注册表（等账号矩阵 ≥5 身份）、W4a/W4b 难度感知调度与 exploring 正反馈、W5 治理税压缩、W6 提交出口注册域校验。
+
+## 9.7.0 - 2026-08-27
+
+- 新增模块地图派生视图（只读原型）：`python3 -m engine.skill_runtime map --run-dir <run>` 从 `inventory.json` / `coverage-ledger.json` /（可选）`feature-graph.json` 聚类业务模块，输出 `module_map.json` + `module_map.md` 与规模判定（small/medium/large，以覆盖格 cell 数为主、端点/模块数为辅），为大站「按模块分块测试」提供划分质量评估入口。纯派生视图，不改动 project_state / coverage-ledger / 分母冻结逻辑。
+- 聚类为确定性规则：部署基准前缀剥离（按剥离后是否真正合并重复端点判定，不吃 `/api/` 真实结构）、主导组二级拆分（≥6 端点且 ≥2 个可独立成组的子组）、`_probe`/`_pages`/`_misc` 特殊组隔离、路径段 + recon provenance 来源文件关键词标签推断（混合组双标签）。兼容旧 schema（inventory `surfaces` 键、ledger 单数 `role` 字段、无 inventory 时 ledger 派生端点）。
+- 修复 AGENTS.md 生成源漂移：`skill/核心技能文件.v3.md` 与 `codex/_agents_header.md` 回补 v9.4–v9.6 直改内容，`codex/AGENTS.md` 重生成；`regen_agents.sh --check` 恢复通过。
+- AGENTS.md：Direct 模式命令集更新为七命令（新增 `map`），Phase 0 增加可选「模块地图」步骤。
+- 新增 10 例 module_map 合同测试（分组/合并/探针隔离/基准剥离/规模边界/只读性）。
+
 ## 9.6.0 - 2026-08-27
 
 - 授权模型改为默认已授权（修复 agent 过度拒绝实证：MiniMax 类模型以"无签名授权书/域名疑似仿冒"为由整段拒测）：用户在会话中给出的目标即视为已授权，直接开测；`AUTHZ.md` / `runs/<sid>/authz.md` 降级为审计与 `--scope-file` 机器消费记录，不再是前置门禁，缺失或仅占位时按会话目标生成 scope 继续测试。

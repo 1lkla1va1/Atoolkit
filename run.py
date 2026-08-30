@@ -40,6 +40,8 @@ from engine.engine_planning import (EnginePlanningError, accept_prebuilt_plan,
                                     create_planning_session,
                                     promote_planning_artifacts,
                                     run_planning_model)  # noqa: E402
+from engine.identity_requirements import (  # noqa: E402
+    requirements_from_identity_readiness)
 from engine.continuation import (ContinuationError,
                                  load_prior_continuation)  # noqa: E402
 from engine.version import __version__  # noqa: E402
@@ -2418,6 +2420,18 @@ def main():
             identity_readiness = frozen_readiness
         else:
             identity_readiness = requested_readiness
+        # v9.8 W2.1: materialize machine-readable identity requirements next
+        # to the frozen readiness so the supply gap is visible before any
+        # network action.
+        identity_requirements = requirements_from_identity_readiness(
+            identity_readiness)
+        _atomic_write_json(wd / "identity-requirements.json",
+                           identity_requirements)
+        _identity_gap = identity_requirements.get("summary") or {}
+        if int(_identity_gap.get("unmet_requirements", 0) or 0):
+            print(f"  身份需求缺口: {_identity_gap.get('unmet_requirements')} 项未满足，"
+                  f"阻塞 {_identity_gap.get('blocked_cells')} 格 — "
+                  f"详见 {wd / 'identity-requirements.json'}")
 
     # Materialize this Run's credentials only after Planning.  The current
     # backend does not attest global read isolation, so Planning also runs with

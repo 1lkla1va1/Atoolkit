@@ -131,6 +131,11 @@ def _cell_cause(
         return "not_applicable", True, "structured not-applicable contract passed"
     if status not in _KNOWN_OPEN:
         return "state_unsupported", False, _ACTION["state_unsupported"]
+    # v9.8 W2.4: Direct marks identity-starved cells on the surface itself
+    # (identity-requirements.json), which reaches attribution even without an
+    # authority execution projection.
+    if surface.get("identity_blocked") is True:
+        return "identity_missing", False, _ACTION["identity_missing"]
     if barriers & {"missing_role", "ownership_unproven"}:
         return "identity_missing", False, _ACTION["identity_missing"]
     if status == "blocked" or execution == "blocked_recoverable" or barriers:

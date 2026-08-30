@@ -21,6 +21,7 @@ from typing import Any, Iterable
 
 try:
     from .blocker import RECOVERABLE, resolve_blocker
+    from .continuation import ContinuationError, load_prior_continuation
     from .enforce import ACCEPTED, DEMOTED, guardian_check_finding
     from .dynamic_execution import (
         EXECUTION_CONTRACT_VERSION,
@@ -31,6 +32,10 @@ try:
         record_execution_event,
         rejected_finding_surface_ids,
         write_execution_projection,
+    )
+    from .identity_requirements import (
+        count_present_identities,
+        derive_identity_requirements,
     )
     from .knowledge import (
         load_cards,
@@ -48,6 +53,7 @@ try:
         STATUS_NOT_VULNERABLE,
         STATUS_SHALLOW_NEGATIVE,
         CoverageLedger,
+        is_high_value,
         normalize_status,
     )
     from .orchestrator import CognitiveState
@@ -82,8 +88,10 @@ try:
         validate_threat_plan,
     )
     from .vuln_classes import exact_vc, norm_vc
+    from .module_map import write_module_map
 except ImportError:  # pragma: no cover - script execution fallback
     from blocker import RECOVERABLE, resolve_blocker
+    from continuation import ContinuationError, load_prior_continuation
     from enforce import ACCEPTED, DEMOTED, guardian_check_finding
     from dynamic_execution import (EXECUTION_CONTRACT_VERSION,
                                    DynamicExecutionError,
@@ -93,12 +101,14 @@ except ImportError:  # pragma: no cover - script execution fallback
                                    record_execution_event,
                                    rejected_finding_surface_ids,
                                    write_execution_projection)
+    from identity_requirements import (count_present_identities,
+                                       derive_identity_requirements)
     from knowledge import (load_cards, match_cards, negative_barrier_signals,
                            negative_sufficient, render_skill_hint)
     from ledger import (STATUS_BLOCKED, STATUS_CONFIRMED, STATUS_EXPLORING,
                         STATUS_NOT_APPLICABLE, STATUS_NOT_TESTED,
                         STATUS_NOT_VULNERABLE, STATUS_SHALLOW_NEGATIVE,
-                        CoverageLedger, normalize_status)
+                        CoverageLedger, is_high_value, normalize_status)
     from orchestrator import CognitiveState
     from planner import plan_surfaces
     from project_state import canonical_asset
@@ -118,6 +128,7 @@ except ImportError:  # pragma: no cover - script execution fallback
     from threat_model import (ThreatModelError, compile_threat_model,
                               derive_threat_coverage, validate_threat_plan)
     from vuln_classes import exact_vc, norm_vc
+    from module_map import write_module_map
 
 
 class SkillRuntimeError(RuntimeError):
@@ -395,6 +406,33 @@ def _metadata_derived_assets(metadata: dict[str, Any]) -> list[str]:
     return []
 
 
+def _attribution_allowed_hosts(run: pathlib.Path) -> list[str] | None:
+    """Scope source for the checkpoint attribution pass (v9.8 W1.1).
+
+    A run with an authority manifest validates against its attested scopes
+    (anything broader would trip ``allow_scope_not_in_manifest``); runs
+    without a manifest fall back to ``run_scope.json`` target_domains.
+    """
+    manifest_path = run / "run_manifest.json"
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        try:
+            manifest = _load_json(manifest_path, root=run)
+        except SkillRuntimeError:
+            manifest = {}
+        scopes = manifest.get("authorized_scopes") if isinstance(manifest, dict) else None
+        if isinstance(scopes, list) and scopes:
+            return [str(item) for item in scopes]
+    scope_path = run / "run_scope.json"
+    if scope_path.is_file() and not scope_path.is_symlink():
+        try:
+            scopes, _derived = parse_scope_file(scope_path)
+        except SkillRuntimeError:
+            scopes = []
+        if scopes:
+            return scopes
+    return None
+
+
 def _inventory_rows(path: pathlib.Path | None) -> list[dict[str, Any] | str]:
     if path is None:
         return []
@@ -569,6 +607,124 @@ def _rejected_finding_details(
     return details
 
 
+def _continuation_inventory_rows(
+    items: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Map validated continuation agenda items onto inventory rows.
+
+    The agenda's critical→high→medium→low order is preserved in the returned
+    row stream; final scheduling order stays Host-owned via the ledger.
+    """
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        endpoint = str(item.get("target_endpoint") or "").strip()
+        method = str(item.get("target_method") or "").strip().upper()
+        if not endpoint or not method:
+            continue
+        row: dict[str, Any] = {
+            "endpoint": endpoint,
+            "method": method,
+            "params": [str(param) for param in _as_list(item.get("target_params"))],
+            "roles": [str(role) for role in _as_list(item.get("target_roles"))],
+            "source": "v9_host_continuation",
+            "continuation_intent_id": str(item.get("intent_id") or ""),
+            "continuation_priority": str(item.get("priority") or ""),
+        }
+        vuln_class = str(item.get("vuln_class") or "").strip()
+        if vuln_class:
+            row["vuln_classes"] = [vuln_class]
+        rows.append(row)
+    return rows
+
+
+def _apply_identity_requirements(
+    run: pathlib.Path,
+    ledger: CoverageLedger,
+) -> dict[str, Any]:
+    """Recompute identity requirements and mirror unmet ones into the ledger.
+
+    v9.8 W2: identity needs are declared before the first network action and
+    recomputed at every checkpoint, so supplying identities mid-run clears
+    the gap without re-init.  Unmet cells stay in the queue and are flagged
+    ``identity_blocked=true``; attribution reads the flag as
+    ``identity_missing``.
+    """
+    requirements = derive_identity_requirements(
+        ledger.surfaces, identities_present=count_present_identities(run))
+    blocked = {
+        cell
+        for requirement in requirements.get("requirements") or []
+        for cell in (requirement.get("blocks_cells") or [])
+    }
+    for surface in ledger.surfaces:
+        surface_id = str(surface.get("surface_id") or "")
+        if surface_id in blocked:
+            surface["identity_blocked"] = True
+        else:
+            surface.pop("identity_blocked", None)
+    atomic_write_json(run / "identity-requirements.json", requirements,
+                      root=run, reject_leaf_symlink=True)
+    return requirements
+
+
+def _freeze_budget_capped(
+    run: pathlib.Path,
+    ledger: CoverageLedger,
+    max_frozen_cells: int,
+) -> list[dict[str, Any]]:
+    """Freeze only the top-N priority cells into this run's denominator.
+
+    v9.8 W0: when the inventory compiles to more cells than a session budget
+    can close, the overflow is deferred to ``deferred-pool.json`` instead of
+    entering the coverage ledger.  Deferred cells keep their full surface
+    identity and priority, are attributed as ``execution_not_started`` at
+    checkpoint, and flow into the next-run agenda.  The ordering key mirrors
+    the ledger's existing priority (high-value first, then feature, then
+    surface_id) so repeated inits are byte-identical.
+    """
+    if len(ledger.surfaces) <= max_frozen_cells:
+        return []
+    ordered = sorted(
+        ledger.surfaces,
+        key=lambda surface: (
+            0 if is_high_value(surface) else 1,
+            str(surface.get("feature") or ""),
+            str(surface.get("surface_id") or ""),
+        ),
+    )
+    frozen_ids = {
+        str(surface.get("surface_id") or "")
+        for surface in ordered[:max_frozen_cells]
+    }
+    deferred = ordered[max_frozen_cells:]
+    ledger.surfaces = [
+        surface for surface in ledger.surfaces
+        if str(surface.get("surface_id") or "") in frozen_ids
+    ]
+    pool = [
+        {**surface,
+         "priority_rank": rank,
+         "deferred_reason": "budget_cap"}
+        for rank, surface in enumerate(deferred, start=len(frozen_ids) + 1)
+    ]
+    ledger.metadata["budget_cap"] = {
+        "max_frozen_cells": max_frozen_cells,
+        "frozen_cells": len(ledger.surfaces),
+        "deferred_cells": len(pool),
+    }
+    atomic_write_json(run / "deferred-pool.json", {
+        "schema_version": 1,
+        "deferred_reason": "budget_cap",
+        "max_frozen_cells": max_frozen_cells,
+        "frozen_cells": len(ledger.surfaces),
+        "deferred_cells": len(pool),
+        "surfaces": pool,
+    }, root=run, reject_leaf_symlink=True)
+    return pool
+
+
 def initialize_direct_run(
     *,
     run_dir: pathlib.Path,
@@ -582,8 +738,12 @@ def initialize_direct_run(
     extra_scopes: Iterable[str] | None = None,
     scope_files: Iterable[pathlib.Path] | None = None,
     derived_assets: Iterable[str] | None = None,
+    continue_from_run: pathlib.Path | None = None,
+    max_frozen_cells: int = 20,
 ) -> dict[str, Any]:
     """Initialize a diagnostic Direct-Skill ledger and bounded work queue."""
+    if int(max_frozen_cells) < 1:
+        raise SkillRuntimeError("--max-frozen-cells must be >= 1")
     run = run_dir.resolve()
     preflight_direct_run(
         run_dir=run,
@@ -596,9 +756,35 @@ def initialize_direct_run(
     )
     authorized_scopes, derived_scopes = _resolve_scope_inputs(
         target, extra_scopes, scope_files, derived_assets)
+    continuation: dict[str, Any] | None = None
+    if continue_from_run is not None:
+        # v9.8 W1.2: consume the prior run's Host-validated agenda.  This only
+        # restores scheduling — ProjectState and submission eligibility are
+        # untouched (Direct stays diagnostic).
+        try:
+            continuation = load_prior_continuation(
+                continue_from_run,
+                primary_target=target,
+                authorized_scopes=authorized_scopes)
+        except ContinuationError as exc:
+            # Stale-hash trap escape hatch (v9.8 R6): when the prior run was
+            # updated after its last checkpoint, one fresh checkpoint rebuilds
+            # the validation triplet and unblocks continuation.
+            raise ContinuationError(
+                f"{exc}；自愈：对 prior run 重跑 `python3 -m "
+                f"engine.skill_runtime checkpoint --run-dir {continue_from_run}` "
+                f"刷新三件套后重试") from exc
+        atomic_write_json(run / "continuation-input.json", {
+            **continuation,
+            "run_dir": str(run),
+            "diagnostic_only": True,
+        }, root=run, reject_leaf_symlink=True)
     rows = _inventory_rows(inventory_path)
     if recon_dir is not None:
         rows.extend(bootstrap_recon(recon_dir))
+    if continuation is not None:
+        rows.extend(_continuation_inventory_rows(
+            continuation.get("items") or []))
     rows = _merge_rows(rows)
     if not rows:
         raise SkillRuntimeError("Direct runtime needs inventory or recon observations")
@@ -661,6 +847,14 @@ def initialize_direct_run(
         surface["source"] = "direct-skill-runtime"
         _decorate_surface(surface, cards)
 
+    # v9.8 W0: budget-matched denominator freeze (legacy plan_surfaces path
+    # only — threat-mode cells stay bound to their compiled feature/threat
+    # denominator per v8.12).
+    deferred_surfaces: list[dict[str, Any]] = []
+    if planning_mode == "legacy_risk":
+        deferred_surfaces = _freeze_budget_capped(
+            run, ledger, int(max_frozen_cells))
+
     unresolved = [row for row in rows if not _row_key(row)[1]]
     resolved = [row for row in rows if _row_key(row)[1]]
     atomic_write_json(run / "inventory.json", {
@@ -681,6 +875,10 @@ def initialize_direct_run(
         "planning_artifact_hashes": planning_artifact_hashes,
         "execution_contract_version": EXECUTION_CONTRACT_VERSION,
     })
+    # v9.8 W2: identity requirements are materialized before the first
+    # network action; unmet cells keep their queue slot with
+    # identity_blocked=true (Direct 降级不阻塞, design W2.2).
+    identity_requirements = _apply_identity_requirements(run, ledger)
     ledger.save(run / "coverage-ledger.json")
     atomic_write_json(run / "candidate-ledger.json", {
         "schema_version": "1.1", "candidates": [],
@@ -702,6 +900,20 @@ def initialize_direct_run(
     status = _runtime_status(
         run, ledger, threat_coverage=threat_coverage,
         execution_projection=execution_projection)
+    if continuation is not None:
+        status["continuation"] = {
+            "source_run": continuation.get("source_run"),
+            "items": len(continuation.get("items") or []),
+            "trust_level": continuation.get("trust_level"),
+        }
+    if deferred_surfaces:
+        status["deferred_pool"] = {
+            "deferred_reason": "budget_cap",
+            "deferred_cells": len(deferred_surfaces),
+            "max_frozen_cells": int(max_frozen_cells),
+        }
+    status["identity_requirements"] = dict(
+        identity_requirements.get("summary") or {})
     atomic_write_json(run / "runtime-status.json", status, root=run, reject_leaf_symlink=True)
     return {**status, "execution_queue": queue}
 
@@ -1018,6 +1230,10 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
             raise SkillRuntimeError(
                 f"planning artifact digest mismatch: {name}")
     cards = load_cards()
+    # v9.8 W2: re-derive identity requirements at every checkpoint so a newly
+    # supplied identity clears the gap without re-init; identity_blocked
+    # flags feed miss-attribution as identity_missing (W2.4).
+    identity_requirements = _apply_identity_requirements(run, ledger)
     observations, observation_errors = _read_observations(run)
     grouped: dict[str, list[dict[str, Any]]] = {}
     for observation in observations:
@@ -1282,6 +1498,34 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     if rendered_hashes:
         # Preserve the report-command verification hook across status rewrites.
         status["rendered_artifacts"] = rendered_hashes
+    # v9.8 W1.1: every Direct checkpoint also emits the attribution triplet
+    # (finding_validation.json + miss-attribution.json + next-run-agenda.json)
+    # via the shared validator, so the next run can consume them through
+    # init --continue-from-run.  A non-zero validation exit code
+    # (precondition_missing / empty_input / incomplete) is a legal diagnostic
+    # state for Direct runs and never fails the checkpoint itself.
+    attribution_summary: dict[str, Any] = {}
+    attribution_error = ""
+    try:
+        validation = validate_run_artifacts(
+            run,
+            allowed_hosts=_attribution_allowed_hosts(run),
+            derived_hosts=_metadata_derived_assets(ledger.metadata) or None,
+            allow_empty=True,
+            write_output=True,
+        )
+        cause_counts = dict(
+            (validation.get("miss_attribution") or {}).get("cause_counts") or {})
+        agenda = validation.get("next_run_agenda") or {}
+        attribution_summary = {
+            "status": validation.get("status"),
+            "exit_code": validation.get("exit_code"),
+            "cause_counts": cause_counts,
+            "agenda_items": int(agenda.get("count", 0) or 0),
+            "identity_missing": int(cause_counts.get("identity_missing", 0) or 0),
+        }
+    except Exception as exc:  # noqa: BLE001
+        attribution_error = f"{type(exc).__name__}: {exc}"
     write_observations_json(run, observation_items, root=run)
     checkpoint = {
         "schema_version": 1,
@@ -1300,6 +1544,10 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
             "observations": len(observation_items),
         },
         "reserved_artifact_violations": reserved_violations,
+        "attribution_summary": attribution_summary,
+        "attribution_error": attribution_error,
+        "identity_requirements": dict(
+            identity_requirements.get("summary") or {}),
         **({"threat_coverage": threat_coverage} if threat_coverage is not None else {}),
     }
     atomic_write_json(run / "state" / "checkpoint.json", checkpoint, root=run,
@@ -1562,6 +1810,10 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--recon-dir", type=pathlib.Path)
     init.add_argument("--feature-graph", type=pathlib.Path)
     init.add_argument("--threat-model", type=pathlib.Path)
+    init.add_argument("--continue-from-run", type=pathlib.Path,
+                      help="消费上一 Run 的归因 agenda（diagnostic-only，v9.8）")
+    init.add_argument("--max-frozen-cells", type=int, default=20,
+                      help="本轮冻结进闭合分母的最大覆盖格数，其余进 deferred-pool（v9.8 W0，默认 20）")
     init.add_argument("--workspace-root", type=pathlib.Path)
     observe = sub.add_parser("observe")
     observe.add_argument("--run-dir", required=True, type=pathlib.Path)
@@ -1578,6 +1830,10 @@ def _parser() -> argparse.ArgumentParser:
     scope.add_argument("--reason", default="", help="追加原因（写入审计日志）")
     report = sub.add_parser("report")
     report.add_argument("--run-dir", required=True, type=pathlib.Path)
+    map_cmd = sub.add_parser(
+        "map",
+        help="生成 module_map 派生视图（模块聚类 + 规模判断，只读输入）")
+    map_cmd.add_argument("--run-dir", required=True, type=pathlib.Path)
     return parser
 
 
@@ -1600,7 +1856,9 @@ def main(argv: list[str] | None = None) -> int:
                 workspace_root=args.workspace_root,
                 require_instruction_match=True,
                 extra_scopes=args.allow, scope_files=args.scope_file,
-                derived_assets=args.allow_derived)
+                derived_assets=args.allow_derived,
+                continue_from_run=args.continue_from_run,
+                max_frozen_cells=args.max_frozen_cells)
         elif args.command == "observe":
             if args.input == "-":
                 observation = json.load(sys.stdin)
@@ -1615,6 +1873,8 @@ def main(argv: list[str] | None = None) -> int:
                 reason=args.reason)
         elif args.command == "report":
             result = report_direct_run(args.run_dir)
+        elif args.command == "map":
+            result = write_module_map(args.run_dir)
         else:
             result = checkpoint_direct_run(args.run_dir)
     except Exception as exc:  # noqa: BLE001
@@ -1643,6 +1903,7 @@ __all__ = [
     "checkpoint_direct_run",
     "report_direct_run",
     "scope_direct_run",
+    "write_module_map",
     "parse_scope_file",
     "DIRECT_QUEUE_LIMIT",
 ]

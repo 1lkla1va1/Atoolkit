@@ -20,7 +20,7 @@ try:
     )
     from ..host_policy import is_authorized_url, normalize_authorized_scopes
     from ..exploration import validate_intuition_exploration
-    from ..ledger import CoverageLedger
+    from ..ledger import CoverageLedger, is_high_value
     from ..outcome import build_miss_attribution, build_next_run_agenda
     from ..negative_retest import (families_from_packets,
                                    has_cross_stage_diversity,
@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover - direct package fallback
                                    rejected_finding_surface_ids)
     from host_policy import is_authorized_url, normalize_authorized_scopes
     from exploration import validate_intuition_exploration
-    from ledger import CoverageLedger
+    from ledger import CoverageLedger, is_high_value
     from outcome import build_miss_attribution, build_next_run_agenda
     from negative_retest import (families_from_packets,
                                  has_cross_stage_diversity,
@@ -3318,6 +3318,24 @@ def _run_closure_gate(
                                     reasons.extend(diversity_reasons)
         except (OSError, json.JSONDecodeError):
             reasons.append("coverage_missing_or_invalid")
+    # v9.8 W0: budget-cap deferred cells stay outside the closure denominator
+    # but remain visible to inventory consistency and terminal attribution.
+    deferred_surfaces: list[dict[str, Any]] = []
+    deferred_path = run_dir / "deferred-pool.json"
+    if deferred_path.is_file() and not deferred_path.is_symlink():
+        try:
+            deferred_value = json.loads(
+                deferred_path.read_text(encoding="utf-8"))
+            deferred_rows = (
+                deferred_value.get("surfaces")
+                if isinstance(deferred_value, dict) else [])
+            deferred_surfaces = [
+                dict(item) for item in (deferred_rows or [])
+                if isinstance(item, dict)]
+            closure_artifact_hashes["deferred-pool.json"] = _sha256_file(
+                deferred_path)
+        except (OSError, json.JSONDecodeError):
+            reasons.append("deferred_pool_invalid")
     if isinstance(endpoints, list) and endpoints:
         try:
             try:
@@ -3342,7 +3360,8 @@ def _run_closure_gate(
                     "endpoint": item.get("endpoint", ""),
                     "method": item.get("method", ""),
                 })
-                for item in surfaces if isinstance(item, dict)
+                for item in [*surfaces, *deferred_surfaces]
+                if isinstance(item, dict)
                 and str(item.get("method") or "").upper() in http_methods
             }
             missing_coverage = sorted(inventory_keys - coverage_keys)
@@ -3353,7 +3372,8 @@ def _run_closure_gate(
                     continue
                 key = canonical_surface_key(item)
                 matching = [
-                    surface for surface in surfaces if isinstance(surface, dict)
+                    surface for surface in [*surfaces, *deferred_surfaces]
+                    if isinstance(surface, dict)
                     and canonical_surface_key({
                         "endpoint": surface.get("endpoint", ""),
                         "method": surface.get("method", ""),
@@ -3530,8 +3550,48 @@ def _run_closure_gate(
                     or int(stats.get("in_scope_closed", 0) or 0)
                     != int(stats.get("in_scope_total", 0) or 0)):
                 reasons.append("coverage_in_scope_incomplete")
+    # v9.8 W0 anti-gaming gate: deferring high-value cells is only legitimate
+    # when the frozen subset was actually worked.  Below an 80% execution-event
+    # rate on frozen cells the run must not close as complete.
+    budget_gate: dict[str, Any] = {}
+    if deferred_surfaces and any(
+            is_high_value(item) for item in deferred_surfaces):
+        frozen_ids = {
+            str(item.get("surface_id") or "")
+            for item in surfaces if isinstance(item, dict)
+            and item.get("in_run_scope") is not False
+        }
+        frozen_ids.discard("")
+        progress_source = execution_projection
+        if not progress_source:
+            progress_path = run_dir / "execution-progress.json"
+            if progress_path.is_file() and not progress_path.is_symlink():
+                try:
+                    progress_source = json.loads(
+                        progress_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    progress_source = {}
+        eventful = {
+            str(row.get("surface_id") or "")
+            for row in (
+                progress_source.get("progress") or []
+                if isinstance(progress_source, dict) else [])
+            if isinstance(row, dict) and row.get("event_ids")
+        }
+        executed = len(frozen_ids & eventful)
+        rate = executed / len(frozen_ids) if frozen_ids else 0.0
+        budget_gate = {
+            "deferred_cells": len(deferred_surfaces),
+            "deferred_high_value": True,
+            "frozen_cells": len(frozen_ids),
+            "frozen_executed": executed,
+            "frozen_execution_rate": round(rate, 4),
+        }
+        if frozen_ids and executed * 5 < len(frozen_ids) * 4:
+            reasons.append("budget_cap_execution_below_floor")
     miss_attribution = build_miss_attribution(
-        surfaces=[item for item in surfaces if isinstance(item, dict)],
+        surfaces=[item for item in [*surfaces, *deferred_surfaces]
+                  if isinstance(item, dict)],
         inventory_rows=(endpoints if isinstance(endpoints, list) else []),
         unresolved_rows=(unresolved if isinstance(unresolved, list) else []),
         execution_projection=execution_projection,
@@ -3539,7 +3599,7 @@ def _run_closure_gate(
     )
     if not miss_attribution.get("complete"):
         reasons.append("miss_attribution_incomplete")
-    return {
+    gate = {
         "result": "pass" if not reasons and session_gate.get("result") == "pass" else "fail",
         "reasons": reasons,
         "session_gate": session_gate,
@@ -3549,6 +3609,9 @@ def _run_closure_gate(
         "miss_attribution": miss_attribution,
         "artifact_hashes": closure_artifact_hashes,
     }
+    if budget_gate:
+        gate["budget_cap"] = budget_gate
+    return gate
 
 
 def _empty_run_gate(

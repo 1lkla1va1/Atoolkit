@@ -28,7 +28,10 @@ def _read_object(path: pathlib.Path, root: pathlib.Path) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file():
         raise ContinuationError(f"continuation artifact missing or unsafe: {path.name}")
     try:
-        raw = safe_read_bytes(path, root=root, max_bytes=2 * 1024 * 1024)
+        # finding_validation.json embeds the full miss-attribution and agenda,
+        # so large runs (hundreds of open cells) legitimately exceed a couple
+        # of MiB; the cap only guards against pathological inputs.
+        raw = safe_read_bytes(path, root=root, max_bytes=16 * 1024 * 1024)
         value = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         raise ContinuationError(f"invalid continuation artifact {path.name}: {exc}") from exc

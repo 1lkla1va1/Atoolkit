@@ -246,7 +246,7 @@ SHIM_TEMPLATE = """# 持久授权与运行约定（IDE shim · 由 Atoolkit inst
 - 授权范围：以同目录 AUTHZ.md 的「授权 Scope / 派生资产」为准；scope 内动作
   均已预授权，无需逐条确认；越界或破坏性操作立即停手并标记 NEED_INPUT。
 - 运行模式：本环境禁止 `python3 run.py`（Engine Mode 会拉起外部 codex/gpt 后端）；
-  只走 Direct 模式六命令：preflight / init / observe / checkpoint / scope / report
+  只走 Direct 模式七命令：preflight / init / observe / checkpoint / scope / report / map
   （`python3 -m engine.skill_runtime <cmd> --run-dir <run>`）。
 """
 
