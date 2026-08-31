@@ -1,0 +1,55 @@
+{
+  "id": "privilege-escalation",
+  "title": "参数语义提权",
+  "description": "覆盖 status/discount/role/state 等参数语义提权：客户端可控字段越权改变角色、价格策略或流程状态。",
+  "match": {
+    "risk_tags": ["privilege", "enum-tamper", "privilege-escalation"],
+    "vuln_classes": ["越权/提权", "业务逻辑"],
+    "params": [
+      "status",
+      "discount",
+      "role",
+      "state",
+      "is_admin",
+      "vip",
+      "level",
+      "audit_status",
+      "user_type"
+    ],
+    "keywords": [
+      "审核",
+      "升级",
+      "角色",
+      "折扣",
+      "权限"
+    ]
+  },
+  "dimensions": [
+    "角色/权限字段是否接受客户端提交并被服务端直接采信",
+    "状态字段能否跨越合法状态机迁移（如直接置为已通过/已支付）",
+    "折扣/优惠字段是否被服务端按权威价格重新核算覆盖",
+    "同一字段在不同写端点的权限校验是否一致"
+  ],
+  "false_negative_rules": [
+    "只测升权方向不能证明降权与横向字段安全",
+    "前端隐藏字段不等于服务端拒绝该字段",
+    "单端点阴性不能证明同字段在其他写端点闭合"
+  ],
+  "evidence_required": [
+    "baseline_request",
+    "tampered_request",
+    "server_side_effect"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 3,
+    "min_response_count": 1,
+    "required_evidence_types": [
+      "baseline_request",
+      "tampered_request"
+    ]
+  },
+  "positive_depth_floor": {
+    "min_depth": 2,
+    "note": "提权须证明服务端副作用（角色/状态/价格真实改变），仅字段被接受不算"
+  }
+}

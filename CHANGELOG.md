@@ -1,5 +1,12 @@
 # Changelog
 
+## 9.8.3 - 2026-08-31
+
+- AGENTS.md 二次瘦身（v3 源文件 416 → 264 行）：只留边界/纪律/报告标准。§0.0–0.4 引擎合同压缩为须知四条主线（细节移 reference「引擎合同附录」）；§5 测试信号门、§6 depth floor 细则/跨阶段重测族/数据预备/聚合缝隙、§3 假阴性陷阱与"不能为空"信号、§11 周期自检节奏移入 `skill/skillmode-reference.md`（新增「测试信号门」「depth floor 与阴性充分性」「测试速查（方法论）」「引擎合同附录」四节，529 → 641 行）；§7 决策树收敛为纯路由表（≤3.5KB 不变，指针逐一落点）。铁律、报告验证门七问、四终态标记、覆盖七状态、压缩锚点五"即写"等边界条款全部保留。
+- 知识卡补缺 5 张（payload-free，过 `_validate_card`）：`redirect-chain`（开放重定向/回调跳转链）、`time-tamper`（时间参数篡改）、`privilege-escalation`（status/discount/role/state 参数语义提权）、`ssrf`（image_url/url/fetch）、`payment-concurrency`（下单/库存/秒杀并发与重复提交）。
+- checkpoint 新增 `created_data_advisory`（非阻断）：observation 文本含注册/创建类保守关键词信号而 `state/created_data.md` 缺失或无有效数据行时输出提醒字段并落盘 `state/created-data-advisory.json`（写盘失败只吞 OSError/UnsafePathError，不进 runtime-status.json、不影响 report_ready）。
+- 版本一致性修复：SKILL.md version 由 9.8.0 对齐到当前版本（doctor `version_consistency` 恢复 ok）。
+
 ## 9.8.2 - 2026-08-31
 
 - W1 scope 输入边界归一：带 path/query/fragment 的 `--target`/`--allow`/`--allow-derived`/scope-file/`scope --add` 在输入边界归一到 origin（stdout warning + `state/scope-audit.jsonl` 留痕）——修掉"入口页 URL 带 /login 导致全部 finding 被自己 scope 判越界"的零化 bug；验证期行为（`normalize_authorized_scopes`/`is_authorized_url`/validate/submission）逐字节不变，路径钉定安全特性与存量 Run 语义不受影响。

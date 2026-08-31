@@ -1,0 +1,56 @@
+{
+  "id": "payment-concurrency",
+  "title": "交易并发与重复提交",
+  "description": "覆盖下单/库存/秒杀/兑换的竞态与幂等：检查-执行窗口、重复提交、关单复用与成功次数复算。",
+  "match": {
+    "risk_tags": ["race", "business-logic", "accounting"],
+    "vuln_classes": ["竞态条件", "业务逻辑", "支付"],
+    "params": [
+      "stock",
+      "count",
+      "num",
+      "quantity",
+      "coupon_id",
+      "order_no",
+      "trade_no",
+      "points"
+    ],
+    "keywords": [
+      "下单",
+      "秒杀",
+      "库存",
+      "兑换",
+      "抢购",
+      "并发",
+      "重复提交"
+    ]
+  },
+  "dimensions": [
+    "检查与执行之间是否存在并发窗口（余额/库存/券只查一次扣多次）",
+    "同一订单/券/积分的重复提交是否幂等",
+    "关单/超时路径能否复活已消费的优惠或库存",
+    "并发成功次数与扣减次数是否可从原始日志复算"
+  ],
+  "false_negative_rules": [
+    "串行请求阴性不能证明并发安全",
+    "并发全部成功且无超额扣减才支持闭合；部分失败须分析窗口",
+    "未做合法基线对照的并发阴性无效"
+  ],
+  "evidence_required": [
+    "baseline_legit",
+    "raw_concurrency_file",
+    "success_count_replay"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 3,
+    "min_response_count": 1,
+    "required_evidence_types": [
+      "baseline_legit",
+      "raw_concurrency_file"
+    ]
+  },
+  "positive_depth_floor": {
+    "min_depth": 3,
+    "note": "竞态成功数必须能从原始并发日志复算（concurrency.successes ↔ success_marker 出现次数）"
+  }
+}

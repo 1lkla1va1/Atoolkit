@@ -1,11 +1,12 @@
-"""v9.8.2 W3 · AGENTS.md 瘦身（哲学归位）双向完整性测试。
+"""v9.8.3 · AGENTS.md 二次瘦身（只留边界/纪律/报告标准）双向完整性测试。
 
-安全网（设计文档 W3 / 审查 M4）：
-① 保留清单——铁律 7 条 + 验证门两层 3+7 问 + 终止 4 标记 + 速查卡全部条目 +
+安全网（v9.8.2 W3 测试演化到新保留政策）：
+① 保留清单——铁律 7 条 + 报告验证门 7 问 + 终止 4 标记 + 速查卡边界条目 +
    覆盖七状态，逐条断言仍存在于瘦身后的 v3 源文件；
 ② 移出清单——每个被移出主题的关键词在 skillmode-reference.md 中存在（漏并即红）；
 ③ §7 决策树段落体积 ≤ 3.5KB；
-④ v3 章节骨架（## 0.0 到 ## 11）存在且顺序不变。
+④ v3 章节骨架（## 0.0 到 ## 11）存在且顺序不变；
+⑤ v3 头部维护约定保留。
 
 断言一律使用稳定子串/关键词，不用长散文整段匹配，避免措辞微调假红。
 """
@@ -46,18 +47,12 @@ def test_iron_rules_preserved():
         assert kw in sec, f"铁律缺失要点: {kw}"
 
 
-def test_validation_gates_preserved():
-    """§5 验证门第一层 3 问 + 第二层 7 问逐条存在。"""
+def test_report_gate_preserved():
+    """§5 报告验证门 7 问逐条存在（测试信号门已移 reference，不在此断言）。"""
     sec = _section(_read(V3), "## 5. 验证门", "## 6. 覆盖完整性")
-    assert "第一层：测试信号门" in sec
-    assert "第二层：报告验证门" in sec
-    for kw in [  # 第一层 3 问
+    assert "报告验证门" in sec
+    for kw in [
         "在授权范围内吗？",
-        "响应有可观察的异常吗？",
-        "这个异常能链接到具体危害吗？",
-    ]:
-        assert kw in sec, f"验证门第一层缺问: {kw}"
-    for kw in [  # 第二层 7 问（第 1 问与第一层共用关键词）
         "有完整可重现的 PoC",
         "危害是可直接演示的",
         "影响已经在 PoC 中复现了吗？",
@@ -65,7 +60,7 @@ def test_validation_gates_preserved():
         "不懂安全的开发者能看懂危害吗？",
         "发到漏洞平台会被接受还是关闭？",
     ]:
-        assert kw in sec, f"验证门第二层缺问: {kw}"
+        assert kw in sec, f"报告验证门缺问: {kw}"
 
 
 def test_termination_markers_preserved():
@@ -75,8 +70,8 @@ def test_termination_markers_preserved():
         assert marker in sec, f"终止协议缺标记: {marker}"
 
 
-def test_quick_card_preserved():
-    """§3 速查卡全部条目（含假阴性陷阱）逐条存在。"""
+def test_quick_card_boundary_items_preserved():
+    """§3 速查卡只保留边界/报告标准条目，逐条存在。"""
     sec = _section(_read(V3), "## 3. 速查卡", "## 4. 铁律")
     for kw in [
         "CORS ≠ 漏洞",
@@ -85,20 +80,10 @@ def test_quick_card_preserved():
         "只报「已证明」",
         "报告必须带 curl",
         "物理证据 > 自我声明",
-        "20 分钟无进展信号",
-        "长链路用 PLAN",
-        "业务逻辑漏洞几乎都是长链路",
         "越界即停",
-        "认证、参数、角色/对象对都是一等攻击面",
-        "响应异常嗅探",
-        "不能为空",
-        # 假阴性陷阱
-        "替换 ID 至少 3-5 个",
-        "已测端点无参数",
-        "金额字段只测了正值",
-        "认证通过后就不再回头测认证面",
+        "一等攻击面",
     ]:
-        assert kw in sec, f"速查卡缺条目: {kw}"
+        assert kw in sec, f"速查卡缺边界条目: {kw}"
 
 
 def test_coverage_seven_states_preserved():
@@ -114,6 +99,24 @@ def test_coverage_seven_states_preserved():
         "exploring",
     ]:
         assert status in sec, f"覆盖七状态缺失: {status}"
+
+
+def test_coverage_disciplines_preserved():
+    """§6 代码绑定的覆盖纪律保留：实验有效性门 / 高价值格 / LOW_ROI 条件 / 阻塞分类。"""
+    sec = _section(_read(V3), "## 6. 覆盖完整性", "## 7. 决策树")
+    for kw in [
+        "coverage-ledger.json",
+        "实验有效性门",
+        "barrier_signals",
+        "高价值格不得空白",
+        "LOW_ROI",
+        "超过 5 个 not_tested 高价值",
+        "阻塞要分类",
+        "captcha/SMS/2FA 不是阻塞条件",
+        "depth_floor",
+        "proof_ready",
+    ]:
+        assert kw in sec, f"§6 缺纪律: {kw}"
 
 
 # ---------------------------------------------------------------- 移出清单
@@ -132,6 +135,13 @@ def test_moved_topics_landed_in_reference():
         "验证码绕过方向清单": ["通用码", "字段省略", "逻辑跳步", "验证码绑用户"],
         "存储型闭环": ["存储型", "闭环"],
         "链式评估": ["chain_assessment"],
+        # v9.8.3 二次瘦身新移出主题
+        "测试信号门": ["测试信号门", "响应有可观察的异常吗？", "这个异常能链接到具体危害吗？"],
+        "depth floor 细则": ["弹性 depth floor", "快速确认", "阴性 depth floor"],
+        "跨阶段阴性重测": ["编码族", "策略族"],
+        "速查卡方法论": ["假阴性陷阱", "替换 ID 至少 3-5 个", "响应异常嗅探", "Content-Type"],
+        "数据预备与聚合缝隙": ["数据预备", "seam_gap"],
+        "引擎合同附录": ["引擎合同附录", "dead_ends.json", "js_ref", "execution-contracts.json"],
     }
     for topic, keywords in topics.items():
         for kw in keywords:
@@ -161,12 +171,10 @@ def test_section7_kept_disciplines_and_pointers():
         "≥5",                      # 穷尽 ≥5 个方向的量化门槛（M4 不删数字）
         "SQLi 与 IDOR 是独立测试面",
         "匿名 200 ≠ 未授权",
-        "20 分钟",
         "Intent",
-        "chain",                   # 链式利用三问保留
         # 触发式指针
         "skillmode-reference.md",
-        "§密码重置", "§用户枚举", "§验证码绕过",
+        "§密码重置", "§验证码绕过",
         "§SQL 注入", "§WAF", "§链式利用评估", "§端点变体", "§攻击模式库",
     ]:
         assert kw in sec, f"§7 保留项缺失: {kw}"

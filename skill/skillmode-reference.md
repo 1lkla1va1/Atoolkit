@@ -527,3 +527,115 @@ create-order ──→ pay/index ──→ payment-gateway ──→ callback
 ## 技术栈路由启发（按框架/语言选方向）
 
 识别出技术栈后优先查对应已知面：Java → 对象处理/表达式解析/中间件暴露面（若命中已知框架如 RuoYi，走 Phase 0 框架指纹卡流程）；PHP → 文件访问/类型边界/输入验证；Node/前端重 → 对象合并/前端渲染/客户端路由。框架指纹命中时以 `knowledge/cards/frameworks/<name>.json` 的已知面为准。
+
+---
+
+## 测试信号门（发现异常时 · 决定是否继续深挖）
+
+遇到异常响应或可疑信号时，用以下 3 问快速判断是否值得投入更多测试时间：
+
+| # | 问题 | 信号判断 |
+|---|---|---|
+| 1 | 在授权范围内吗？ | 不在 → 停止，不碰 |
+| 2 | 响应有可观察的异常吗？ | 有异常（状态码变化/内容差异/长度变化/错误信息/时间延迟）→ 值得深挖。无异常但参数可控 → 换 payload 类型再试 |
+| 3 | 这个异常能链接到具体危害吗？ | 能描述出"如果成功会怎样" → 继续。**不要求此时已证明**，只要求危害路径合理且可验证 |
+
+**关键**：测试阶段不要因为"还没有 PoC"或"影响还没证明"就放弃。信号门只过滤"确实没信号"的情况，有信号就追到底。
+
+---
+
+## depth floor 与阴性充分性
+
+### 弹性 depth floor（两级确认）
+
+确认漏洞前，候选必须达到 depth_floor——即用多向量/多角色/多对象的对比证据证明这**真是漏洞且严重度没被低估**。
+
+| 级别 | 条件 | 要求 |
+|---|---|---|
+| **快速确认** | 首个 payload 即成功 + 影响明确 | 1 个成功 + 2 个失败对照 |
+| **完整确认** | 需要排除误报或评估严重度 | 达到完整 depth floor 阈值 |
+
+快速确认条件：首个 payload 产生明确可区分结果 + 影响可直接证明 + 确定性结果（非"可能"）。最小证据：1 成功请求+响应、1 对照请求+响应（证明差异是 payload 导致）；涉及越权时加 1 owner + 1 attacker 请求+响应差异，并用原始响应/产品策略证明资源本应 `owner_only`、`authenticated_only` 或 `role_restricted`。匿名可访问、两账号看到相同公开数据、可从公开页面/文档发现的内容均不是漏洞。
+
+**这是取证完整性，不是"进一步利用"**——前者必做，后者红线禁止。depth_score < depth_floor 时候选不得标 proof_ready。
+
+### 阴性 depth floor（弹性判断）
+
+阴性结论需要足够的测试深度支撑。深度由你根据端点复杂度、参数语义、响应特征和技术栈自行判断，不设硬性数值阈值。
+
+判断原则：
+- 参数语义越复杂（多义/多类型/多上下文），需要的测试向量越多样
+- 响应差异越微妙（行数变化 vs 状态码变化 vs 内容变化），需要的对照实验越充分
+- 涉及越权/多角色的漏洞，必须有跨角色对比证据
+- 仅凭单一 payload 类型不足以排除注入类漏洞
+
+未充分测试的阴性一律标 `shallow_negative`，不得标 `not_vulnerable`。
+
+### 跨阶段阴性重测
+
+多阶段/跨 Run 测试下，前一阶段标记为 `not_vulnerable` 的输入验证类 surface，后一阶段恢复为 `shallow_negative`，必须使用至少一个新的 payload 编码族和一个新的注入策略族重新测试。旧记录没有族元数据时，当前阶段至少证明两个编码族与两个策略族。前阶段阴性只是起点；final validator 会从物理 packet 重算族差异，模型文字或自报 `depth_sufficient` 不能闭格。
+
+阴性落盘的机器可读格式见上文「阴性落盘完整格式」。
+
+---
+
+## 测试速查（方法论）
+
+> 从核心文件 §3/§6/§11 移出的操作细则与节奏建议。边界与报告标准仍以核心文件为准。
+
+- **节奏**：连续 20 分钟无进展信号考虑换攻击面，但有微弱信号就继续追（模型直觉比计时器可靠）；长链路用 PLAN（前置规划），短链路用 TODO（边走边测）；业务逻辑漏洞几乎都是长链路 → 先建模、再拆 TODO、按清单执行。
+- **自检节奏**：过去 15 个 surface 中连续 5 个 shallow_negative → 换攻击面方向；单 surface 耗时超 15 分钟 → 评估放弃并标 blocked；每 25 个 surface 回顾核心文件速查卡/垃圾洞清单，并检查高价值 surface 覆盖与 negative depth 是否充分。
+- **响应异常嗅探**：对每个 API 响应，检查是否有意外字段（callback_sign、内部路径、调试信息、其他用户敏感数据），即使主流程正常——意外字段本身可能是独立的攻击面入口。
+- **参数"不能为空"信号**：接口返回"不能为空/格式错误/缺少字段"通常意味着参数名或编码方式不对，而不是参数真的缺失。尝试不同的 Content-Type、参数命名约定（snake_case / camelCase / PascalCase）或请求结构（form / JSON / multipart）。先解决格式问题再继续测试，不要直接标 negative。
+
+### 假阴性陷阱
+
+- 替换 ID 至少 3-5 个（同根因去重）
+- 已测端点无参数 → 不代表安全，检查路径本身（信息泄露/未授权访问）
+- 金额字段只测了正值 → 负数/零/精度/单位换算
+- 认证通过后就不再回头测认证面 → 错，注册/找回/重置/captcha 都是独立面
+
+### 数据预备与聚合缝隙
+
+- **数据预备**：测试某些端点前须先创建测试数据（余额/积分记录、订单、购物车、图片/文件等），确保端点有内容可测。端点返回空数据不得直接标 `not_vulnerable`，必须先执行数据预备后重测。
+- **聚合缝隙检查**：finding 聚合阶段须列出所有端点参数按类型检查是否都有测试记录，未覆盖的标 `seam_gap` 补测。
+
+---
+
+## 引擎合同附录（Engine/Host 细节）
+
+> 核心文件 §0.0–0.4 的完整版细节。进入 Engine Mode 或需要精确合同时阅读。
+
+### Threat Mode 分母与 discovery channel
+
+- Threat Mode 的覆盖分母来自经 schema 和 inventory 校验的 `feature-graph.json` + `threat-model.json`：先描述业务 actor/asset/state/trust boundary/action，再声明安全不变量、滥用动作、安全结果、可观察突破和证据要求；不得用漏洞类型清单代替这一步。
+- `js_ref`、`inline_script`、`asset_ref`、`page_link`、`path_inference`、`response_body` 六个 discovery channel 必须逐一给出 run 内物理证据；`blocked/not_applicable` 必须说明原因。每个 resolved endpoint 必须归属 feature 或进入有理由的 unassigned 清单。Discovery 至少有两个 covered channel，且代码/资源组（`js_ref|inline_script|asset_ref`）与导航/运行组（`page_link|path_inference|response_body`）各至少一个；全部 blocked/N/A 或只有单侧证据时不得声称完整 threat planning。
+- risk tag 只负责知识卡路由和优先级，不负责自动生成 Threat Mode 分母。未提供完整 threat artifacts 的 Direct 运行固定为 `legacy_risk/planning_degraded=true`，不得标 report-ready。
+- 报告渲染规则：完整闭合时渲染 final，未闭合但有已证漏洞时只渲染 `draft_report.md`，proof/manifest 失败时两者都不保留；手写同名文件会被 quarantine 并由代码重渲染。
+
+### 两阶段与身份
+
+- Engine Threat Mode 分成 sibling Planning/Attack Session。两个 phase 各自在首个模型动作前拥有 run plan/manifest，Attack manifest 必须绑定 Planning authority manifest 的 session 与 hash。
+- Engine Attack 的多身份原始 header 只从 Planning 完成后生成的受限 `identities.json` 按 label 读取；不得混用浏览器共享会话，不得把该文件复制进报告。Finalizer 开始前的恢复若指纹不一致须新开 sid；已有 finalization journal 时 Run 已冻结，继续测试也必须新开 sid。
+- 原始凭据与 PII 只允许存在于权限收紧的凭据/证据包。Planning snapshot 和 Canonical report 使用稳定 `<redacted:kind:hash>`；不得把 Cookie、Authorization、API Key、Token、手机号或邮箱原值复制进 inventory、threat、summary、Finding 散文或对外报告（自建测试账号例外，见核心文件 §10「数据即写」）。
+- CSRF 证明标准：`state_before → cross_site_request → state_after`，并有不同 Origin、受害者 Cookie、物理跨站发起载体、before/after marker 与 state delta。只有手工设置 Origin/Cookie，或仅"缺 CSRF token""响应头暴露 token"，都不是已证明 CSRF。
+
+### 执行合同与义务
+
+- 每个 frozen threat cell 都有 Host 生成的 Experiment Contract：`threat-model.json.evidence_required` 原文和确定性最低深度共同形成 `execution-contracts.json`；它们只约束当前 threat 的实验有效性，不生成新的漏洞类或 sibling cell。
+- `execution-progress.json` 和 `execution-queue.json` 由 Host reducer 重算。用户枚举需消息/时间/行为通道，跨身份需 owner/alternate/object marker，交易需合法基线/边界/state delta，持久化输入需 submit/read-back/render，SSRF/文件写入需结果证明；缺任一义务的阴性保持 `shallow_negative/exploring`。
+- Event 只证明实验已发生并驱动下一步，不能替代 canonical Finding 或 negative envelope。
+- Direct checkpoint 中任一 proof-rejected Finding、ingestion error 或 agent 写入 finalizer 保留产物，均为必须返工的显式失败项；不得只保留 Markdown 结论，也不得标记 `report_ready`。
+- 运行中新 endpoint/param 绑定证据后只进入 `execution-backlog.json`，disposition 固定 `next_run_required`；当前 Run 不得用动态发现改写 frozen denominator。
+
+### 跨 Run dead-end 合同（Engine Mode）
+
+普通 `SKIP`、预算不足、缺账号和模型自行放弃都不能跨 Run 关闭覆盖格。只有确实"不适用"的精确单元才写入会话根目录 `dead_ends.json`，格式为 `{"schema_version":"1.0","dead_ends":[...]}`；每项必须包含 `status=not_applicable`、精确 `asset/method/endpoint/param/role_scope/vuln_class`，并显式提供 `namespace/param_location/subject_role/object_kind`（无值时写空字符串）、`reason_code`、`refutation` 和可读取的 `evidence_refs`。`reason_code` 只允许：`endpoint_removed`、`feature_disabled`、`method_not_supported`、`parameter_not_consumed`、`role_not_applicable`、`vulnerability_class_not_applicable`。缺字段或证据校验失败时只作为本轮提示，不进入项目真值。
+
+### 归因、续航与提交
+
+- 未闭项只由 Host reducer 生成稳定 `v9_host_continuation`，输出到 `next-run-agenda.json`。authority-trusted finalizer 可在本轮不完整时只提交这些 continuation 到 ProjectState；不得同时提交未通过 closure 的阴性、dead-end 或模型散文。
+- 下一 Run scheduler 必须按 critical/high/medium/low 顺序消费全部 Host continuation。只有 Host continuation 可以把有证据的新 discovery 加入陈旧 inventory 之外的待测队列；普通模型 Intent 仍只接收 critical/high 且受 inventory 约束。
+- 继承闭格必须精确匹配 `origin + namespace + METHOD/path + param/location + actor/subject/object + exact vuln_class`；知识路由的语义家族不得用于闭格 key。schema 1/2 的聚合 cell 只保留为 stale 待复测证据，不得自动闭合 schema 3 exact-class cell。未知 method 的新路径进入 unresolved queue，不得默认 GET。
+- 当前 diagnostic Run 可用显式 `--continue-from-run` 消费上一 Run 经 validation digest、归因和 agenda 重算后的待办；`continuation-input.json` 必须绑定到新 manifest，且只能恢复当前 Run 调度，不能直接改 ProjectState 或提升 submission eligibility。
+- 对外提交前必须运行 `python3 run.py submission <run-dir>`；只有 delivery、归因、receipt、报告 hash 与敏感信息检查全部通过才可提交。`python3 run.py audit <legacy-run>` 只读审计旧产物，绝不提升旧 Markdown 为 Finding 真值。submission 按 manifest `authorized_scopes` / `run_scope.json` 确定性校验每条 finding 的 root target 在册性，不在册即 `eligible=false`；模型不做域名归属判断，目标不在册属 scope 声明问题，回 init/scope 命令补录。

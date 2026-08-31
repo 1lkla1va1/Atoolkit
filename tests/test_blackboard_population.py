@@ -7,7 +7,7 @@ class TestD3_BlackboardPopulation:
     """D3: orchestrator must fill domains_covered and surface_index with real data."""
 
     def _read_orchestrator(self):
-        p = pathlib.Path("engine/orchestrator.py")
+        p = pathlib.Path(__file__).resolve().parents[1] / "engine/orchestrator.py"
         assert p.exists(), f"{p} not found"
         return p.read_text(encoding="utf-8")
 

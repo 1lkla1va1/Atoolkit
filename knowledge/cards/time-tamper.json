@@ -1,0 +1,54 @@
+{
+  "id": "time-tamper",
+  "title": "时间参数篡改",
+  "description": "覆盖 order_time/timestamp/create_time 等时间语义参数：超时订单复活、活动时间窗绕过、状态机回拨与签名时间拆分。",
+  "match": {
+    "risk_tags": ["time-tamper", "business-logic"],
+    "vuln_classes": ["业务逻辑", "时间篡改"],
+    "params": [
+      "order_time",
+      "timestamp",
+      "create_time",
+      "pay_time",
+      "expire_time",
+      "start_time",
+      "end_time",
+      "ts"
+    ],
+    "keywords": [
+      "超时",
+      "过期",
+      "活动",
+      "秒杀",
+      "关单"
+    ]
+  },
+  "dimensions": [
+    "客户端提交的时间是否被服务端信任而非以服务端时钟为准",
+    "修改时间能否复活已关闭/已超时的订单、优惠或活动资格",
+    "时间参数与签名校验的绑定关系是否可被拆分重放",
+    "时间窗边界（等于开始/结束时刻）的判定是否一致"
+  ],
+  "false_negative_rules": [
+    "只测未来时间不能证明历史时间被拒绝",
+    "单一端点阴性不能证明关联状态机（支付/退款/关单）闭合",
+    "存在签名字段时未验证签名与时间拆分不得下阴性"
+  ],
+  "evidence_required": [
+    "baseline_legit",
+    "tampered_result",
+    "state_delta"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 3,
+    "min_response_count": 1,
+    "required_evidence_types": [
+      "baseline_legit",
+      "tampered_result"
+    ]
+  },
+  "positive_depth_floor": {
+    "min_depth": 2,
+    "note": "时间篡改须有状态差异（订单/资格/余额 before-after）才可 proof_ready"
+  }
+}

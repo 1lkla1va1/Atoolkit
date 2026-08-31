@@ -8,7 +8,8 @@ class TestBlackboardV2Schema:
     """Blackboard v2 must preserve fields needed for cross-run inheritance."""
 
     def _read_graph(self):
-        return pathlib.Path("engine/graph.py").read_text(encoding="utf-8")
+        root = pathlib.Path(__file__).resolve().parents[1]
+        return (root / "engine/graph.py").read_text(encoding="utf-8")
 
     def test_schema_v2_has_all_required_keys(self):
         src = self._read_graph()

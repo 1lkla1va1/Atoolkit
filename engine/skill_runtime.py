@@ -995,6 +995,94 @@ def _budget_guardrail(
     return guardrail
 
 
+# v9.8.3: created_data 登记 advisory（非阻断）。§10「数据即写」要求把自助注册
+# 账号等目标侧创建数据当轮登记到 state/created_data.md；本检查只做保守关键词
+# 信号匹配，绝不解析或信任业务语义。
+_CREATED_DATA_SIGNAL_KEYWORDS = (
+    "register", "signup", "sign_up", "注册", "创建账号", "新建账号",
+    "自助注册", "开户",
+)
+
+
+def _created_data_signals(observations: list[dict[str, Any]]) -> list[str]:
+    """Collect creation-style keywords present in observation text (conservative)."""
+    hits: set[str] = set()
+    for observation in observations:
+        try:
+            text = json.dumps(observation, ensure_ascii=False).lower()
+        except (TypeError, ValueError):
+            continue
+        for keyword in _CREATED_DATA_SIGNAL_KEYWORDS:
+            if keyword in text:
+                hits.add(keyword)
+    return sorted(hits)
+
+
+def _created_data_rows(text: str) -> int:
+    """Count effective data rows in a created_data.md table.
+
+    Header (含「类型」) and separator (只含 ``|`` ``-`` ``:`` 空白) rows do not
+    count; only rows carrying real cells do.
+    """
+    rows = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        cells = [cell for cell in cells if cell]
+        if not cells:
+            continue
+        if all(set(cell) <= set(":- ") for cell in cells):
+            continue
+        if any("类型" in cell for cell in cells):
+            continue
+        rows += 1
+    return rows
+
+
+def _created_data_advisory(
+    run: pathlib.Path,
+    observations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """v9.8.3: advisory reminding agents to register target-side created data.
+
+    When observation text carries register/create-style signals but
+    ``state/created_data.md`` is missing or has no effective data rows, the
+    checkpoint surfaces this advisory.  Advisory only: it never mutates the
+    ledger, never blocks the checkpoint and never feeds ``report_ready``.
+    """
+    signals = _created_data_signals(observations)
+    path = run / "state" / "created_data.md"
+    registered_rows = 0
+    if path.is_file() and not path.is_symlink():
+        try:
+            registered_rows = _created_data_rows(safe_read_text(path, root=run))
+        except (OSError, ValueError):
+            registered_rows = 0
+    triggered = bool(signals) and registered_rows == 0
+    advisory: dict[str, Any] = {
+        "schema_version": 1,
+        "triggered": triggered,
+        "signal_keywords": signals,
+        "registered_rows": registered_rows,
+        "message": (
+            "observation 中出现注册/创建类信号，但 state/created_data.md "
+            "缺失或无有效数据行——按核心文件 §10「数据即写」当轮登记"
+            "（含自建账号明文凭据），终态报告附录必须引用它"
+        ) if triggered else "",
+    }
+    # 与 _budget_guardrail 同款：advisory 写盘失败只吞 OSError/UnsafePathError，
+    # 绝不阻塞 checkpoint。
+    try:
+        ensure_directory(run / "state", root=run)
+        atomic_write_json(run / "state" / "created-data-advisory.json", advisory,
+                          root=run, reject_leaf_symlink=True)
+    except (OSError, UnsafePathError):  # 只吞写盘失败，编程错误照常抛出
+        advisory["advisory_error"] = "created_data_advisory_write_failed"
+    return advisory
+
+
 def _freeze_budget_capped(
     run: pathlib.Path,
     ledger: CoverageLedger,
@@ -1882,6 +1970,12 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         # runtime-metrics (best-effort by contract) so it leaves a trace.
         metrics.record("checkpoint.budget_guardrail", 0.0,
                        guardrail_write_error=1)
+    # v9.8.3: created_data 登记 advisory——observation 含注册/创建类信号而
+    # state/created_data.md 缺失或无有效数据行时提醒补登（非阻断）。
+    created_data_advisory = _created_data_advisory(run, observations)
+    if created_data_advisory.get("advisory_error"):
+        metrics.record("checkpoint.created_data_advisory", 0.0,
+                       advisory_write_error=1)
 
     execution_events, execution_errors = _execution_events_from_observations(
         run, ledger, observations)
@@ -2007,6 +2101,7 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         "identity_requirements": dict(
             identity_requirements.get("summary") or {}),
         "budget_guardrail": budget_guardrail,
+        "created_data_advisory": created_data_advisory,
         **({"threat_coverage": threat_coverage} if threat_coverage is not None else {}),
     }
     atomic_write_json(run / "state" / "checkpoint.json", checkpoint, root=run,

@@ -1,0 +1,56 @@
+{
+  "id": "redirect-chain",
+  "title": "开放重定向与回调跳转链",
+  "description": "覆盖开放重定向的结果化判定：单独跳转是现象，链到凭证窃取、OAuth/SSO 回调劫持或支付回调参数泄露才是结果。",
+  "match": {
+    "risk_tags": ["redirect-chain", "callback", "open-redirect"],
+    "vuln_classes": ["开放重定向", "跳转"],
+    "params": [
+      "redirect",
+      "redirect_uri",
+      "return_url",
+      "callback_url",
+      "next",
+      "goto",
+      "target",
+      "return_to",
+      "redir"
+    ],
+    "keywords": [
+      "redirect",
+      "callback",
+      "oauth",
+      "sso",
+      "登录回调",
+      "支付回调"
+    ]
+  },
+  "dimensions": [
+    "重定向目标是否可被攻击者控制为站外地址",
+    "跳转链是否携带或泄露 token、授权码、签名等敏感参数",
+    "重定向是否可与 OAuth/SSO 回调或支付回调链式利用",
+    "重定向 URL 是否被服务端二次请求而放大为服务端请求面"
+  ],
+  "false_negative_rules": [
+    "仅验证一次跳转响应不能证明回调参数不泄露",
+    "只测浏览器侧跳转不能排除服务端二次请求的链式风险",
+    "单独开放重定向是现象；未评估链式利用不得同时声明无风险"
+  ],
+  "evidence_required": [
+    "redirect_response",
+    "redirect_target_control",
+    "sensitive_param_trace"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 3,
+    "min_response_count": 1,
+    "required_evidence_types": [
+      "redirect_response",
+      "redirect_target_control"
+    ]
+  },
+  "positive_depth_floor": {
+    "min_depth": 2,
+    "note": "单独的开放重定向是现象；proof_ready 需要链到已证后果（链式利用评估见 reference）"
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "id": "ssrf",
+  "title": "服务端请求伪造（SSRF）",
+  "description": "覆盖 image_url/url/fetch 等参数引发的服务端请求：内网探测、云元数据访问、协议切换与回连验证。",
+  "match": {
+    "risk_tags": ["ssrf"],
+    "vuln_classes": ["ssrf", "服务端请求伪造"],
+    "params": [
+      "image_url",
+      "url",
+      "fetch",
+      "import_url",
+      "callback_url",
+      "target_url",
+      "pic",
+      "src",
+      "uri",
+      "link"
+    ],
+    "keywords": [
+      "抓取",
+      "远程图片",
+      "导入",
+      "webhook",
+      "预览",
+      "回连"
+    ]
+  },
+  "dimensions": [
+    "服务端是否对可控 URL 发起真实请求（可控回连点/带外通道证明）",
+    "目标地址校验是否可被内网地址、特殊解析形式或协议切换穿过",
+    "响应是否回显内网资源内容，或可经差异推断端口/服务存活性",
+    "跳转跟随、解析缓存与校验-请求时序是否制造二次差异"
+  ],
+  "false_negative_rules": [
+    "无回连渠道时的阴性不可信，须先建立可控回连点",
+    "仅测公网地址被拒不能证明内网地址被拒",
+    "跳转跟随与重试路径未覆盖不得下阴性"
+  ],
+  "evidence_required": [
+    "oob_callback",
+    "request_trace",
+    "destination_control"
+  ],
+  "negative_sufficiency": {
+    "min_vectors": 3,
+    "min_response_count": 1,
+    "required_evidence_types": [
+      "oob_callback",
+      "request_trace"
+    ]
+  },
+  "positive_depth_floor": {
+    "min_depth": 2,
+    "note": "SSRF 须证明服务端真实发起请求且目标在授权范围内；回连日志是最低证据"
+  }
+}

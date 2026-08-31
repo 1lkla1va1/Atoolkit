@@ -3,9 +3,11 @@ import re
 import pathlib
 import pytest
 
+_ROOT = pathlib.Path(__file__).resolve().parents[1]
+
 
 def _read(path):
-    return pathlib.Path(path).read_text(encoding="utf-8")
+    return (_ROOT / path).read_text(encoding="utf-8")
 
 
 class TestD4_SchedulerStats:
