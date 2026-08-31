@@ -56,6 +56,7 @@ try:
         is_high_value,
         normalize_status,
     )
+    from .metrics import PhaseRecorder, write_runtime_metrics
     from .orchestrator import CognitiveState
     from .planner import plan_surfaces
     from .project_state import canonical_asset
@@ -109,6 +110,7 @@ except ImportError:  # pragma: no cover - script execution fallback
                         STATUS_NOT_APPLICABLE, STATUS_NOT_TESTED,
                         STATUS_NOT_VULNERABLE, STATUS_SHALLOW_NEGATIVE,
                         CoverageLedger, is_high_value, normalize_status)
+    from metrics import PhaseRecorder, write_runtime_metrics
     from orchestrator import CognitiveState
     from planner import plan_surfaces
     from project_state import canonical_asset
@@ -145,6 +147,9 @@ _FORMAT_SIGNALS = {"format_unresolved"}
 _HUMAN_SIGNALS = {"missing_role", "challenge_unsolved"}
 DIRECT_QUEUE_LIMIT = 16
 DIRECT_HINT_CARD_LIMIT = 4
+# v9.8.1 R1: reachability guardrail thresholds (constants, not CLI flags).
+BUDGET_GUARDRAIL_FLOOR = 0.2
+BUDGET_GUARDRAIL_MIN_FROZEN = 5
 DIRECT_RESERVED_ARTIFACTS = (
     "final_report.md",
     "draft_report.md",
@@ -639,6 +644,39 @@ def _continuation_inventory_rows(
     return rows
 
 
+def derive_and_mirror_identity_requirements(
+    run: pathlib.Path,
+    surfaces: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Derive identity requirements over a surface set and mirror the verdict.
+
+    v9.8.1 W4a: init calls this on the pre-freeze full planned surface set so
+    the budget cap can prefer reachable cells; checkpoint calls it on
+    ``ledger.surfaces`` merged with the deferred pool so ``blocks_cells``
+    keeps the same full-set meaning in both artifacts.  Unmet cells are
+    flagged ``identity_blocked=true``; the flag is a pure derivation
+    recomputed from ``identities.json`` on every call (no persistent
+    demotion state), so supplying identities clears it automatically.
+    """
+    surfaces = [s for s in surfaces if isinstance(s, dict)]
+    requirements = derive_identity_requirements(
+        surfaces, identities_present=count_present_identities(run))
+    blocked = {
+        cell
+        for requirement in requirements.get("requirements") or []
+        for cell in (requirement.get("blocks_cells") or [])
+    }
+    for surface in surfaces:
+        surface_id = str(surface.get("surface_id") or "")
+        if surface_id in blocked:
+            surface["identity_blocked"] = True
+        else:
+            surface.pop("identity_blocked", None)
+    atomic_write_json(run / "identity-requirements.json", requirements,
+                      root=run, reject_leaf_symlink=True)
+    return requirements
+
+
 def _apply_identity_requirements(
     run: pathlib.Path,
     ledger: CoverageLedger,
@@ -650,23 +688,96 @@ def _apply_identity_requirements(
     the gap without re-init.  Unmet cells stay in the queue and are flagged
     ``identity_blocked=true``; attribution reads the flag as
     ``identity_missing``.
+
+    v9.8.1 W4a (MAJOR-2): the checkpoint derivation input is
+    ``ledger.surfaces`` + deferred-pool surfaces merged by surface_id, so
+    ``blocks_cells`` keeps the init-time full-set meaning; the pool file's
+    per-row ``identity_blocked`` marker is refreshed in place.
     """
-    requirements = derive_identity_requirements(
-        ledger.surfaces, identities_present=count_present_identities(run))
-    blocked = {
-        cell
-        for requirement in requirements.get("requirements") or []
-        for cell in (requirement.get("blocks_cells") or [])
-    }
-    for surface in ledger.surfaces:
-        surface_id = str(surface.get("surface_id") or "")
-        if surface_id in blocked:
-            surface["identity_blocked"] = True
-        else:
-            surface.pop("identity_blocked", None)
-    atomic_write_json(run / "identity-requirements.json", requirements,
-                      root=run, reject_leaf_symlink=True)
+    pool_document: dict[str, Any] | None = None
+    pool_surfaces: list[dict[str, Any]] = []
+    pool_path = run / "deferred-pool.json"
+    if pool_path.is_file() and not pool_path.is_symlink():
+        try:
+            candidate = _load_json(pool_path, root=run)
+        except SkillRuntimeError:
+            candidate = None
+        if isinstance(candidate, dict):
+            pool_document = candidate
+            pool_surfaces = [
+                item for item in (candidate.get("surfaces") or [])
+                if isinstance(item, dict)
+            ]
+    merged: list[dict[str, Any]] = list(ledger.surfaces)
+    seen = {str(surface.get("surface_id") or "") for surface in merged}
+    for surface in pool_surfaces:
+        if str(surface.get("surface_id") or "") not in seen:
+            merged.append(surface)
+    requirements = derive_and_mirror_identity_requirements(run, merged)
+    if pool_document is not None:
+        atomic_write_json(pool_path, pool_document, root=run,
+                          reject_leaf_symlink=True)
     return requirements
+
+
+def _budget_guardrail(
+    run: pathlib.Path,
+    ledger: CoverageLedger,
+    requirements: dict[str, Any],
+) -> dict[str, Any]:
+    """v9.8.1 R1: advisory reachability guardrail over the frozen set.
+
+    Runs after the checkpoint observation merge, so a cell confirmed by this
+    very checkpoint already reads as terminal and drops out of the
+    denominator (Round-2 MINOR-1).  The denominator is the open frozen set:
+    coverage-ledger surfaces in run scope (``in_run_scope is not False``)
+    whose status is not terminal.  The deferred pool must never be merged
+    in — pool rows also carry ``in_run_scope=True`` and would inflate the
+    denominator, diluting the ratio.  A cell is reachable when it is open
+    and not ``identity_blocked``; non-identity blockers (WAF/session/format)
+    keep their own recovery protocol and are not consumed here.
+
+    Advisory only: it never mutates the ledger, never blocks the checkpoint
+    and never feeds ``report_ready``.  ``triggered`` means "with the current
+    account matrix, most of the remaining frozen cells cannot produce
+    closure this run" — the aggregated ``human_actions`` say what to supply.
+    """
+    open_frozen = [
+        surface for surface in ledger.surfaces
+        if isinstance(surface, dict)
+        and surface.get("in_run_scope") is not False
+        and normalize_status(str(surface.get("status") or "")) not in _CLOSED
+    ]
+    frozen_cells = len(open_frozen)
+    reachable_cells = sum(
+        1 for surface in open_frozen
+        if surface.get("identity_blocked") is not True
+    )
+    ratio = (reachable_cells / frozen_cells) if frozen_cells else 0.0
+    triggered = (
+        frozen_cells >= BUDGET_GUARDRAIL_MIN_FROZEN
+        and ratio < BUDGET_GUARDRAIL_FLOOR
+    )
+    human_actions = _dedupe(
+        str(requirement.get("human_action") or "")
+        for requirement in requirements.get("requirements") or []
+        if isinstance(requirement, dict) and requirement.get("reason_code")
+    )
+    guardrail = {
+        "schema_version": 1,
+        "frozen_cells": frozen_cells,
+        "reachable_cells": reachable_cells,
+        "reachable_ratio": round(ratio, 4),
+        "floor": BUDGET_GUARDRAIL_FLOOR,
+        "triggered": triggered,
+        "min_frozen_for_eval": BUDGET_GUARDRAIL_MIN_FROZEN,
+        "recommendation": "NEED_INPUT" if triggered else "ok",
+        "human_actions": human_actions,
+    }
+    ensure_directory(run / "state", root=run)
+    atomic_write_json(run / "state" / "budget-guardrail.json", guardrail,
+                      root=run, reject_leaf_symlink=True)
+    return guardrail
 
 
 def _freeze_budget_capped(
@@ -683,12 +794,20 @@ def _freeze_budget_capped(
     checkpoint, and flow into the next-run agenda.  The ordering key mirrors
     the ledger's existing priority (high-value first, then feature, then
     surface_id) so repeated inits are byte-identical.
+
+    v9.8.1 W4a: identity reachability outranks value — a cell whose identity
+    requirement is unmet costs this run's budget without producing closure,
+    so ``identity_blocked`` cells sort behind reachable ones and land in the
+    pool with ``deferred_reason="identity_cap"`` (the rest keep
+    ``"budget_cap"``).  The top-level ``deferred_reasons`` count dictionary
+    replaces the old single-value ``deferred_reason`` field.
     """
     if len(ledger.surfaces) <= max_frozen_cells:
         return []
     ordered = sorted(
         ledger.surfaces,
         key=lambda surface: (
+            1 if surface.get("identity_blocked") is True else 0,
             0 if is_high_value(surface) else 1,
             str(surface.get("feature") or ""),
             str(surface.get("surface_id") or ""),
@@ -706,9 +825,14 @@ def _freeze_budget_capped(
     pool = [
         {**surface,
          "priority_rank": rank,
-         "deferred_reason": "budget_cap"}
+         "deferred_reason": (
+             "identity_cap" if surface.get("identity_blocked") is True
+             else "budget_cap")}
         for rank, surface in enumerate(deferred, start=len(frozen_ids) + 1)
     ]
+    deferred_reasons = {"budget_cap": 0, "identity_cap": 0}
+    for entry in pool:
+        deferred_reasons[entry["deferred_reason"]] += 1
     ledger.metadata["budget_cap"] = {
         "max_frozen_cells": max_frozen_cells,
         "frozen_cells": len(ledger.surfaces),
@@ -716,7 +840,7 @@ def _freeze_budget_capped(
     }
     atomic_write_json(run / "deferred-pool.json", {
         "schema_version": 1,
-        "deferred_reason": "budget_cap",
+        "deferred_reasons": deferred_reasons,
         "max_frozen_cells": max_frozen_cells,
         "frozen_cells": len(ledger.surfaces),
         "deferred_cells": len(pool),
@@ -745,6 +869,11 @@ def initialize_direct_run(
     if int(max_frozen_cells) < 1:
         raise SkillRuntimeError("--max-frozen-cells must be >= 1")
     run = run_dir.resolve()
+    # v9.8.1 W5a: governance-tax instrumentation (best-effort; the write at
+    # the tail swallows its own errors into metrics_error).
+    metrics = PhaseRecorder()
+    init_started_at = time.time()
+    init_started_perf = time.perf_counter()
     preflight_direct_run(
         run_dir=run,
         target=target,
@@ -779,6 +908,7 @@ def initialize_direct_run(
             "run_dir": str(run),
             "diagnostic_only": True,
         }, root=run, reject_leaf_symlink=True)
+    metrics_tick = time.perf_counter()
     rows = _inventory_rows(inventory_path)
     if recon_dir is not None:
         rows.extend(bootstrap_recon(recon_dir))
@@ -846,14 +976,28 @@ def initialize_direct_run(
         surface["in_run_scope"] = True
         surface["source"] = "direct-skill-runtime"
         _decorate_surface(surface, cards)
+    metrics.record("init.plan", time.perf_counter() - metrics_tick)
+
+    # v9.8 W2 + v9.8.1 W4a: identity requirements are derived over the
+    # pre-freeze full planned surface set and materialized before the first
+    # network action; unmet cells are flagged identity_blocked=true (Direct
+    # 降级不阻塞, design W2.2) so the budget cap below can prefer reachable
+    # cells and defer stateful ones with reason identity_cap.
+    metrics_tick = time.perf_counter()
+    identity_requirements = derive_and_mirror_identity_requirements(
+        run, ledger.surfaces)
+    metrics.record("init.identity", time.perf_counter() - metrics_tick)
 
     # v9.8 W0: budget-matched denominator freeze (legacy plan_surfaces path
     # only — threat-mode cells stay bound to their compiled feature/threat
     # denominator per v8.12).
     deferred_surfaces: list[dict[str, Any]] = []
+    metrics_tick = time.perf_counter()
     if planning_mode == "legacy_risk":
         deferred_surfaces = _freeze_budget_capped(
             run, ledger, int(max_frozen_cells))
+    metrics.record("init.freeze", time.perf_counter() - metrics_tick)
+    metrics_tick = time.perf_counter()
 
     unresolved = [row for row in rows if not _row_key(row)[1]]
     resolved = [row for row in rows if _row_key(row)[1]]
@@ -875,10 +1019,6 @@ def initialize_direct_run(
         "planning_artifact_hashes": planning_artifact_hashes,
         "execution_contract_version": EXECUTION_CONTRACT_VERSION,
     })
-    # v9.8 W2: identity requirements are materialized before the first
-    # network action; unmet cells keep their queue slot with
-    # identity_blocked=true (Direct 降级不阻塞, design W2.2).
-    identity_requirements = _apply_identity_requirements(run, ledger)
     ledger.save(run / "coverage-ledger.json")
     atomic_write_json(run / "candidate-ledger.json", {
         "schema_version": "1.1", "candidates": [],
@@ -908,14 +1048,28 @@ def initialize_direct_run(
         }
     if deferred_surfaces:
         status["deferred_pool"] = {
-            "deferred_reason": "budget_cap",
+            "deferred_reasons": {
+                reason: sum(
+                    1 for entry in deferred_surfaces
+                    if entry.get("deferred_reason") == reason)
+                for reason in ("budget_cap", "identity_cap")
+            },
             "deferred_cells": len(deferred_surfaces),
             "max_frozen_cells": int(max_frozen_cells),
         }
     status["identity_requirements"] = dict(
         identity_requirements.get("summary") or {})
     atomic_write_json(run / "runtime-status.json", status, root=run, reject_leaf_symlink=True)
-    return {**status, "execution_queue": queue}
+    metrics.record("init.projection", time.perf_counter() - metrics_tick)
+    metrics.record("init.total", time.perf_counter() - init_started_perf)
+    metrics_error = ""
+    try:
+        write_runtime_metrics(
+            run, metrics, event="init",
+            mark_init=True, first_init_at=init_started_at)
+    except Exception as exc:  # noqa: BLE001
+        metrics_error = f"{type(exc).__name__}: {exc}"
+    return {**status, "execution_queue": queue, "metrics_error": metrics_error}
 
 
 def _validate_ref(run: pathlib.Path, ref: str) -> str:
@@ -939,6 +1093,7 @@ def record_observation(
 ) -> dict[str, Any]:
     """Create one immutable observation or accept an identical retry."""
     run = run_dir.resolve()
+    observe_started_perf = time.perf_counter()
     if not _ID_RE.fullmatch(agent_id or ""):
         raise SkillRuntimeError("invalid agent_id")
     if not isinstance(observation, dict) or observation.get("schema_version") != 1:
@@ -1005,12 +1160,26 @@ def record_observation(
     ensure_directory(destination.parent, root=run)
     created = create_json_exclusive(destination, normalized, root=run)
     if created:
-        return {"path": destination.relative_to(run).as_posix(), "idempotent": False}
-    existing = _load_json(destination, root=run)
-    if existing != normalized:
-        raise SkillRuntimeError(
-            f"observation id already exists with different content: {agent_id}/{observation_id}")
-    return {"path": destination.relative_to(run).as_posix(), "idempotent": True}
+        result = {"path": destination.relative_to(run).as_posix(),
+                  "idempotent": False}
+    else:
+        existing = _load_json(destination, root=run)
+        if existing != normalized:
+            raise SkillRuntimeError(
+                f"observation id already exists with different content: {agent_id}/{observation_id}")
+        result = {"path": destination.relative_to(run).as_posix(),
+                  "idempotent": True}
+    # v9.8.1 W5a: observe is the most frequent governance action in a session;
+    # time it per call.  Metrics failure must never fail the observe itself.
+    metrics = PhaseRecorder()
+    metrics.record("observe.total", time.perf_counter() - observe_started_perf,
+                   observations=1)
+    metrics_error = ""
+    try:
+        write_runtime_metrics(run, metrics, event="observe")
+    except Exception as exc:  # noqa: BLE001
+        metrics_error = f"{type(exc).__name__}: {exc}"
+    return {**result, "metrics_error": metrics_error}
 
 
 def _read_observations(run: pathlib.Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
@@ -1217,6 +1386,11 @@ def _apply_direct_execution_gate(
 def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     """Reduce all immutable observations into ledger/status/queue projections."""
     run = run_dir.resolve()
+    # v9.8.1 W5a: six checkpoint sub-phase timers + totals; best-effort write
+    # at the tail swallows its own errors into metrics_error.
+    metrics = PhaseRecorder()
+    checkpoint_started_perf = time.perf_counter()
+    metrics_tick = checkpoint_started_perf
     ledger = CoverageLedger.load(run / "coverage-ledger.json")
     for name, expected in sorted(
             (ledger.metadata.get("planning_artifact_hashes") or {}).items()):
@@ -1230,10 +1404,13 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
             raise SkillRuntimeError(
                 f"planning artifact digest mismatch: {name}")
     cards = load_cards()
+    metrics.record("checkpoint.ledger_load", time.perf_counter() - metrics_tick)
     # v9.8 W2: re-derive identity requirements at every checkpoint so a newly
     # supplied identity clears the gap without re-init; identity_blocked
     # flags feed miss-attribution as identity_missing (W2.4).
+    metrics_tick = time.perf_counter()
     identity_requirements = _apply_identity_requirements(run, ledger)
+    metrics.record("checkpoint.identity", time.perf_counter() - metrics_tick)
     observations, observation_errors = _read_observations(run)
     grouped: dict[str, list[dict[str, Any]]] = {}
     for observation in observations:
@@ -1242,10 +1419,13 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     # v9.3: the full authorized scope list (multi-asset runs) is authoritative;
     # legacy runs without `authorized_scopes` fall back to the single target.
     scope_hosts = _metadata_authorized_scopes(ledger.metadata)
+    metrics_tick = time.perf_counter()
     collected = collect_structured_findings(
         run,
         authorized_hosts=scope_hosts or None,
         derived_hosts=_metadata_derived_assets(ledger.metadata) or None)
+    metrics.record("checkpoint.finding_collect",
+                   time.perf_counter() - metrics_tick)
     # v9.2: wire the Guardian gate into the Skill checkpoint path, mirroring
     # validate_run_artifacts.  Demotions (incl. L1 garbage-title hits) become
     # observations — they never inflate proof_repair_required and never block
@@ -1256,6 +1436,8 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         dict(item) for item in (collected.get("observations") or [])]
     rejected_findings: list[dict[str, Any]] = list(collected.get("rejected") or [])
     accepted_by_path: dict[str, dict[str, Any]] = {}
+    pre_gate_observations = len(observation_items)
+    metrics_tick = time.perf_counter()
     for item, normalized in zip(
             collected.get("accepted") or [], collected.get("normalized") or []):
         path = pathlib.Path(str(item.get("path") or ""))
@@ -1282,6 +1464,9 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
                     f"guardian:{verdict.result}:L{verdict.level}:{verdict.reason}"],
             })
 
+    metrics.record("checkpoint.guardian_gate", time.perf_counter() - metrics_tick)
+    guardian_demotions = len(observation_items) - pre_gate_observations
+    metrics_tick = time.perf_counter()
     conflicts: list[dict[str, Any]] = []
     for surface in ledger.surfaces:
         current = grouped.get(str(surface.get("surface_id") or ""), [])
@@ -1444,6 +1629,11 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         surface["knowledge_card_ids"] = [
             card.get("id") for card in matched if card.get("id")]
 
+    # v9.8.1 R1: advisory reachability guardrail.  Placed after the merge
+    # loop so cells confirmed by this checkpoint already read as terminal
+    # (Round-2 MINOR-1); never mutates status and never gates the run.
+    budget_guardrail = _budget_guardrail(run, ledger, identity_requirements)
+
     execution_events, execution_errors = _execution_events_from_observations(
         run, ledger, observations)
     rejected_execution_surfaces = rejected_finding_surface_ids(
@@ -1498,6 +1688,9 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     if rendered_hashes:
         # Preserve the report-command verification hook across status rewrites.
         status["rendered_artifacts"] = rendered_hashes
+    metrics.record("checkpoint.observation_merge",
+                   time.perf_counter() - metrics_tick)
+    metrics_tick = time.perf_counter()
     # v9.8 W1.1: every Direct checkpoint also emits the attribution triplet
     # (finding_validation.json + miss-attribution.json + next-run-agenda.json)
     # via the shared validator, so the next run can consume them through
@@ -1526,7 +1719,22 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         }
     except Exception as exc:  # noqa: BLE001
         attribution_error = f"{type(exc).__name__}: {exc}"
+    metrics.record("checkpoint.attribution_validate",
+                   time.perf_counter() - metrics_tick)
     write_observations_json(run, observation_items, root=run)
+    metrics.record(
+        "checkpoint.total", time.perf_counter() - checkpoint_started_perf,
+        observations=len(observations),
+        guardian_demotions=guardian_demotions,
+        rejected=len(rejected_findings))
+    # v9.8.1 W5a red line: a metrics failure (disk/permission) must never fail
+    # the checkpoint — swallow and report via metrics_error.
+    metrics_error = ""
+    try:
+        write_runtime_metrics(run, metrics, event="checkpoint",
+                              mark_checkpoint=True)
+    except Exception as exc:  # noqa: BLE001
+        metrics_error = f"{type(exc).__name__}: {exc}"
     checkpoint = {
         "schema_version": 1,
         **status,
@@ -1546,8 +1754,10 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
         "reserved_artifact_violations": reserved_violations,
         "attribution_summary": attribution_summary,
         "attribution_error": attribution_error,
+        "metrics_error": metrics_error,
         "identity_requirements": dict(
             identity_requirements.get("summary") or {}),
+        "budget_guardrail": budget_guardrail,
         **({"threat_coverage": threat_coverage} if threat_coverage is not None else {}),
     }
     atomic_write_json(run / "state" / "checkpoint.json", checkpoint, root=run,

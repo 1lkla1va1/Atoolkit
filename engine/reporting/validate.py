@@ -3583,6 +3583,13 @@ def _run_closure_gate(
         budget_gate = {
             "deferred_cells": len(deferred_surfaces),
             "deferred_high_value": True,
+            # v9.8.1 W4a (MAJOR-1): transparency counter only — it never
+            # participates in the trigger; the 80% execution floor applies
+            # regardless of why cells were deferred.
+            "deferred_identity_blocked_high_value": sum(
+                1 for item in deferred_surfaces
+                if item.get("identity_blocked") is True
+                and is_high_value(item)),
             "frozen_cells": len(frozen_ids),
             "frozen_executed": executed,
             "frozen_execution_rate": round(rate, 4),

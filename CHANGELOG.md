@@ -1,5 +1,18 @@
 # Changelog
 
+## 9.8.1 - 2026-08-31
+
+- W4a 调度消费端：init 改为"先身份推导后冻结"，`_freeze_budget_capped` 排序键首维加 `identity_blocked`（可达性优先于价值），被身份挤出的格记 `deferred_reason=identity_cap`（顶层改 `deferred_reasons` 计数字典）；`next_surfaces()` 与 execution queue 排序在同优先级内把 identity_blocked 格降权（纯派生、每次 init/checkpoint 重算，身份到位自动恢复）。
+- A0 推导器匿名豁免修正：纯匿名格（`role==anonymous`）一律 `needed=0`——修掉匿名 IDOR 探测面在 0 身份默认 run 下被整批误标 identity_blocked 的地基回归；带态格行为不变。
+- deferred 归因防漂移：pool 格归因时剥离 `identity_blocked`，`cause_code` 恒为 `execution_not_started`（agenda 保持 medium），防止数百 deferred 格跨 Run 集体升 high 挤压有信号的 continuation；冻结集内 blocked 格仍归因 `identity_missing`。checkpoint 的 identity-requirements 推导输入扩为 ledger + pool 全集口径。
+- R1 可达占比护栏：checkpoint 对冻结集算可达占比，`<0.2` 且冻结 ≥5 格时输出 `budget_guardrail.triggered=true` + 聚合 `human_actions`（advisory，不改任何 status）；落盘 `state/budget-guardrail.json`。
+- W6 提交出口校验：`inspect_submission` 新增确定性 scope 隶属校验——finding root target 必须 ∈ manifest `authorized_scopes`（无 manifest 回退 `run_scope.json`），相对 target 按 primary_target urljoin 解析；仿冒域/未在册 target 即 `eligible=false`（`finding_target_out_of_scope:<host>`），堵死第三方仿冒站误投。
+- W5a 治理税 instrumentation：新 `engine/metrics.py`，init/observe/checkpoint 相位计时计数落盘 `runtime-metrics.json` + `state/metrics.jsonl`（含 session_span，占比为含空闲下界）；best-effort，测量失败永不阻塞主流程。
+- AGENTS.md：回补 v9.8 workspace 目录布局直改内容（修复生成源漂移），新增 Direct 产物与续航、终态 checkpoint 约定、budget_guardrail 消费、带态冻结（identities.json 预置）与提交出口机器校验条文。
+- 新增 28 例测试（调度消费端 8、重放 3、护栏 7、提交 scope 6、metrics 4），全量 507 passed / 3 skipped。
+- 设计文档：`design/迭代方案/v9.8.1_可达性调度消费端与提交出口收口.md`（含对抗审查修订附录，3 BLOCKER / 6 MAJOR / 6 MINOR 逐条处置）。
+- 裁撤项（经对抗审查验证后降级为条件项）：exploring 正反馈（原定义为死代码 + 存在零成本伪造路径）、R11 探索税配额（前提不存在）；触发条件见设计文档 §0.3/§3。
+
 ## 9.8.0 - 2026-08-31
 
 - W0 预算冻结：`init --max-frozen-cells`（默认 20）限制单 Run 冻结分母，超额 surface 进入 `deferred-pool.json`（确定性冻结集，字节级可重放）；validate 新增防作弊闸——deferred 含高价值格且冻结格执行事件率 <80% 时拒绝 complete，防止用 deferred 冒充完成。

@@ -157,7 +157,10 @@ def derive_identity_requirements(
         role = _role_for_surface(surface)
         mode = _mode_for_tags(surface.get("risk_tags") or [])
         needed = _COUNT_NEEDED[mode]
-        if mode == "single" and role == "anonymous":
+        # v9.8.1 A0: purely anonymous probing needs no credential regardless
+        # of mode — the peer_pair/stateful comparison is carried by the
+        # sibling authenticated-role cell expanded from the same endpoint.
+        if role == "anonymous":
             needed = 0
         if needed < 1:
             continue

@@ -63,14 +63,17 @@ def test_budget_cap_splits_frozen_and_deferred(tmp_path):
     frozen = _frozen_ids(run)
     assert len(frozen) == 20
     pool = _load(run, "deferred-pool.json")
-    assert pool["deferred_reason"] == "budget_cap"
+    # v9.8.1 W4a：顶层单值 deferred_reason 改为计数字典；本 fixture 全带态
+    # （roles=["user"] + id 参数 → peer_pair）且 0 身份 → 全部 identity_cap
+    assert pool["deferred_reasons"] == {
+        "budget_cap": 0, "identity_cap": pool["deferred_cells"]}
     assert pool["max_frozen_cells"] == 20
     assert pool["frozen_cells"] == 20
     # seed_matrix 会按 vuln_class 等维度展开，总格数 > 端点数；不写死总数
     assert pool["deferred_cells"] == len(pool["surfaces"]) > 0
     # 完整 surface 身份 + 优先级 + deferred_reason
     for entry in pool["surfaces"]:
-        assert entry["deferred_reason"] == "budget_cap"
+        assert entry["deferred_reason"] == "identity_cap"
         assert entry["priority_rank"] > 20
         for field in ("surface_id", "endpoint", "method", "param", "roles",
                       "risk_tags"):

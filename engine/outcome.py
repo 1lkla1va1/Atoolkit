@@ -207,6 +207,14 @@ def build_miss_attribution(
         if not isinstance(raw, dict) or raw.get("in_run_scope") is False:
             continue
         surface = dict(raw)
+        if surface.get("deferred_reason"):
+            # v9.8.1 §1.1.1-4 (BLOCKER-2): a deferred-pool row is this run's
+            # explicit "not this round" declaration; its cause_code stays
+            # execution_not_started (medium priority in the next-run agenda)
+            # even though the pool row carries a live identity_blocked
+            # marker for identity-requirements/gate consumers.  Frozen-set
+            # blocked cells keep their identity_missing attribution.
+            surface.pop("identity_blocked", None)
         surface_id = str(surface.get("surface_id") or _digest("surface", surface))
         progress = progress_by_id.get(surface_id)
         cause, terminal, action = _cell_cause(surface, progress)

@@ -389,6 +389,10 @@ class CoverageLedger:
             def _prio(s: dict[str, Any]) -> tuple:
                 shallow = s.get("negative_depth") == "shallow" or str(s.get("status") or "").lower() == SHALLOW_NEGATIVE
                 return (
+                    # v9.8.1 W4a: identity-unreachable cells demote behind
+                    # reachable ones (their this-run closure cost is
+                    # unbounded); the flag is re-derived every checkpoint.
+                    1 if s.get("identity_blocked") is True else 0,
                     0 if shallow else 1,
                     0 if s.get("next_actions") else 1,
                     0 if is_high_value(s) else 1,

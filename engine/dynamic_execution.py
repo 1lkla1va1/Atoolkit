@@ -736,6 +736,9 @@ def build_execution_projection(
                 "barrier_signals": sorted(barriers),
                 "next_obligations": missing[:6],
                 "high_value": bool(is_high_value(surface)),
+                # v9.8.1 W4a: identity-unreachable cells sort behind
+                # reachable ones within the same execution status.
+                "identity_blocked": bool(surface.get("identity_blocked")),
             })
     priority = {
         "proof_repair": 0,
@@ -746,6 +749,7 @@ def build_execution_projection(
     }
     queue.sort(key=lambda item: (
         priority.get(item["execution_status"], 9),
+        1 if item["identity_blocked"] else 0,
         0 if item["high_value"] else 1,
         item["feature_id"], item["surface_id"],
     ))
