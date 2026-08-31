@@ -1,5 +1,15 @@
 # Changelog
 
+## 9.8.2 - 2026-08-31
+
+- W1 scope 输入边界归一：带 path/query/fragment 的 `--target`/`--allow`/`--allow-derived`/scope-file/`scope --add` 在输入边界归一到 origin（stdout warning + `state/scope-audit.jsonl` 留痕）——修掉"入口页 URL 带 /login 导致全部 finding 被自己 scope 判越界"的零化 bug；验证期行为（`normalize_authorized_scopes`/`is_authorized_url`/validate/submission）逐字节不变，路径钉定安全特性与存量 Run 语义不受影响。
+- W2 框架指纹路由：Phase 0 新增硬步骤——识别到已知框架时写 `recon/framework_fingerprint.md`（首行 `framework: <name>` 机器约定）；init 据此加载 `knowledge/cards/frameworks/<name>.json`（首张：ruoyi），对命中已知面的 surface 打 `framework_hit` 并作为冻结排序的 tie-breaker（不凌驾价值维），未覆盖已知面输出 advisory（提示首个 checkpoint 前重跑 init 的回路）。卡片只加权不扩面，解析容错 BOM/大小写、拒绝路径遍历与 symlink。
+- W3 AGENTS.md 哲学归位瘦身：§7 决策树 11.1KB → 3.5KB——保留决策框架与纪律原则（含"穷尽 ≥5 个方向"量化门槛），方法论细则（SQLi 上下文/WAF 技术/密码重置/用户枚举三通道/验证码方向/端点变体/业务攻击模式）全部移入 `skill/skillmode-reference.md`（缺失四节先补后移），每主题留触发式指针；全文 53.8KB → 46.3KiB。新增双向完整性测试（保留条款逐条在 + 移出内容 reference 可查）与 v3 头部维护约定"方法论只减不增"。
+- W4 护栏失败隔离：`_budget_guardrail` 写盘失败不再挂 checkpoint（稳定 code `budget_guardrail_write_failed` + metrics counter 留痕，只吞 OSError/UnsafePathError）。
+- 实现审查 MINOR 修复：Engine `--allow-derived` 同口径归一；指纹解析容错；reference 指针逐一对齐标题；Direct 归一 warning 文案修正；技术栈路由启发并入 reference。
+- 新增 40 例测试，全量 547 passed / 3 skipped。
+- 设计文档：`design/迭代方案/v9.8.2_哲学归位与框架指纹路由.md`（两轮设计对抗审查 12+5 条全闭合 + 一轮实现对抗审查 0 BLOCKER/0 MAJOR/7 MINOR 全修复）。
+
 ## 9.8.1 - 2026-08-31
 
 - W4a 调度消费端：init 改为"先身份推导后冻结"，`_freeze_budget_capped` 排序键首维加 `identity_blocked`（可达性优先于价值），被身份挤出的格记 `deferred_reason=identity_cap`（顶层改 `deferred_reasons` 计数字典）；`next_surfaces()` 与 execution queue 排序在同优先级内把 identity_blocked 格降权（纯派生、每次 init/checkpoint 重算，身份到位自动恢复）。

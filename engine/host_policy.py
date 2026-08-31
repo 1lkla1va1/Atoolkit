@@ -133,6 +133,56 @@ def parse_authorized_scope(value: str) -> AuthorizedScope | None:
     return AuthorizedScope(host, port, include_subdomains)
 
 
+def strip_scope_path_with_warning(value: str) -> tuple[str, str | None]:
+    """Fold a path/query/fragment-bearing scope URL back to its origin.
+
+    v9.8.2 W1 — input boundaries only (Direct init / ``scope --add`` /
+    Engine CLI ``--target``/``--allow``).  A scope like
+    ``https://host:20002/login`` used to pin the authorized subtree to
+    ``/login`` via ``is_authorized_url``'s path-prefix match, silently
+    narrowing every finding elsewhere on the site to out-of-scope.  At the
+    input boundary the operator's intent is the whole site (path-level
+    narrowing has the explicit ``--allow-path``/``--deny-path`` channel), so
+    the value is normalized to ``scheme://host[:port]`` and the caller
+    surfaces the returned warning + writes a scope-audit record.
+
+    Unchanged (``warning is None``): ``path`` empty or ``/``, bare
+    host/IP/wildcard forms.  Userinfo keeps the existing fail-closed
+    behavior — the value is returned untouched so downstream
+    ``parse_authorized_scope`` still rejects it.  Verification-time
+    semantics (``normalize_authorized_scopes`` / ``is_authorized_url`` /
+    validate / submission) are deliberately untouched: stored scopes keep
+    their path pinning.
+    """
+    text = _strip_method(value)
+    if "://" not in text:
+        return text, None
+    try:
+        split = urlsplit(text)
+    except ValueError:
+        return text, None
+    if split.scheme.lower() not in _DEFAULT_PORTS or not split.hostname:
+        return text, None
+    if split.username is not None or split.password is not None:
+        return text, None
+    if split.path in ("", "/") and not split.query and not split.fragment:
+        return text, None
+    try:
+        port = split.port
+    except ValueError:
+        return text, None
+    hostname = split.hostname
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    origin = f"{split.scheme.lower()}://{host}"
+    if port is not None:
+        origin += f":{port}"
+    warning = (
+        f"scope 输入 {text!r} 带 path/query/fragment，已归一到 origin "
+        f"{origin!r}（路径级收窄请用显式路径授权：Engine --allow-path/--deny-path）"
+    )
+    return origin, warning
+
+
 def format_scope(scope: AuthorizedScope) -> str:
     host = f"[{scope.host}]" if ":" in scope.host else scope.host
     prefix = "*." if scope.include_subdomains else ""

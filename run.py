@@ -18,6 +18,7 @@
 from __future__ import annotations
 import argparse, inspect, sys, time, re, pathlib, json, shutil, os, secrets, hashlib
 from fnmatch import fnmatch
+from typing import Iterable
 from urllib.parse import urlsplit
 
 ROOT = pathlib.Path(__file__).resolve().parent
@@ -29,12 +30,13 @@ from engine.verify import (verify_idor, extract_poc, urllib_transport,  # noqa: 
                            extract_poc_from_finding)
 from engine.host_policy import (authorization_scope_from_url, hostname_from_url,
                                 normalize_authorized_scopes,
-                                parse_authorized_scope)  # noqa: E402
+                                parse_authorized_scope,
+                                strip_scope_path_with_warning)  # noqa: E402
 from engine.runtime_manifest import doctor  # noqa: E402
 from engine.run_authority import (ensure_project_identity,
                                   validate_session_id as _validate_session_id)  # noqa: E402
 from engine.safe_io import (atomic_write_text, ensure_directory,
-                            safe_read_bytes)  # noqa: E402
+                            safe_append_text, safe_read_bytes)  # noqa: E402
 from engine.engine_planning import (EnginePlanningError, accept_prebuilt_plan,
                                     build_identity_readiness,
                                     create_planning_session,
@@ -98,6 +100,70 @@ def default_project_slug(target: str, *, base_path: str = "/") -> str:
 def safe_session_id(value: str) -> str:
     """Validate, rather than sanitize, a session ID used as a path component."""
     return _validate_session_id(value)
+
+
+def _strip_cli_scope_inputs(
+    target: str,
+    allow: list[str],
+) -> tuple[str, list[str], list[tuple[str, str]]]:
+    """v9.8.2 W1: fold path-bearing ``--target``/``--allow`` values back to origin.
+
+    CLI 入口页 URL 的用户意图是整站；路径级收窄由显式 --allow-path/
+    --deny-path 承担。只动 CLI 输入本身——合并后的 raw_scopes 与既有
+    manifest 内的 scope 不做 retroactive 改判。返回 (stripped_target,
+    stripped_allow, [(from, to), ...])。
+    """
+    normalizations: list[tuple[str, str]] = []
+    stripped_target, warning = strip_scope_path_with_warning(target)
+    if warning:
+        normalizations.append((target, stripped_target))
+    stripped_allow: list[str] = []
+    for item in allow:
+        value, warning = strip_scope_path_with_warning(item)
+        if warning:
+            normalizations.append((item, value))
+        stripped_allow.append(value)
+    return stripped_target, stripped_allow, normalizations
+
+
+def _strip_derived_inputs(
+    allow_derived: Iterable[str],
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """v9.8.2 MINOR 修复：--allow-derived 与 --target/--allow 同口径归一。
+
+    返回 (stripped_derived, [(from, to), ...])，normalizations 由调用方
+    并入 scope_normalizations 统一打印与审计。
+    """
+    stripped: list[str] = []
+    normalizations: list[tuple[str, str]] = []
+    for item in allow_derived:
+        value = str(item).strip()
+        if not value:
+            continue
+        stripped_value, warning = strip_scope_path_with_warning(value)
+        if warning:
+            normalizations.append((value, stripped_value))
+        stripped.append(stripped_value)
+    return stripped, normalizations
+
+
+def _audit_cli_scope_normalizations(
+    wd: pathlib.Path,
+    normalizations: list[tuple[str, str]],
+) -> None:
+    """Append one scope_path_normalized record per CLI normalization."""
+    if not normalizations:
+        return
+    ensure_directory(wd / "state", root=wd)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for frm, to in normalizations:
+        safe_append_text(wd / "state" / "scope-audit.jsonl", json.dumps({
+            "ts": stamp,
+            "action": "scope_path_normalized",
+            "from": frm,
+            "to": to,
+            "actor": "run.py cli",
+        }, ensure_ascii=False) + "\n", root=wd)
 
 
 def safe_session_dir(base: pathlib.Path, sid: str) -> pathlib.Path:
@@ -2029,15 +2095,28 @@ def main():
                  else (f"Cookie: {args.cookie}" if args.cookie else ""))
 
     skill = (ROOT / "skill" / "核心技能文件.v3.md").read_text(encoding="utf-8")
-    target_scope = authorization_scope_from_url(args.target)
+    # v9.8.2 W1: CLI 输入边界归一——带 path/query/fragment 的 --target 与
+    # --allow 在入口处归一到 origin（stdout warning + state/scope-audit.jsonl
+    # 留痕）；路径级收窄由显式 --allow-path/--deny-path 承担。严禁碰合并后
+    # 的 raw_scopes 或 manifest 内既有 scope。
+    target_input, allow_inputs, scope_normalizations = _strip_cli_scope_inputs(
+        args.target, list(args.allow))
+    derived_inputs, derived_normalizations = _strip_derived_inputs(
+        args.allow_derived)
+    scope_normalizations.extend(derived_normalizations)
+    for frm, to in scope_normalizations:
+        print(f"[scope-normalize] WARNING: scope 输入 {frm!r} 带 "
+              f"path/query/fragment，已归一到 origin {to!r}"
+              "（路径级收窄请用 --allow-path/--deny-path）")
+    _audit_cli_scope_normalizations(wd, scope_normalizations)
+    target_scope = authorization_scope_from_url(target_input)
     if not target_scope:
         ap.error("--target 必须是合法的 http(s) 绝对 URL")
-    raw_scopes = [target_scope] + args.allow
+    raw_scopes = [target_scope] + allow_inputs
     if any(parse_authorized_scope(scope) is None for scope in raw_scopes):
         ap.error("--allow 必须是合法的 host、host:port、*.domain 或 http(s) URL")
     hosts = normalize_authorized_scopes(raw_scopes)
-    derived_hosts = normalize_authorized_scopes([
-        str(value) for value in args.allow_derived if str(value).strip()])
+    derived_hosts = normalize_authorized_scopes(derived_inputs)
     if len(derived_hosts) != len([v for v in args.allow_derived if str(v).strip()]):
         ap.error("--allow-derived 必须是合法的 host、host:port、*.domain 或 http(s) URL")
     try:

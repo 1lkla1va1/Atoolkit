@@ -1,0 +1,60 @@
+{
+  "card_id": "framework.ruoyi",
+  "framework": "ruoyi",
+  "last_verified": "2026-08-31",
+  "verified_against_version": "RuoYi-Vue 4.x",
+  "fingerprints": [
+    "页面标题/版权含「若依」或 RuoYi 字样",
+    "验证码端点 GET /captchaImage 返回 uuid + base64 图片",
+    "响应或错误信息含 com.ruoyi 类名（如 com.ruoyi.framework.*）",
+    "登录提交 /login 带 username/password/code/uuid 四元组",
+    "前端静态资源命名含 ruoyi（如 ruoyi.js）"
+  ],
+  "prefix_variants": ["/prod-api", ""],
+  "known_surfaces": [
+    {
+      "path_prefix": "/druid",
+      "hypothesis": "Druid 监控台未授权访问（会话/URI/SQL 监控数据泄露）",
+      "role": "anonymous"
+    },
+    {
+      "path_prefix": "/monitor/job",
+      "hypothesis": "Quartz 定时任务管理面（任务新建/编辑可导致任意调用执行，亦见 SQLi 历史）",
+      "role": "user"
+    },
+    {
+      "path_prefix": "/tool/swagger",
+      "hypothesis": "Swagger 文档页未授权暴露完整接口清单",
+      "role": "anonymous"
+    },
+    {
+      "path_prefix": "/v2/api-docs",
+      "hypothesis": "swagger api-docs 未授权暴露接口结构与参数",
+      "role": "anonymous"
+    },
+    {
+      "path_prefix": "/actuator",
+      "hypothesis": "Spring Actuator 端点暴露（env/heapdump 等敏感信息面）",
+      "role": "anonymous"
+    },
+    {
+      "path_prefix": "/common/download",
+      "hypothesis": "通用下载接口 resource 参数路径穿越/任意文件读取",
+      "role": "user"
+    },
+    {
+      "path_prefix": "/system/role/export",
+      "hypothesis": "角色数据导出接口越权/批量数据泄露（数据范围校验缺失）",
+      "role": "user"
+    },
+    {
+      "path_prefix": "/system/config",
+      "hypothesis": "系统配置面泄露 initPassword 等默认口令配置项",
+      "role": "user"
+    }
+  ],
+  "default_credentials": [
+    {"user": "admin", "pass": "admin123", "note": "仅作测试起点，命中即改"},
+    {"user": "ry", "pass": "admin123", "note": "仅作测试起点"}
+  ]
+}

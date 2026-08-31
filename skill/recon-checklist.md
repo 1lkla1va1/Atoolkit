@@ -34,6 +34,25 @@
 
 ---
 
+## 0.1.6 框架指纹识别（1 分钟，v9.8.2）
+
+**目标**：识别目标是否基于已知框架（如 RuoYi/若依），让框架已知攻击面不依赖运气。
+
+1. 检查指纹：页面标题/版权、验证码端点形态、错误信息中的框架类名、静态资源命名
+2. 命中已知框架时，写 `recon/framework_fingerprint.md`，**首行必须是机器可读约定**（小写、单框架、与 `knowledge/cards/frameworks/<name>.json` 文件名对应）：
+
+   ```
+   framework: ruoyi
+   ```
+
+   首行之后写人读证据（命中了哪些指纹、版本线索）
+3. init 读取该文件并加载对应框架卡：命中卡片的已知面在冻结排序中获得加权（仅作高价值之后的 tie-breaker，不凌驾业务格）；**卡片提示的未覆盖端点必须并入 `endpoint_inventory.md`**（卡片只加权不扩面，扩面是 recon 的职责）
+4. 补完 inventory 后**在首个 checkpoint 之前重跑 init**（重跑会重建 ledger；checkpoint 之后重跑则状态归零）
+
+注意：本步骤只负责「识别框架 → 已知面进 inventory」；怎么测仍由你自主决定。
+
+---
+
 ## 0.2 API 端点枚举（3 分钟）
 
 **目标**：验证端点是否真实可达，并分类。
@@ -99,8 +118,9 @@
 |---|---|---|
 | 0.1 页面与 JS 分析 | 5 分钟 | endpoint_inventory.md |
 | 0.1.5 非 API 页面扫描 | 2 分钟 | 更新 endpoint_inventory.md |
+| 0.1.6 框架指纹识别 | 1 分钟 | recon/framework_fingerprint.md |
 | 0.2 API 端点枚举 | 3 分钟 | 更新 endpoint_inventory.md |
 | 0.3 业务流建模 | 5 分钟 | business_flow.md |
 | 0.4 攻击面清单生成 | 2 分钟 | attack_surface_list.md |
 | 0.5 完整性检查 | — | 通过完整性门或回补 |
-| **合计** | **~17 分钟** | **完整攻击面清单** |
+| **合计** | **~18 分钟** | **完整攻击面清单** |

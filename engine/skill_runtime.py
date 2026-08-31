@@ -60,7 +60,10 @@ try:
     from .orchestrator import CognitiveState
     from .planner import plan_surfaces
     from .project_state import canonical_asset
-    from .host_policy import normalize_authorized_scopes
+    from .host_policy import (
+        normalize_authorized_scopes,
+        strip_scope_path_with_warning,
+    )
     from .reporting.collect import collect_structured_findings
     from .reporting.decision import decide_canonical_report, gate_outcomes
     from .reporting.observations import (
@@ -75,9 +78,11 @@ try:
     from .reporting.validate import validate_run_artifacts
     from .runtime_manifest import inspect_workspace_instructions
     from .safe_io import (
+        UnsafePathError,
         atomic_write_json,
         create_json_exclusive,
         ensure_directory,
+        safe_append_text,
         safe_read_bytes,
         safe_read_text,
     )
@@ -114,7 +119,8 @@ except ImportError:  # pragma: no cover - script execution fallback
     from orchestrator import CognitiveState
     from planner import plan_surfaces
     from project_state import canonical_asset
-    from host_policy import normalize_authorized_scopes
+    from host_policy import (normalize_authorized_scopes,
+                             strip_scope_path_with_warning)
     from reporting.collect import collect_structured_findings
     from reporting.decision import decide_canonical_report, gate_outcomes
     from reporting.observations import (build_observation_records,
@@ -124,8 +130,9 @@ except ImportError:  # pragma: no cover - script execution fallback
     from reporting.schema import load_finding
     from reporting.validate import validate_run_artifacts
     from runtime_manifest import inspect_workspace_instructions
-    from safe_io import (atomic_write_json, create_json_exclusive,
-                         ensure_directory, safe_read_bytes, safe_read_text)
+    from safe_io import (UnsafePathError, atomic_write_json,
+                         create_json_exclusive, ensure_directory,
+                         safe_append_text, safe_read_bytes, safe_read_text)
     from surface import bootstrap as bootstrap_recon
     from threat_model import (ThreatModelError, compile_threat_model,
                               derive_threat_coverage, validate_threat_plan)
@@ -233,8 +240,13 @@ def preflight_direct_run(
     normalized_target = str(target).strip()
     if not normalized_target:
         raise SkillRuntimeError("Direct preflight requires target")
-    authorized_scopes, derived_scopes = _resolve_scope_inputs(
-        normalized_target, extra_scopes, scope_files, derived_assets)
+    authorized_scopes, derived_scopes, scope_normalizations = (
+        _resolve_scope_inputs(
+            normalized_target, extra_scopes, scope_files, derived_assets))
+    # v9.8.2 W1: normalization warnings are emitted on every invocation; the
+    # audit trail is written only when this call creates the preflight record
+    # (below), so an idempotent re-run never duplicates audit lines.
+    _emit_scope_normalizations(scope_normalizations)
     instruction_binding: dict[str, Any] | None = None
     if require_instruction_match:
         workspace = workspace_root.resolve() if workspace_root else None
@@ -276,6 +288,9 @@ def preflight_direct_run(
         if existing != record:
             raise SkillRuntimeError(
                 "Direct preflight already exists with different target/state")
+    else:
+        _audit_scope_normalizations(
+            run, scope_normalizations, actor="skill_runtime preflight")
     atomic_write_json(
         run / "runtime-status.json", record, root=run,
         reject_leaf_symlink=True)
@@ -380,19 +395,70 @@ def _resolve_scope_inputs(
     extra_scopes: Iterable[str] | None,
     scope_files: Iterable[pathlib.Path] | None,
     derived_assets: Iterable[str] | None,
-) -> tuple[list[str], list[str]]:
-    """Normalize primary target + extra scopes + scope files into scope lists."""
-    scopes: list[str] = [str(target or "").strip()]
-    derived: list[str] = [str(item).strip() for item in (derived_assets or [])]
-    scopes.extend(str(item).strip() for item in (extra_scopes or []))
+) -> tuple[list[str], list[str], list[tuple[str, str]]]:
+    """Normalize primary target + extra scopes + scope files into scope lists.
+
+    v9.8.2 W1: every input read here (target / --allow / scope-file entries,
+    derived alike) passes through ``strip_scope_path_with_warning`` so a
+    path-bearing URL is folded back to its origin at the input boundary;
+    the returned ``normalizations`` list carries ``(from, to)`` pairs for
+    the caller to surface as stdout warnings + scope-audit records.
+    """
+    normalizations: list[tuple[str, str]] = []
+
+    def _strip(item: str) -> str:
+        normalized, warning = strip_scope_path_with_warning(item)
+        if warning:
+            normalizations.append((item, normalized))
+        return normalized
+
+    scopes: list[str] = [_strip(str(target or "").strip())]
+    derived: list[str] = [
+        _strip(str(item).strip()) for item in (derived_assets or [])]
+    scopes.extend(_strip(str(item).strip()) for item in (extra_scopes or []))
     for scope_file in scope_files or []:
         file_scopes, file_derived = parse_scope_file(pathlib.Path(scope_file))
-        scopes.extend(file_scopes)
-        derived.extend(file_derived)
+        scopes.extend(_strip(item) for item in file_scopes)
+        derived.extend(_strip(item) for item in file_derived)
     normalized = normalize_authorized_scopes([item for item in scopes if item])
     if not normalized:
         raise SkillRuntimeError("no valid authorized scope could be derived")
-    return normalized, normalize_authorized_scopes([item for item in derived if item])
+    return (normalized,
+            normalize_authorized_scopes([item for item in derived if item]),
+            normalizations)
+
+
+def _emit_scope_normalizations(
+    normalizations: Iterable[tuple[str, str]],
+) -> None:
+    """Print one prominent stdout warning per input-boundary normalization."""
+    for frm, to in normalizations:
+        print(f"[scope-normalize] WARNING: scope 输入 {frm!r} 带 "
+              f"path/query/fragment，已归一到 origin {to!r}"
+              "（Direct 模式无路径级收窄通道，归一为 fail-wide 方向的唯一处理）")
+
+
+def _audit_scope_normalizations(
+    run: pathlib.Path,
+    normalizations: Iterable[tuple[str, str]],
+    *,
+    actor: str,
+) -> None:
+    """Append one ``scope_path_normalized`` record per normalization."""
+    entries = list(normalizations)
+    if not entries:
+        return
+    ensure_directory(run / "state", root=run)
+    audit_path = run / "state" / "scope-audit.jsonl"
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for frm, to in entries:
+        safe_append_text(audit_path, json.dumps({
+            "ts": stamp,
+            "action": "scope_path_normalized",
+            "from": frm,
+            "to": to,
+            "actor": actor,
+        }, ensure_ascii=False) + "\n", root=run)
 
 
 def _metadata_authorized_scopes(metadata: dict[str, Any]) -> list[str]:
@@ -490,6 +556,147 @@ def _cards_for_surface(surface: dict[str, Any], cards: list[dict]) -> list[dict]
 def _decorate_surface(surface: dict[str, Any], cards: list[dict]) -> None:
     matched = _cards_for_surface(surface, cards)
     surface["knowledge_card_ids"] = [str(card.get("id")) for card in matched if card.get("id")]
+
+
+# ── v9.8.2 W2: 框架指纹路由 ─────────────────────────────────────────────
+# Phase 0 的机器可读通道：recon/framework_fingerprint.md 首行
+# `framework: <name>`（小写、单框架、与 knowledge/cards/frameworks/<name>.json
+# 文件名对应）。命中卡只做两件事：冻结排序 tie-breaker 加权 + 已知面未覆盖
+# advisory；卡片只加权不扩面——入 inventory 始终是 recon 的职责。
+_FRAMEWORK_FINGERPRINT_FILE = "framework_fingerprint.md"
+_FRAMEWORK_LINE_RE = re.compile(
+    r"^\s*framework\s*:\s*([A-Za-z0-9][A-Za-z0-9._-]{0,63})\s*$",
+    re.IGNORECASE)
+_FRAMEWORK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_ABSOLUTE_URL_PREFIX_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s\"'<>]+")
+_FRAMEWORK_CARD_REQUIRED_KEYS = (
+    "card_id", "framework", "last_verified", "verified_against_version",
+    "fingerprints", "prefix_variants", "known_surfaces", "default_credentials",
+)
+
+
+def _framework_cards_dir() -> pathlib.Path:
+    return (pathlib.Path(__file__).resolve().parent.parent
+            / "knowledge" / "cards" / "frameworks")
+
+
+def _load_framework_card(
+    recon_dir: pathlib.Path | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Load ``knowledge/cards/frameworks/<name>.json`` for the recon fingerprint.
+
+    Returns ``(card, advisory)``; exactly one side is meaningful.  Every
+    failure degrades to an advisory string — cards reweight the freeze
+    order, they never gate init.  Multi-framework targets are explicitly out
+    of scope for v9.8.2 (single first-line name).
+    """
+    if recon_dir is None:
+        return None, ("[framework] advisory: 未提供 recon 目录，跳过框架指纹路由；"
+                      "Phase 0 识别到已知框架时写 recon/framework_fingerprint.md"
+                      "（首行 `framework: <name>`）后重跑 init")
+    fingerprint = pathlib.Path(recon_dir) / _FRAMEWORK_FINGERPRINT_FILE
+    if fingerprint.is_symlink() or not fingerprint.is_file():
+        return None, (f"[framework] advisory: 未找到 {fingerprint.name}（recon 目录）；"
+                      "Phase 0 若识别到已知框架（如 RuoYi），写入首行 "
+                      "`framework: <name>` 后在首个 checkpoint 前重跑 init")
+    try:
+        text = fingerprint.read_text(encoding="utf-8-sig", errors="ignore")
+    except OSError as exc:
+        return None, (f"[framework] advisory: 读取 {fingerprint.name} 失败："
+                      f"{type(exc).__name__}")
+    lines = text.splitlines()
+    match = _FRAMEWORK_LINE_RE.match(lines[0]) if lines else None
+    if not match:
+        return None, (f"[framework] advisory: {fingerprint.name} 首行不是 "
+                      "`framework: <name>` 机器可读约定，跳过框架卡路由")
+    name = match.group(1).lower()
+    if not _FRAMEWORK_NAME_RE.fullmatch(name):
+        return None, f"[framework] advisory: 非法框架名 {name!r}，跳过框架卡路由"
+    card_path = _framework_cards_dir() / f"{name}.json"
+    if card_path.is_symlink() or not card_path.is_file():
+        return None, (f"[framework] advisory: 指纹命中 {name!r} 但无对应框架卡 "
+                      f"{card_path.name}，跳过框架卡路由")
+    try:
+        card = json.loads(card_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return None, (f"[framework] advisory: 框架卡 {card_path.name} 解析失败："
+                      f"{type(exc).__name__}")
+    if not isinstance(card, dict) or any(
+            key not in card for key in _FRAMEWORK_CARD_REQUIRED_KEYS):
+        return None, (f"[framework] advisory: 框架卡 {card_path.name} schema "
+                      "不完整，跳过框架卡路由")
+    return card, ""
+
+
+def _framework_expanded_prefixes(card: dict[str, Any]) -> list[str]:
+    """``prefix_variants × known_surfaces.path_prefix`` 笛卡尔展开（去重保序）。
+
+    卡片 ``known_surfaces.path_prefix`` 一律存无部署前缀路径（如 ``/druid``）；
+    部署前缀（如 ``/prod-api`` 开发代理前缀）由 ``prefix_variants`` 承载——
+    生产环境常直接挂无前缀路径，不展开会系统性漏测。
+    """
+    variants = _as_list(card.get("prefix_variants")) or [""]
+    out: list[str] = []
+    for raw_variant in variants:
+        variant = str(raw_variant or "").strip().rstrip("/").lower()
+        for surface in _as_list(card.get("known_surfaces")):
+            if not isinstance(surface, dict):
+                continue
+            prefix = str(surface.get("path_prefix") or "").strip()
+            if not prefix.startswith("/"):
+                continue
+            expanded = variant + prefix.lower()
+            if expanded not in out:
+                out.append(expanded)
+    return out
+
+
+def _framework_endpoint_path(endpoint: str) -> str:
+    """endpoint → 小写纯路径（剥 scheme://authority、query、fragment）。"""
+    path = _ABSOLUTE_URL_PREFIX_RE.sub("", str(endpoint or "").strip())
+    return path.split("?", 1)[0].split("#", 1)[0].lower()
+
+
+def _framework_hit(endpoint: str, prefixes: list[str]) -> bool:
+    """大小写不敏感的路径前缀匹配；无 glob、无正则。"""
+    path = _framework_endpoint_path(endpoint)
+    return bool(path) and any(path.startswith(prefix) for prefix in prefixes)
+
+
+def _apply_framework_card(
+    ledger: CoverageLedger,
+    card: dict[str, Any],
+    rows: list[dict[str, Any] | str],
+) -> list[str]:
+    """Mark ``framework_hit=True`` on ledger surfaces matching the card.
+
+    Returns the card's known surfaces absent from the merged inventory rows;
+    the caller emits them as an advisory (cards reweight the freeze order,
+    they never extend the inventory).
+    """
+    prefixes = _framework_expanded_prefixes(card)
+    if not prefixes:
+        return []
+    for surface in ledger.surfaces:
+        if _framework_hit(str(surface.get("endpoint") or ""), prefixes):
+            surface["framework_hit"] = True
+    inventory_paths = {
+        _framework_endpoint_path(_row_key(row)[0]) for row in rows
+    }
+    variants = _as_list(card.get("prefix_variants")) or [""]
+    uncovered: list[str] = []
+    for surface in _as_list(card.get("known_surfaces")):
+        if not isinstance(surface, dict):
+            continue
+        prefix = str(surface.get("path_prefix") or "").strip()
+        if not prefix.startswith("/"):
+            continue
+        expanded = [str(variant or "").strip().rstrip("/").lower()
+                    + prefix.lower() for variant in variants]
+        if not any(any(path.startswith(item) for item in expanded)
+                   for path in inventory_paths):
+            uncovered.append(prefix)
+    return uncovered
 
 
 def _queue_from_ledger(
@@ -774,9 +981,17 @@ def _budget_guardrail(
         "recommendation": "NEED_INPUT" if triggered else "ok",
         "human_actions": human_actions,
     }
-    ensure_directory(run / "state", root=run)
-    atomic_write_json(run / "state" / "budget-guardrail.json", guardrail,
-                      root=run, reject_leaf_symlink=True)
+    # v9.8.2 W4 (MINOR-1): the guardrail is advisory, so a write failure
+    # (e.g. a symlinked artifact leaf tripping the fail-closed guard) must
+    # never hang the checkpoint.  Swallow with a stable code; the checkpoint
+    # caller mirrors the failure into runtime-metrics so the fail-closed
+    # signal is not silent.
+    try:
+        ensure_directory(run / "state", root=run)
+        atomic_write_json(run / "state" / "budget-guardrail.json", guardrail,
+                          root=run, reject_leaf_symlink=True)
+    except (OSError, UnsafePathError):  # 只吞写盘失败，编程错误照常抛出
+        guardrail["guardrail_error"] = "budget_guardrail_write_failed"
     return guardrail
 
 
@@ -809,6 +1024,10 @@ def _freeze_budget_capped(
         key=lambda surface: (
             1 if surface.get("identity_blocked") is True else 0,
             0 if is_high_value(surface) else 1,
+            # v9.8.2 W2: framework_hit 只做 high_value 之后的 tie-breaker——
+            # 绝不凌驾价值维（否则卡片端点×CSRF 会挤掉业务端点×IDOR，
+            # 换皮复发 Ruoyi 冻结错配）；无卡环境该维恒 1，排序逐字节不变。
+            0 if surface.get("framework_hit") is True else 1,
             str(surface.get("feature") or ""),
             str(surface.get("surface_id") or ""),
         ),
@@ -883,8 +1102,11 @@ def initialize_direct_run(
         scope_files=scope_files,
         derived_assets=derived_assets,
     )
-    authorized_scopes, derived_scopes = _resolve_scope_inputs(
-        target, extra_scopes, scope_files, derived_assets)
+    # The preflight call above already emitted/audited any scope-path
+    # normalizations for these same inputs; the second resolution only needs
+    # the normalized lists.
+    authorized_scopes, derived_scopes, _scope_normalizations = (
+        _resolve_scope_inputs(target, extra_scopes, scope_files, derived_assets))
     continuation: dict[str, Any] | None = None
     if continue_from_run is not None:
         # v9.8 W1.2: consume the prior run's Host-validated agenda.  This only
@@ -977,6 +1199,28 @@ def initialize_direct_run(
         surface["source"] = "direct-skill-runtime"
         _decorate_surface(surface, cards)
     metrics.record("init.plan", time.perf_counter() - metrics_tick)
+
+    # v9.8.2 W2: framework fingerprint routing.  Phase 0 writes
+    # <recon_dir>/framework_fingerprint.md (first line `framework: <name>`);
+    # a matching knowledge/cards/frameworks/<name>.json marks matching
+    # surfaces framework_hit=True so the legacy budget freeze below can
+    # prefer them as a post-high_value tie-breaker.  Cards never extend the
+    # inventory — known surfaces absent from recon surface as an advisory.
+    metrics_tick = time.perf_counter()
+    framework_card, framework_advisory = _load_framework_card(recon_dir)
+    if framework_advisory:
+        print(framework_advisory)
+    if framework_card is not None:
+        framework_uncovered = _apply_framework_card(ledger, framework_card, rows)
+        print(f"[framework] 命中框架卡 {framework_card.get('card_id')}"
+              f"（{framework_card.get('framework')}），已对命中 surface 打 "
+              "framework_hit 标（冻结排序 high_value 之后的 tie-breaker）")
+        if framework_uncovered:
+            print("[framework] 框架卡提示未覆盖端点："
+                  + ", ".join(framework_uncovered)
+                  + "；卡片只加权不扩面——请把这些端点补进 inventory 后"
+                    "在首个 checkpoint 前重跑 init（checkpoint 后重跑则状态归零）")
+    metrics.record("init.framework", time.perf_counter() - metrics_tick)
 
     # v9.8 W2 + v9.8.1 W4a: identity requirements are derived over the
     # pre-freeze full planned surface set and materialized before the first
@@ -1633,6 +1877,11 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     # loop so cells confirmed by this checkpoint already read as terminal
     # (Round-2 MINOR-1); never mutates status and never gates the run.
     budget_guardrail = _budget_guardrail(run, ledger, identity_requirements)
+    if budget_guardrail.get("guardrail_error"):
+        # v9.8.2 W4: mirror the swallowed guardrail write failure into
+        # runtime-metrics (best-effort by contract) so it leaves a trace.
+        metrics.record("checkpoint.budget_guardrail", 0.0,
+                       guardrail_write_error=1)
 
     execution_events, execution_errors = _execution_events_from_observations(
         run, ledger, observations)
@@ -1788,10 +2037,22 @@ def scope_direct_run(
             "scope requires an initialized run (coverage-ledger.json missing); "
             "run skill_runtime init first")
     ledger = CoverageLedger.load(ledger_path)
+    # v9.8.2 W1: scope --add is an input boundary too — a path-bearing URL
+    # added mid-run would rebuild the same out-of-scope zeroing trap, so it
+    # is folded back to origin with a stdout warning + audit record.
+    normalizations: list[tuple[str, str]] = []
+
+    def _strip(item: str) -> str:
+        normalized, warning = strip_scope_path_with_warning(item)
+        if warning:
+            normalizations.append((item, normalized))
+        return normalized
+
     added_scopes = normalize_authorized_scopes(
-        [str(item).strip() for item in (add or []) if str(item).strip()])
+        [_strip(str(item).strip()) for item in (add or []) if str(item).strip()])
     added_derived = normalize_authorized_scopes(
-        [str(item).strip() for item in (derived or []) if str(item).strip()])
+        [_strip(str(item).strip()) for item in (derived or []) if str(item).strip()])
+    _emit_scope_normalizations(normalizations)
     if not added_scopes and not added_derived:
         raise SkillRuntimeError("scope requires at least one valid --add/--derived URL")
     current_scopes = _metadata_authorized_scopes(ledger.metadata)
@@ -1814,6 +2075,8 @@ def scope_direct_run(
         raise SkillRuntimeError("scope audit log is a symlink; refusing to append")
     with audit_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(audit_entry, ensure_ascii=False) + "\n")
+    _audit_scope_normalizations(
+        run, normalizations, actor="skill_runtime scope")
     return {
         "schema_version": 1,
         "mode": "direct_diagnostic",
