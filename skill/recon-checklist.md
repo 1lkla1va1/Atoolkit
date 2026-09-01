@@ -5,6 +5,13 @@
 >
 > **核心目标**：用 15 分钟建立完整的攻击面清单（attack_surface_list.md）。
 > **适用模式**：Skill Mode / 纯 agent 模式。Engine 模式下由 `orchestrator.py` 自动完成部分枚举。
+>
+> **自动化采集（v10.0）**：本清单第 0.1 步的页面/JS 抓取可先由采集器完成（只产原料、GET-only、
+> 默认 2 rps、scope 硬门在代码里；`--passive` 显式开启 crt.sh/wayback 被动源）：
+> `python3 -m engine.skill_runtime recon --target https://example.com --scope-file AUTHZ.md --out testdata/runs/<sid>/recon`
+> 产物目录直接喂 `python3 -m engine.skill_runtime init --target https://example.com --scope-file AUTHZ.md --recon-dir testdata/runs/<sid>/recon --run-dir testdata/runs/<sid>`。
+> 已知限制：scope 对子域/scheme/端口钉死，302 到 www 变体或换协议会被 skip，需要时用 `--allow` 显式加入；
+> `--out` 路径不得含符号链接组件（macOS 的 `/tmp`、`/var` 均为符号链接，会 fail closed），用真实路径如 `/private/tmp/...`。
 
 ---
 

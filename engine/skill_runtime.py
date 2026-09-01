@@ -87,6 +87,7 @@ try:
         safe_read_text,
     )
     from .surface import bootstrap as bootstrap_recon
+    from .recon import collect_recon
     from .threat_model import (
         ThreatModelError,
         compile_threat_model,
@@ -134,6 +135,7 @@ except ImportError:  # pragma: no cover - script execution fallback
                          create_json_exclusive, ensure_directory,
                          safe_append_text, safe_read_bytes, safe_read_text)
     from surface import bootstrap as bootstrap_recon
+    from recon import collect_recon
     from threat_model import (ThreatModelError, compile_threat_model,
                               derive_threat_coverage, validate_threat_plan)
     from vuln_classes import exact_vc, norm_vc
@@ -2111,6 +2113,53 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     return checkpoint
 
 
+def recon_direct_run(
+    *,
+    target: str,
+    extra_scopes: Iterable[str] | None = None,
+    scope_files: Iterable[pathlib.Path] | None = None,
+    derived_assets: Iterable[str] | None = None,
+    out_dir: pathlib.Path,
+    passive: bool = False,
+    max_pages: int = 200,
+    rps: float = 2.0,
+    max_file_bytes: int = 2 * 1024 * 1024,
+    max_total_bytes: int = 50 * 1024 * 1024,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Direct 模式 recon 采集入口（v10.0）：scope 解析复用 preflight/init 的共享
+    helper ``_resolve_scope_inputs``（--allow / --scope-file / 归一化 / derived 全部
+    同语义），随后 ``engine.recon.collect_recon`` 采集并落盘 recon_dir 契约布局。
+
+    derived_assets 仅供审计记录（回显进摘要）：采集器不向派生资产发请求，
+    scope 扩充只能走既有 ``skill_runtime scope --add`` 人工通道。
+    """
+    scopes, derived, normalizations = _resolve_scope_inputs(
+        target, extra_scopes, scope_files, derived_assets)
+    _emit_scope_normalizations(normalizations)
+    from .host_policy import parse_http_url
+    # 种子取用户给的 --target 原样；纯 host 形式补 http://（is_authorized_url 的
+    # scheme/端口钉死语义会拦掉不符的变体，v10.0 已知限制见 design 文档）。
+    seed = str(target or "").strip()
+    if parse_http_url(seed) is None:
+        seed = f"http://{scopes[0].rstrip('/')}/"
+    result = collect_recon(
+        [seed], scopes, pathlib.Path(out_dir),
+        passive=bool(passive), max_pages=int(max_pages), rps=float(rps),
+        max_file_bytes=int(max_file_bytes),
+        max_total_bytes=int(max_total_bytes), timeout=float(timeout))
+    result["derived_assets_audit"] = derived
+    result["mode"] = "direct_recon"
+    result["authority_trusted"] = False
+    # 摘要含 derived 审计回显，重写 recon-summary.jsonl
+    from .recon.emit import ReconWriter
+    ReconWriter(pathlib.Path(out_dir)).write_summary(result)
+    print(f"[recon] pages={result['pages']} js={result['js']} "
+          f"skipped_out_of_scope={result['skipped_out_of_scope']} "
+          f"out={out_dir}")
+    return result
+
+
 def scope_direct_run(
     run_dir: pathlib.Path,
     *,
@@ -2402,6 +2451,32 @@ def _parser() -> argparse.ArgumentParser:
         "map",
         help="生成 module_map 派生视图（模块聚类 + 规模判断，只读输入）")
     map_cmd.add_argument("--run-dir", required=True, type=pathlib.Path)
+    recon_cmd = sub.add_parser(
+        "recon",
+        help="侦察输入采集器（v10.0）：抓取种子页/JS 快照 → recon_dir（init "
+             "--recon-dir 消费）；GET-only、2rps 默认限速、scope 硬门在代码里")
+    recon_cmd.add_argument("--target", required=True,
+                           help="主目标 URL（唯一 crawl 种子，必须在授权 scope 内）")
+    recon_cmd.add_argument("--allow", action="append", default=[],
+                           help="额外授权资产 URL/host（扩大 scope 门，可多次）")
+    recon_cmd.add_argument("--scope-file", action="append", default=[],
+                           type=pathlib.Path,
+                           help="授权 scope 文件（AUTHZ.md/authz.md 或 JSON，可多次；"
+                                "派生资产小节仅作审计记录，不抓取）")
+    recon_cmd.add_argument("--out", required=True, type=pathlib.Path,
+                           help="recon 产物目录（供 init --recon-dir 消费）")
+    recon_cmd.add_argument("--passive", action="store_true",
+                           help="开启被动源（crt.sh/web.archive.org，默认关）")
+    recon_cmd.add_argument("--max-pages", type=int, default=200,
+                           help="页面快照上限（默认 200）")
+    recon_cmd.add_argument("--rps", type=float, default=2.0,
+                           help="每 host 请求速率上限（默认 2）")
+    recon_cmd.add_argument("--max-file-bytes", type=int, default=2 * 1024 * 1024,
+                           help="单文件字节上限（默认 2MB，超出截断）")
+    recon_cmd.add_argument("--max-total-bytes", type=int, default=50 * 1024 * 1024,
+                           help="总落盘字节上限（默认 50MB）")
+    recon_cmd.add_argument("--timeout", type=float, default=15.0,
+                           help="单请求超时秒数（默认 15）")
     return parser
 
 
@@ -2443,6 +2518,13 @@ def main(argv: list[str] | None = None) -> int:
             result = report_direct_run(args.run_dir)
         elif args.command == "map":
             result = write_module_map(args.run_dir)
+        elif args.command == "recon":
+            result = recon_direct_run(
+                target=args.target, extra_scopes=args.allow,
+                scope_files=args.scope_file, out_dir=args.out,
+                passive=args.passive, max_pages=args.max_pages,
+                rps=args.rps, max_file_bytes=args.max_file_bytes,
+                max_total_bytes=args.max_total_bytes, timeout=args.timeout)
         else:
             result = checkpoint_direct_run(args.run_dir)
     except Exception as exc:  # noqa: BLE001
@@ -2471,6 +2553,7 @@ __all__ = [
     "checkpoint_direct_run",
     "report_direct_run",
     "scope_direct_run",
+    "recon_direct_run",
     "write_module_map",
     "parse_scope_file",
     "DIRECT_QUEUE_LIMIT",
