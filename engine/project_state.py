@@ -34,6 +34,12 @@ except ImportError:  # pragma: no cover
 
 
 PROJECT_STATE_SCHEMA_VERSION = 3
+# v10.1: trust_basis 档位（方案 §3.3）。containment = Engine authority 通道
+# （现状，不变）；evidence_reverified = 证据复验通道（Direct 下是幻觉过滤
+# 器，不是完整性边界——输入产物均在 agent 可写目录）。
+TRUST_BASIS_CONTAINMENT = "containment"
+TRUST_BASIS_EVIDENCE = "evidence_reverified"
+TRUST_BASES = {TRUST_BASIS_CONTAINMENT, TRUST_BASIS_EVIDENCE}
 DEAD_END_REASON_CODES = {
     "endpoint_removed",
     "feature_disabled",
@@ -1326,7 +1332,10 @@ class ProjectStateStore:
         })
         return projected
 
-    def _merge_finding(self, state: dict[str, Any], finding: dict[str, Any], run_id: str) -> None:
+    def _merge_finding(
+        self, state: dict[str, Any], finding: dict[str, Any], run_id: str,
+        *, trust_basis: str = TRUST_BASIS_CONTAINMENT,
+    ) -> None:
         if not (finding.get("acceptance_status") == "accepted"
                 and finding.get("proof_status") == "confirmed"
                 and finding.get("claim_kind") == "root_finding"):
@@ -1380,8 +1389,46 @@ class ProjectStateStore:
                 "observations": [], "status": "confirmed",
             })
             record["status"] = "confirmed"
-            record.pop("revalidation_reason", None)
-            record.pop("conflicting_run", None)
+            # v10.1 信任档位与复验元数据（读取方缺失 = legacy）。
+            record["trust_basis"] = (
+                trust_basis if trust_basis in TRUST_BASES
+                else TRUST_BASIS_CONTAINMENT)
+            reverify = (
+                finding.get("reverify")
+                if isinstance(finding.get("reverify"), dict) else {})
+            if reverify.get("evidence_ref"):
+                record["evidence_ref"] = str(reverify["evidence_ref"])
+            if reverify.get("reverified_at"):
+                record["last_reverified_at"] = str(reverify["reverified_at"])
+            if (trust_basis == TRUST_BASIS_EVIDENCE
+                    and (str(record.get("revalidation_reason") or "")
+                         or str(record.get("conflicting_run") or ""))):
+                # Gate-A P1-3：evidence 通道清除路径加条件、禁 pop。
+                # 条件①本轮 reverify=match；②差分基线重放不命中（baseline_outcome=match）。
+                cleared = (
+                    str(reverify.get("outcome") or "") == "match"
+                    and str(reverify.get("baseline_outcome") or "") == "match")
+                if not cleared:
+                    # fail closed：条件不满足 → 保持 revalidation 状态，
+                    # 恢复 needs_revalidation 标记并跳过本行的 confirmed 写入。
+                    record["status"] = "needs_revalidation"
+                    record["revalidation_reason"] = (
+                        str(record.get("revalidation_reason") or "")
+                        or "evidence reverify did not confirm the conflicted cell")
+                    record["conflicting_run"] = str(
+                        record.get("conflicting_run") or "")
+                    continue
+                record.setdefault("revalidation_history", []).append({
+                    "revalidation_reason": str(
+                        record.get("revalidation_reason") or ""),
+                    "conflicting_run": str(record.get("conflicting_run") or ""),
+                    "cleared_at": _now(),
+                    "cleared_by_run": run_id,
+                    "cleared_by": TRUST_BASIS_EVIDENCE,
+                    "evidence_ref": str(reverify.get("evidence_ref") or ""),
+                })
+                # 字段保留原值（禁 pop）；状态改写为已清除，审计可回溯。
+                record["revalidation_status"] = "cleared_evidence_reverified"
             _merge_unique(record["seen_in_runs"], [run_id])
             observation = next((
                 item for item in record["observations"]
@@ -1409,11 +1456,23 @@ class ProjectStateStore:
                 if (intent.get("source_kind") == "truth_conflict"
                         and intent.get("source_surface_id") == key
                         and intent.get("status") == "pending"):
+                    # v10.1 Gate-A P1-3：truth_conflict intent 仅在清除条件
+                    # 满足时（本行 finding 带 evidence 通道 match + 基线
+                    # match）置 completed；outcome_summary 追加本轮 evidence_ref。
+                    cleared = (
+                        trust_basis == TRUST_BASIS_EVIDENCE
+                        and str((finding.get("reverify") or {}).get("outcome") or "") == "match"
+                        and str((finding.get("reverify") or {}).get("baseline_outcome") or "") == "match")
+                    if trust_basis == TRUST_BASIS_EVIDENCE and not cleared:
+                        continue
                     intent["status"] = "completed"
                     intent["outcome_summary"] = (
-                        "exact cell revalidated by a new proof-confirmed finding")
+                        "exact cell revalidated by a new proof-confirmed finding"
+                        if trust_basis == TRUST_BASIS_CONTAINMENT
+                        else "exact cell revalidated by evidence reverify: "
+                             + str((finding.get("reverify") or {}).get("evidence_ref") or ""))
                     intent["resolved_at"] = _now()
-            state["cell_registry"][key] = {
+            cell_record = {
                 "cell_key": key, "asset_id": asset, "method": method,
                 "path": _canonical_row_path(path, param, dimensions),
                 "param": param,
@@ -1424,8 +1483,18 @@ class ProjectStateStore:
                 "canonical_finding_id": canonical_id,
                 "evidence_refs": evidence_refs,
                 "evidence_hashes": evidence_hashes,
+                "trust_basis": (
+                    trust_basis if trust_basis in TRUST_BASES
+                    else TRUST_BASIS_CONTAINMENT),
                 "updated_at": _now(),
             }
+            if (finding.get("reverify") or {}).get("evidence_ref"):
+                cell_record["evidence_ref"] = str(
+                    finding["reverify"]["evidence_ref"])
+            if (finding.get("reverify") or {}).get("reverified_at"):
+                cell_record["last_reverified_at"] = str(
+                    finding["reverify"]["reverified_at"])
+            state["cell_registry"][key] = cell_record
 
             fact = {
                 "fact_id": _stable_id("fact", fingerprint),
@@ -1445,7 +1514,15 @@ class ProjectStateStore:
                 "evidence_refs": evidence_refs,
                 "evidence_hashes": evidence_hashes,
                 "source_run": run_id,
+                "trust_basis": (
+                    trust_basis if trust_basis in TRUST_BASES
+                    else TRUST_BASIS_CONTAINMENT),
             }
+            if (finding.get("reverify") or {}).get("evidence_ref"):
+                fact["evidence_ref"] = str(finding["reverify"]["evidence_ref"])
+            if (finding.get("reverify") or {}).get("reverified_at"):
+                fact["last_reverified_at"] = str(
+                    finding["reverify"]["reverified_at"])
             existing_fact = next((
                 item for item in state["facts"]
                 if item.get("canonical_finding_id") == canonical_id
@@ -1563,6 +1640,7 @@ class ProjectStateStore:
         dead_ends: list[dict[str, Any]] | None = None,
         run_summary: dict[str, Any] | None = None,
         expected_revision: int | None = None,
+        trust_basis: str = TRUST_BASIS_CONTAINMENT,
     ) -> dict[str, Any]:
         inventory_records = [
             ({"endpoint": item} if isinstance(item, str) else dict(item))
@@ -1648,7 +1726,11 @@ class ProjectStateStore:
             for dead_end in dead_end_records:
                 self._merge_dead_end(state, dead_end, run_id)
             for finding in finding_records:
-                self._merge_finding(state, finding, run_id)
+                self._merge_finding(
+                    state, finding, run_id,
+                    trust_basis=(
+                        trust_basis if trust_basis in TRUST_BASES
+                        else TRUST_BASIS_CONTAINMENT))
             if intent_records is not None:
                 by_id = {str(i.get("intent_id")): i for i in state["intents"] if i.get("intent_id")}
                 for intent in intent_records:
@@ -1790,6 +1872,7 @@ class ProjectStateStore:
 
 __all__ = [
     "PROJECT_STATE_SCHEMA_VERSION", "DEAD_END_REASON_CODES",
+    "TRUST_BASES", "TRUST_BASIS_CONTAINMENT", "TRUST_BASIS_EVIDENCE",
     "ProjectStateCorrupt", "ProjectStateError",
     "ProjectStateStore", "canonical_asset", "canonical_project_cell_key",
     "canonical_project_surface_key", "finding_fingerprint", "verify_project_evidence",

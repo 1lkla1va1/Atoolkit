@@ -617,6 +617,7 @@ def _prepare_project_truth(
     continuation_pass: bool,
     closure_pass: bool,
     runtime_summary: dict[str, Any],
+    trust_basis: str = "containment",
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     store = ProjectStateStore(project_dir)
     before = _project_state_or_empty(store)
@@ -636,7 +637,8 @@ def _prepare_project_truth(
             shadow_project=shadow, session_id=session_id, authority=authority)
         shadow_store = ProjectStateStore(shadow)
         after = shadow_store.commit_run(
-            session_id, expected_revision=revision_before, **commit_input)
+            session_id, expected_revision=revision_before, **commit_input,
+            trust_basis=trust_basis)
         meta = dict(shadow_store.last_commit or {})
         revision_after = int(after.get("revision", revision_before) or revision_before)
         mutated = revision_after != revision_before
@@ -899,6 +901,10 @@ def finalize_run(
     authority_dir: str | pathlib.Path,
     allow_empty: bool = False,
     authority_trusted: bool = False,
+    # v10.1: evidence 通道升格门（方案 §3.3）。authority run 下显式传 False
+    # （由左支 authority_trusted 承载）；非 authority run 可凭 evidence_pass
+    # 升格跨 Run 记忆（trust_basis=evidence_reverified），但不解锁提交资格。
+    evidence_pass: bool = False,
     authorization_assurance: str = "unverified",
     project_name: str = "target",
     primary_target: str = "",
@@ -1076,8 +1082,12 @@ def finalize_run(
         # Project truth is an authority mutation, not a diagnostic projection.
         # If the parent cannot prove execution containment, retain the frozen
         # evidence for inspection but do not merge it into cross-run truth.
+        # v10.1: evidence_pass = 本轮待升格 finding 中所有含 replay 段者
+        # reverify 全 match；authority run 下该分支显式 = False（由左支承载），
+        # containment 通道行为逐字节不变。
         project_truth_proof_pass = bool(
-            proof_pass and finalization_contract["authority_trusted"])
+            proof_pass
+            and (finalization_contract["authority_trusted"] or evidence_pass))
         miss_attribution = dict(validation.get("miss_attribution") or {})
         continuation_pass = bool(
             finalization_contract["authority_trusted"]
@@ -1088,6 +1098,12 @@ def finalize_run(
         )
 
         if _stage_index(journal["stage"]) < _stage_index("PROJECT_PREPARED"):
+            # v10.1: containment = authority 通道（现状）；evidence_reverified
+            # 仅当非 authority run 显式通过 evidence_pass 时使用。
+            commit_trust_basis = (
+                "containment"
+                if finalization_contract["authority_trusted"] or not evidence_pass
+                else "evidence_reverified")
             commit, commit_input = _prepare_project_truth(
                 authority=authority, project_dir=project,
                 snapshot_run=snapshot_run, source_run=run,
@@ -1096,6 +1112,7 @@ def finalize_run(
                 continuation_pass=continuation_pass,
                 closure_pass=closure_pass,
                 runtime_summary=dict(journal.get("runtime_summary") or {}),
+                trust_basis=commit_trust_basis,
             )
             advance(
                 "PROJECT_PREPARED", commit=commit,

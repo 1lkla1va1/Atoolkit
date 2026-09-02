@@ -58,14 +58,20 @@ try:
     )
     from .metrics import PhaseRecorder, write_runtime_metrics
     from .orchestrator import CognitiveState
-    from .planner import plan_surfaces
-    from .project_state import canonical_asset
+    from .planner import make_surface_id, plan_surfaces
+    from .project_state import TRUST_BASIS_EVIDENCE, ProjectStateStore, canonical_asset
     from .host_policy import (
         normalize_authorized_scopes,
         strip_scope_path_with_warning,
     )
     from .reporting.collect import collect_structured_findings
     from .reporting.decision import decide_canonical_report, gate_outcomes
+    from .reverify import (
+        DEFAULT_BUDGET_PER_RUN,
+        ReverifyBudget,
+        load_identities,
+        reverify_finding,
+    )
     from .reporting.observations import (
         build_observation_records,
         write_observations_json,
@@ -79,6 +85,7 @@ try:
     from .runtime_manifest import inspect_workspace_instructions
     from .safe_io import (
         UnsafePathError,
+        atomic_write_bytes,
         atomic_write_json,
         create_json_exclusive,
         ensure_directory,
@@ -118,8 +125,9 @@ except ImportError:  # pragma: no cover - script execution fallback
                         CoverageLedger, is_high_value, normalize_status)
     from metrics import PhaseRecorder, write_runtime_metrics
     from orchestrator import CognitiveState
-    from planner import plan_surfaces
-    from project_state import canonical_asset
+    from planner import make_surface_id, plan_surfaces
+    from project_state import (TRUST_BASIS_EVIDENCE, ProjectStateStore,
+                               canonical_asset)
     from host_policy import (normalize_authorized_scopes,
                              strip_scope_path_with_warning)
     from reporting.collect import collect_structured_findings
@@ -130,10 +138,13 @@ except ImportError:  # pragma: no cover - script execution fallback
                                      render_observation_report)
     from reporting.schema import load_finding
     from reporting.validate import validate_run_artifacts
+    from reverify import (DEFAULT_BUDGET_PER_RUN, ReverifyBudget,
+                          load_identities, reverify_finding)
     from runtime_manifest import inspect_workspace_instructions
-    from safe_io import (UnsafePathError, atomic_write_json,
-                         create_json_exclusive, ensure_directory,
-                         safe_append_text, safe_read_bytes, safe_read_text)
+    from safe_io import (UnsafePathError, atomic_write_bytes,
+                         atomic_write_json, create_json_exclusive,
+                         ensure_directory, safe_append_text,
+                         safe_read_bytes, safe_read_text)
     from surface import bootstrap as bootstrap_recon
     from recon import collect_recon
     from threat_model import (ThreatModelError, compile_threat_model,
@@ -1107,10 +1118,19 @@ def _freeze_budget_capped(
     ``"budget_cap"``).  The top-level ``deferred_reasons`` count dictionary
     replaces the old single-value ``deferred_reason`` field.
     """
-    if len(ledger.surfaces) <= max_frozen_cells:
+    # v10.1: inherited confirmed cells（evidence_reverified 记忆）已是闭合格，
+    # 完全绕过冻结帽——既不占预算也不进 deferred-pool（对齐"不计入本轮已测"
+    # 会计：它们不消耗本轮执行预算）。
+    inherited_surfaces = [
+        surface for surface in ledger.surfaces
+        if surface.get("inherited_from_project_state") is True]
+    candidates = [
+        surface for surface in ledger.surfaces
+        if surface.get("inherited_from_project_state") is not True]
+    if len(candidates) <= max_frozen_cells:
         return []
     ordered = sorted(
-        ledger.surfaces,
+        candidates,
         key=lambda surface: (
             1 if surface.get("identity_blocked") is True else 0,
             0 if is_high_value(surface) else 1,
@@ -1129,7 +1149,8 @@ def _freeze_budget_capped(
     deferred = ordered[max_frozen_cells:]
     ledger.surfaces = [
         surface for surface in ledger.surfaces
-        if str(surface.get("surface_id") or "") in frozen_ids
+        if (surface.get("inherited_from_project_state") is True
+            or str(surface.get("surface_id") or "") in frozen_ids)
     ]
     pool = [
         {**surface,
@@ -1144,15 +1165,17 @@ def _freeze_budget_capped(
         deferred_reasons[entry["deferred_reason"]] += 1
     ledger.metadata["budget_cap"] = {
         "max_frozen_cells": max_frozen_cells,
-        "frozen_cells": len(ledger.surfaces),
+        "frozen_cells": len(candidates) - len(pool),
         "deferred_cells": len(pool),
+        "inherited_cells": len(inherited_surfaces),
     }
     atomic_write_json(run / "deferred-pool.json", {
         "schema_version": 1,
         "deferred_reasons": deferred_reasons,
         "max_frozen_cells": max_frozen_cells,
-        "frozen_cells": len(ledger.surfaces),
+        "frozen_cells": len(candidates) - len(pool),
         "deferred_cells": len(pool),
+        "inherited_cells": len(inherited_surfaces),
         "surfaces": pool,
     }, root=run, reject_leaf_symlink=True)
     return pool
@@ -1173,6 +1196,7 @@ def initialize_direct_run(
     derived_assets: Iterable[str] | None = None,
     continue_from_run: pathlib.Path | None = None,
     max_frozen_cells: int = 20,
+    project_dir: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     """Initialize a diagnostic Direct-Skill ledger and bounded work queue."""
     if int(max_frozen_cells) < 1:
@@ -1290,6 +1314,16 @@ def initialize_direct_run(
         _decorate_surface(surface, cards)
     metrics.record("init.plan", time.perf_counter() - metrics_tick)
 
+    # v10.1: 继承消费（可选 --project-dir；缺省与现状逐字节一致）。放在
+    # in_run_scope 装饰之后，inherited surface 以 in_run_scope=False 注入。
+    project_inheritance: dict[str, Any] | None = None
+    if project_dir is not None:
+        metrics_tick = time.perf_counter()
+        project_inheritance = _inherit_project_cells(
+            run=run, project_dir=project_dir.resolve(), ledger=ledger,
+            rows=rows, authorized_scopes=authorized_scopes)
+        metrics.record("init.inherit", time.perf_counter() - metrics_tick)
+
     # v9.8.2 W2: framework fingerprint routing.  Phase 0 writes
     # <recon_dir>/framework_fingerprint.md (first line `framework: <name>`);
     # a matching knowledge/cards/frameworks/<name>.json marks matching
@@ -1393,6 +1427,16 @@ def initialize_direct_run(
         }
     status["identity_requirements"] = dict(
         identity_requirements.get("summary") or {})
+    if project_inheritance is not None:
+        ensure_directory(run / "state", root=run)
+        atomic_write_json(
+            run / "state" / "inherited-reverify.json", project_inheritance,
+            root=run, reject_leaf_symlink=True)
+        status["project_inheritance"] = {
+            key: project_inheritance.get(key)
+            for key in ("inherited", "revalidation_required", "barrier",
+                        "budget", "trust_level")
+        }
     atomic_write_json(run / "runtime-status.json", status, root=run, reject_leaf_symlink=True)
     metrics.record("init.projection", time.perf_counter() - metrics_tick)
     metrics.record("init.total", time.perf_counter() - init_started_perf)
@@ -1717,7 +1761,450 @@ def _apply_direct_execution_gate(
     return changed
 
 
-def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
+def _reverify_evidence_sink(
+    project_dir: pathlib.Path, session_id: str, finding_id: str,
+    artifact_registry: dict[str, dict[str, str]],
+) -> Any:
+    """Build a reverify evidence sink bound to one finding package.
+
+    落盘根 = ``<project_dir>/sessions/<sid>/findings/<finding_id>/``（与
+    project_state ``_attest_evidence`` 布局天然一致）；文件名
+    ``replay_<UTC毫秒>.http``；safe_io 原子写（mode 0600）。每个落盘文件的
+    sha256 记进 ``artifact_registry``，由调用方并入当轮 reverify 段
+    （validation_sha256 覆盖；P1-4：防"改文件不重算摘要"的低级伪造——
+    防不了整体重写+重算，信任分级见 reverify.py 模块注释）。
+    """
+    root = project_dir / "sessions" / session_id / "findings" / finding_id
+
+    def sink(text: str) -> str:
+        ensure_directory(root, root=project_dir)
+        name = f"replay_{int(time.time() * 1000)}.http"
+        path = root / name
+        atomic_write_json  # noqa: B018 - 文档性引用占位（见下 atomic_write_text）
+        from .safe_io import atomic_write_text
+        atomic_write_text(path, text, root=project_dir, reject_leaf_symlink=True)
+        rel = f"findings/{finding_id}/{name}"
+        artifact_registry[rel] = hashlib.sha256(
+            safe_read_bytes(path, root=project_dir)).hexdigest()
+        return rel
+
+    return sink
+
+
+def _copy_finding_package(
+    finding_dir: pathlib.Path, project_dir: pathlib.Path, session_id: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Copy one finding package into project long-term storage (P2-f).
+
+    Returns (relative_paths -> sha256, ref_rewrites).  All files are written
+    atomically with mode 0600 via safe_io（凭据卫生：长期存储权限收紧）。
+    """
+    target_root = project_dir / "sessions" / session_id / "findings" / finding_dir.name
+    ensure_directory(target_root, root=project_dir)
+    hashes: dict[str, str] = {}
+    for source in sorted(finding_dir.rglob("*"), key=lambda item: item.as_posix()):
+        if source.is_dir() or source.is_symlink():
+            continue
+        relative = source.relative_to(finding_dir)
+        payload = source.read_bytes()
+        atomic_write_bytes(
+            target_root / relative, payload, root=project_dir)
+        rel = f"findings/{finding_dir.name}/{relative.as_posix()}"
+        hashes[rel] = hashlib.sha256(payload).hexdigest()
+    return hashes, {}
+
+
+def _dir_content_digest(finding_dir: pathlib.Path, *, ignore_replay_evidence: bool = False) -> str:
+    """Deterministic content digest of a finding package directory.
+
+    ``ignore_replay_evidence``：比较会话副本与源包时跳过 ``replay_<ms>.http``
+    （复验证据文件只存在于 project 会话副本，属于复验产物而非 PoC 输入，
+    不参与"输入是否变化"的判定）。
+    """
+    rows = []
+    for source in sorted(finding_dir.rglob("*"), key=lambda item: item.as_posix()):
+        if source.is_dir() or source.is_symlink():
+            continue
+        if ignore_replay_evidence and re.fullmatch(
+                r"replay_\d+\.http", source.name):
+            continue
+        rows.append(
+            source.relative_to(finding_dir).as_posix() + ":"
+            + hashlib.sha256(source.read_bytes()).hexdigest())
+    return hashlib.sha256(
+        "\n".join(rows).encode("utf-8")).hexdigest()
+
+
+def _promote_findings_to_project(
+    *,
+    run: pathlib.Path,
+    project_dir: pathlib.Path,
+    ledger: CoverageLedger,
+    guardian_accepted: list[dict[str, Any]],
+    accepted_by_path: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """v10.1 Direct 证据复验升格链路（方案 §3.2/§3.3）。
+
+    对本轮 guardian-accepted 且含 replay 段的 finding 执行真实重放；全部
+    match 者连同 finding 包复制进 ``<project_dir>/sessions/<sid>/findings/``
+    并经 ``ProjectStateStore.commit_run`` 入库（trust_basis=evidence_reverified）。
+    Direct 下该通道是幻觉过滤器，不是完整性边界；产物仍 diagnostic、
+    不可提交。升格只在首次带 ``--project-dir`` 的 checkpoint 发生；同
+    run_id 重跑时按会话内容比对判幂等或 commit_conflict，不崩溃。
+    """
+    session_id = run.name
+    authorized_scopes = _metadata_authorized_scopes(ledger.metadata)
+    artifact_registry: dict[str, dict[str, str]] = {}
+    budget = ReverifyBudget(DEFAULT_BUDGET_PER_RUN)
+    identities = load_identities(run)
+    rows: list[dict[str, Any]] = []
+    promoted: list[dict[str, Any]] = []
+    committed_before = False
+
+    store = ProjectStateStore(project_dir, project_scope=authorized_scopes)
+    try:
+        prior_state = store.preview()
+        prior_history = (prior_state.get("run_history") or {}).get(session_id) or {}
+        committed_before = bool(prior_history.get("commit_input_sha256"))
+    except Exception:  # noqa: BLE001 - unreadable project dir stays diagnostic
+        committed_before = False
+
+    for item in guardian_accepted:
+        finding = dict(item.get("finding") or {})
+        fid = str(item.get("id") or finding.get("id") or "")
+        path = pathlib.Path(str(item.get("path") or ""))
+        finding_dir = path.parent
+        # 包目录名（findings/<dir>/）是 evidence 布局锚点：sink 与整包复制
+        # 必须用同一目录名，attest 才能在 sessions/<sid>/ 下解析 evidence_ref。
+        package_id = finding_dir.name or fid
+        verification = (
+            finding.get("verification")
+            if isinstance(finding.get("verification"), dict) else {})
+        replay_spec = (
+            verification.get("replay")
+            if isinstance(verification.get("replay"), dict) else None)
+        row: dict[str, Any] = {"finding_id": fid, "path": path.name}
+        if not isinstance(replay_spec, dict):
+            row.update({"outcome": "not_eligible",
+                        "reason": "no replay section (evidence channel requires it)"})
+            rows.append(row)
+            continue
+        dir_digest = _dir_content_digest(finding_dir)
+        row["finding_dir_sha256"] = dir_digest
+        if committed_before:
+            # 重入语义（Gate-A R2 P1-12）：同 run_id 已有 commit——按 finding
+            # 包内容比对：与已入库副本逐字节一致 → 幂等；不一致 → commit_conflict。
+            # 不再发复验流量、不再触发 commit_run（升格只在首次发生）。
+            copy_root = project_dir / "sessions" / session_id / "findings" / package_id
+            if copy_root.is_dir():
+                copied_digest = _dir_content_digest(
+                    copy_root, ignore_replay_evidence=True)
+                if copied_digest == dir_digest:
+                    row.update({"outcome": "match",
+                                "replay": "skipped_already_committed",
+                                "promoted": True, "idempotent": True})
+                else:
+                    row.update({"outcome": "mismatch",
+                                "reason": "commit_conflict: finding changed after promotion",
+                                "promoted": False, "commit_conflict": True})
+            else:
+                row.update({"outcome": "barrier",
+                            "reason": "commit_conflict: prior commit exists but session copy missing",
+                            "promoted": False, "commit_conflict": True})
+            rows.append(row)
+            continue
+        if not identities:
+            row.update({"outcome": "barrier",
+                        "reason": "identities.json missing/empty (supply identities and re-checkpoint)",
+                        "promoted": False})
+            rows.append(row)
+            continue
+        sink = _reverify_evidence_sink(
+            project_dir, session_id, package_id, artifact_registry)
+        result = reverify_finding(
+            finding, finding_dir,
+            identities=identities,
+            authorized_scopes=authorized_scopes,
+            evidence_sink=sink,
+            budget=budget)
+        row.update({**result,
+                    "promoted": result.get("outcome") == "match"})
+        if result.get("outcome") == "match":
+            copied = _copy_finding_package(finding_dir, project_dir, session_id)
+            row["copied_files_sha256"] = copied
+            normalized = accepted_by_path.get(str(path.resolve()))
+            commit_finding = dict(normalized) if normalized else dict(finding)
+            # proof_files 重写为 session 相对布局，只保留 finding 包内引用；
+            # 追加 replay 证据文件，使 cell evidence 绑定复验产物。
+            prefix = f"findings/{package_id}/"
+            kept_refs = [
+                str(ref) for ref in (
+                    commit_finding.get("proof_files")
+                    or commit_finding.get("evidence_refs") or [])
+                if str(ref).startswith(prefix)
+            ]
+            evidence_ref = str(result.get("evidence_ref") or "")
+            if evidence_ref and evidence_ref not in kept_refs:
+                kept_refs.append(evidence_ref)
+            commit_finding["proof_files"] = kept_refs
+            commit_finding["evidence_refs"] = list(kept_refs)
+            commit_finding["reverify"] = {
+                "outcome": result.get("outcome"),
+                "baseline_outcome": result.get("baseline_outcome"),
+                "evidence_ref": evidence_ref,
+                "evidence_sha256": artifact_registry.get(evidence_ref, ""),
+                "reverified_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            promoted.append(commit_finding)
+        rows.append(row)
+
+    commit_section: dict[str, Any] = {
+        "performed": False, "idempotent": False, "conflict": False,
+        "delta": {}, "warnings": [],
+    }
+    if committed_before:
+        conflicts = [row for row in rows if row.get("commit_conflict")]
+        idempotent = [row for row in rows if row.get("idempotent")]
+        if conflicts:
+            commit_section["conflict"] = True
+            commit_section["warnings"].append({
+                "code": "commit_conflict",
+                "detail": (
+                    "run already promoted with different input; promotion "
+                    "happens on the first --project-dir checkpoint only"),
+            })
+        elif idempotent:
+            commit_section["idempotent"] = True
+    elif promoted:
+        # 纪律①（Gate-A R3 P2-h）：仅在存在 ≥1 个新 match finding 时 commit，
+        # 空提交不污染 run_history。
+        run_summary = {
+            "status": "promoted_evidence_reverified",
+            # v10.1 方案 §6.4 锚定：本文件新增 authority_trusted 字面量只允许
+            # 出现在本函数（Direct 诊断档位显式声明）。
+            "authority_trusted": False,
+            "trust_basis": "evidence_reverified",
+            "promoted_findings": [
+                str(row.get("id") or "") for row in promoted],
+        }
+        try:
+            store.commit_run(
+                session_id, findings=promoted, run_summary=run_summary,
+                trust_basis="evidence_reverified")
+            last = dict(store.last_commit or {})
+            commit_section["performed"] = True
+            commit_section["idempotent"] = bool(last.get("idempotent"))
+            commit_section["delta"] = dict(last.get("delta") or {})
+            if not commit_section["delta"].get("root_findings"):
+                # P2-b 可观测性：复验 match 但 root_findings 增量为 0——
+                # 常见原因是 scope 钉不命中或 claim_kind != root_finding。
+                commit_section["warnings"].append({
+                    "code": "promotion_not_reflected",
+                    "detail": (
+                        "reverify matched but root_findings delta is 0; "
+                        "check scope pin / claim_kind / attest layout"),
+                })
+        except Exception as exc:  # noqa: BLE001 - ProjectStateError 等不崩溃
+            commit_section["conflict"] = True
+            commit_section["warnings"].append({
+                "code": "commit_failed",
+                "detail": f"{type(exc).__name__}: {exc}",
+            })
+
+    return {
+        "schema_version": 1,
+        "trust_basis": "evidence_reverified",
+        "trust_level": (
+            "hallucination_filter_not_integrity_boundary"),
+        "project_dir": str(project_dir),
+        "session_ref": f"project:sessions/{session_id}",
+        "budget": {"limit": budget.limit, "used": budget.used},
+        "findings": rows,
+        "reverify_artifacts_sha256": dict(artifact_registry),
+        "commit": commit_section,
+    }
+
+
+def _inherit_project_cells(
+    *,
+    run: pathlib.Path,
+    project_dir: pathlib.Path,
+    ledger: CoverageLedger,
+    rows: list[dict[str, Any] | str],
+    authorized_scopes: list[str] | None = None,
+    max_age_hours: float = 72.0,
+    budget_limit: int = DEFAULT_BUDGET_PER_RUN,
+) -> dict[str, Any]:
+    """v10.1 Direct 继承消费（方案 §3.4 / Gate-A P1-6）。
+
+    读取 project_state 中 ``trust_basis=evidence_reverified`` 的 confirmed
+    cell，逐一继承复验（共享当 Run 预算；TTL 内免复验）。match 的 cell 以
+    inherited 标记注入 coverage-ledger，并同步注入 inventory 行（P2-d①）；
+    accounting 规则对齐 orchestrator ``inherited_from_blackboard`` 特判
+    （P2-d②）：inherited cell 不计入本轮「已测」证据。mismatch → 不注入、
+    cell 标 revalidation_required；barrier → 不注入、保持 open 进 agenda。
+
+    注意：本函数在 init 的 ``in_run_scope=True`` 装饰循环**之后**调用；
+    inherited surface 以 ``in_run_scope=False`` 注入——与 Engine 侧
+    ``inherited_from_blackboard`` 会计特判同向：不计入本轮执行/闭合分母。
+    """
+    session_id = run.name
+    if authorized_scopes is None:
+        authorized_scopes = _metadata_authorized_scopes(ledger.metadata)
+    store = ProjectStateStore(project_dir, project_scope=authorized_scopes)
+    try:
+        state = store.preview()
+    except Exception as exc:  # noqa: BLE001 - unreadable project stays diagnostic
+        return {"schema_version": 1, "error": f"{type(exc).__name__}: {exc}",
+                "inherited": 0, "revalidation_required": 0, "barrier": 0}
+    artifact_registry: dict[str, dict[str, str]] = {}
+    budget = ReverifyBudget(budget_limit)
+    identities = load_identities(run)
+    now_epoch = time.time()
+    rows_out: list[dict[str, Any]] = []
+    inherited_count = 0
+    revalidation_count = 0
+    barrier_count = 0
+
+    for key, cell in (state.get("cell_registry") or {}).items():
+        if not isinstance(cell, dict):
+            continue
+        if (str(cell.get("status") or "") != "confirmed"
+                or str(cell.get("trust_basis") or "") != TRUST_BASIS_EVIDENCE):
+            continue
+        canonical_id = str(cell.get("canonical_finding_id") or "")
+        row: dict[str, Any] = {
+            "cell_key": key,
+            "canonical_finding_id": canonical_id,
+            "endpoint": str(cell.get("path") or ""),
+            "method": str(cell.get("method") or ""),
+            "param": str(cell.get("param") or ""),
+            "role": str(cell.get("role_scope") or "unknown"),
+        }
+        rows_out.append(row)
+        # ---- TTL：last_reverified_at 在 max_age_hours 内 → 免复验直接继承
+        ttl_ok = False
+        last_reverified = str(cell.get("last_reverified_at") or "")
+        if last_reverified:
+            try:
+                from datetime import datetime, timezone as _tz
+                parsed = datetime.strptime(
+                    last_reverified, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_tz.utc)
+                age_hours = (now_epoch - parsed.timestamp()) / 3600.0
+                # Gate-B P2：负 age（伪造/未来时间戳）不得免复验继承
+                ttl_ok = 0.0 <= age_hours <= float(max_age_hours)
+                row["age_hours"] = round(age_hours, 2)
+            except ValueError:
+                ttl_ok = False
+        if not ttl_ok:
+            # 超出 TTL → 必须真实复验。cell 证据包在
+            # <project_dir>/sessions/<source_run>/findings/<canonical_finding_id>/
+            evidence_ref = str(cell.get("evidence_ref") or "")
+            source_dir = None
+            if evidence_ref.startswith("findings/"):
+                # evidence_ref 形如 findings/<fid>/replay_*.http，fid 即 finding 目录名
+                fid = evidence_ref.split("/")[1]
+                candidate = (project_dir / "sessions" / str(cell.get("source_run") or "")
+                             / "findings" / fid)
+                if candidate.is_dir():
+                    source_dir = candidate
+            if source_dir is None:
+                barrier_count += 1
+                row.update({"inherited": False, "outcome": "barrier",
+                            "reason": "replay package not found for TTL re-verify"})
+                continue
+            replay_findings = sorted(source_dir.glob("finding.json"))
+            if not replay_findings:
+                barrier_count += 1
+                row.update({"inherited": False, "outcome": "barrier",
+                            "reason": "finding.json missing in replay package"})
+                continue
+            if not identities:
+                barrier_count += 1
+                row.update({"inherited": False, "outcome": "barrier",
+                            "reason": "identities.json missing/empty"})
+                continue
+            finding = json.loads(safe_read_bytes(
+                replay_findings[0], root=project_dir).decode("utf-8"))
+            sink = _reverify_evidence_sink(
+                project_dir, session_id, source_dir.name, artifact_registry)
+            result = reverify_finding(
+                finding, source_dir,
+                identities=identities,
+                authorized_scopes=authorized_scopes,
+                evidence_sink=sink, budget=budget)
+            row.update({**result, "inherited": result.get("outcome") == "match"})
+            if result.get("outcome") == "match":
+                row["inherited"] = True
+            elif result.get("outcome") == "mismatch":
+                revalidation_count += 1
+                continue
+            else:
+                barrier_count += 1
+                continue
+        else:
+            row["inherited"] = True
+            row["outcome"] = "match"
+            row["replay"] = "skipped_ttl"
+        if not row.get("inherited"):
+            continue
+        inherited_count += 1
+        # ---- 注入 ledger：inherited confirmed cell（P2-d②：不计入本轮已测）
+        endpoint = str(cell.get("path") or "")
+        method = str(cell.get("method") or "")
+        param = str(cell.get("param") or "")
+        role = str(cell.get("role_scope") or "unknown")
+        surface_id = make_surface_id(
+            endpoint, method, param, [role])
+        surface = ledger.get(surface_id)
+        if surface is None:
+            surface = ledger.add_surface({
+                "surface_id": surface_id,
+                "endpoint": endpoint, "method": method, "param": param,
+                "roles": [role], "risk_tags": [],
+                "source": "project_state_inherited",
+            })
+        surface["status"] = STATUS_CONFIRMED
+        surface["inherited"] = True
+        surface["inherited_from_project_state"] = True
+        surface["inherited_from_blackboard"] = True
+        surface["evidence_ref"] = str(cell.get("evidence_ref") or "")
+        surface["trust_basis"] = str(cell.get("trust_basis") or "")
+        surface["last_reverified_at"] = str(cell.get("last_reverified_at") or "")
+        surface["canonical_finding_id"] = canonical_id
+        surface["in_run_scope"] = False
+        surface.pop("blocker", None)
+        surface.pop("next_actions", None)
+        # ---- 同步注入 inventory 行（P2-d①：防 inventory-ledger 一致性误报）
+        rows.append({
+            "endpoint": endpoint, "method": method,
+            "params": [param] if param else [],
+            "roles": [role],
+            "source": "project_state_inherited",
+            "inherited": True,
+        })
+
+    return {
+        "schema_version": 1,
+        "trust_basis": "evidence_reverified",
+        "trust_level": "hallucination_filter_not_integrity_boundary",
+        "project_dir": str(project_dir),
+        "max_age_hours": float(max_age_hours),
+        "budget": {"limit": budget.limit, "used": budget.used},
+        "inherited": inherited_count,
+        "revalidation_required": revalidation_count,
+        "barrier": barrier_count,
+        "cells": rows_out,
+        "reverify_artifacts_sha256": dict(artifact_registry),
+    }
+
+
+def checkpoint_direct_run(
+    run_dir: pathlib.Path,
+    *,
+    project_dir: pathlib.Path | None = None,
+) -> dict[str, Any]:
     """Reduce all immutable observations into ledger/status/queue projections."""
     run = run_dir.resolve()
     # v9.8.1 W5a: six checkpoint sub-phase timers + totals; best-effort write
@@ -1800,6 +2287,14 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
 
     metrics.record("checkpoint.guardian_gate", time.perf_counter() - metrics_tick)
     guardian_demotions = len(observation_items) - pre_gate_observations
+    # v10.1: 证据复验升格（可选 --project-dir）。缺省时 checkpoint 行为与
+    # 现状逐字节一致（不产生 reverify 段、不触网）。
+    project_promotion: dict[str, Any] | None = None
+    if project_dir is not None:
+        project_promotion = _promote_findings_to_project(
+            run=run, project_dir=project_dir.resolve(), ledger=ledger,
+            guardian_accepted=guardian_accepted,
+            accepted_by_path=accepted_by_path)
     metrics_tick = time.perf_counter()
     conflicts: list[dict[str, Any]] = []
     for surface in ledger.surfaces:
@@ -2044,6 +2539,10 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
     # state for Direct runs and never fails the checkpoint itself.
     attribution_summary: dict[str, Any] = {}
     attribution_error = ""
+    extra_sections: dict[str, Any] = {}
+    if project_promotion is not None:
+        # 方案 §3.3：reverify 段进 finding_validation.json（自指摘要哈希覆盖）。
+        extra_sections["reverify"] = project_promotion
     try:
         validation = validate_run_artifacts(
             run,
@@ -2051,6 +2550,7 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
             derived_hosts=_metadata_derived_assets(ledger.metadata) or None,
             allow_empty=True,
             write_output=True,
+            extra_sections=extra_sections or None,
         )
         cause_counts = dict(
             (validation.get("miss_attribution") or {}).get("cause_counts") or {})
@@ -2104,6 +2604,8 @@ def checkpoint_direct_run(run_dir: pathlib.Path) -> dict[str, Any]:
             identity_requirements.get("summary") or {}),
         "budget_guardrail": budget_guardrail,
         "created_data_advisory": created_data_advisory,
+        **({"project_promotion": project_promotion}
+           if project_promotion is not None else {}),
         **({"threat_coverage": threat_coverage} if threat_coverage is not None else {}),
     }
     atomic_write_json(run / "state" / "checkpoint.json", checkpoint, root=run,
@@ -2431,6 +2933,11 @@ def _parser() -> argparse.ArgumentParser:
                       help="消费上一 Run 的归因 agenda（diagnostic-only，v9.8）")
     init.add_argument("--max-frozen-cells", type=int, default=20,
                       help="本轮冻结进闭合分母的最大覆盖格数，其余进 deferred-pool（v9.8 W0，默认 20）")
+    init.add_argument(
+        "--project-dir", type=pathlib.Path,
+        help="v10.1 显式 project 目录（与 checkpoint --project-dir 同一目录即"
+             "同身份）：消费 evidence_reverified confirmed cell，TTL 内免复验"
+             "继承入 ledger（inherited 标记，不计入本轮已测）")
     init.add_argument("--workspace-root", type=pathlib.Path)
     observe = sub.add_parser("observe")
     observe.add_argument("--run-dir", required=True, type=pathlib.Path)
@@ -2438,6 +2945,11 @@ def _parser() -> argparse.ArgumentParser:
     observe.add_argument("--input", required=True, help="observation JSON file or - for stdin")
     checkpoint = sub.add_parser("checkpoint")
     checkpoint.add_argument("--run-dir", required=True, type=pathlib.Path)
+    checkpoint.add_argument(
+        "--project-dir", type=pathlib.Path,
+        help="v10.1 显式升格目录：对本轮含 verification.replay 的 accepted "
+             "finding 做证据复验，全 match 者入库 project_state"
+             "（trust_basis=evidence_reverified，幻觉过滤器级）；缺省行为不变")
     scope = sub.add_parser("scope")
     scope.add_argument("--run-dir", required=True, type=pathlib.Path)
     scope.add_argument("--add", action="append", default=[],
@@ -2501,7 +3013,8 @@ def main(argv: list[str] | None = None) -> int:
                 extra_scopes=args.allow, scope_files=args.scope_file,
                 derived_assets=args.allow_derived,
                 continue_from_run=args.continue_from_run,
-                max_frozen_cells=args.max_frozen_cells)
+                max_frozen_cells=args.max_frozen_cells,
+                project_dir=args.project_dir)
         elif args.command == "observe":
             if args.input == "-":
                 observation = json.load(sys.stdin)
@@ -2526,7 +3039,8 @@ def main(argv: list[str] | None = None) -> int:
                 rps=args.rps, max_file_bytes=args.max_file_bytes,
                 max_total_bytes=args.max_total_bytes, timeout=args.timeout)
         else:
-            result = checkpoint_direct_run(args.run_dir)
+            result = checkpoint_direct_run(
+                args.run_dir, project_dir=args.project_dir)
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"status": "error", "error": f"{type(exc).__name__}: {exc}"},
                          ensure_ascii=False))

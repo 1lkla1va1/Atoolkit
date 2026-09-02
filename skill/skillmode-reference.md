@@ -110,6 +110,8 @@ v8.10 negative 还应携带 `barrier_signals` 与 `preconditions`。以下 barri
 
 **模式 6 · 响应篡改绕过前端校验**：拦截验证码错误响应 `{"status":"0","msg":"验证码错误"}` → 修改为 `{"status":"1","msg":"成功"}` → 观察前端是否进入下一步（前端信任了响应状态但后端是否在下一步重新验证前置条件）。
 
+**模式 7 · 会话凭证载体复用**：扫码登录/深链携带的 token/会话票缺少一次性校验——扫码确认后 token 留在 URL 中可复制复用（同一链接在无痕环境重放即可登录）、运营配置 JSON 或深链中的会话票跨用户/跨时间重放。测试方法：截取含票值的完整链接在无痕会话重放；将票值替换进另一账号上下文验证绑定性；对比票值使用前后是否失效。
+
 ---
 
 ## 密码重置常见攻击模式（参考）
@@ -277,6 +279,9 @@ findings/finding_<id>/
 
 条件必填：
 - `verification.access_expectation`：未授权/IDOR/越权必须证明资源本应非公开，并引用同接口拒绝、明确私有可见性、属主私有创建或产品策略的物理证据；匿名 200 不能替代此项
+- `verification.replay`（v10.1 证据复验升格，可选）：跨 Run 复利通道的回查声明——
+  `{"kind":"readback","request_file":"request_readback.http","identity":"user_b","baseline_identity":"anon","control_url":"(可选，403 判定对照)","expectation":{"status":200,"required_markers":["含具体数据片段的正则"],"absent_markers":[]},"max_age_hours":72}`。
+  机器门逐条强校验：① method ∈ GET/HEAD/OPTIONS（只重放幂等回查读请求，状态变化类 PoC 的重放对象 = 其 GET 闭环回查）；② `identity` 必须存在于 run 的 `identities.json`；③ `baseline_identity` **全类必填**且 ≠ identity（不在 identities.json 时按空 auth=真匿名）；④ `required_markers` ≥1，逐条过探针集恒真拒绝（`""/ok/success/true/status/200/error/null/{}`）+ 去转义字面长度 ≥4 + 必须命中原始 proof 响应（同 64KB 截断口径）；⑤ 重放时差分基线身份再取一次同请求，marker 在基线命中即 mismatch（信封式 `"code":0`/`"success":true` 对探针集免疫，只有基线能杀）。marker 写法指引：必须包含**具体数据片段**（如 `"owner":"owner-a"`、订单号、一次性 nonce），不要写 `"code":0` 这类信封模式；复验全 match 才升格 `trust_basis=evidence_reverified`（Direct 下是幻觉过滤器，不是完整性边界）
 - 高影响 `impact_claims`：RCE 必须有 `impact_type=command_execution` 与响应中可检索的唯一 `execution_nonce`；ATO/会话窃取必须有身份标记；批量数据必须给有限 `observed_count`
 - Race：`verification.success_marker` 在 `raw_concurrency_file` 中的实际出现次数必须能复算 `concurrency.successes`
 - `source_proof`：从 JS/源码构造数据包时，写明文件、行号
@@ -287,6 +292,9 @@ findings/finding_<id>/
 通用规则：
 - `risk.proven_impact` 只能写已证明结果，不能写"可能/疑似/理论上"
 - `proof_packets[].request_file`、`response_file`、`poc.file` 对应文件必须真实存在
+- **replay.request_file 落盘时即剥离认证头（Cookie/Authorization/token 等）**：重放靠
+  `with_identity` 从 run 的 `identities.json` 注入身份，不依赖快照 Cookie；升格复制进
+  project_dir 长期存储的证据包一律 0600 权限收紧
 - root finding、已证明影响、利用链假设必须分层；链假设不进入标题、严重度、accepted 或评分
 - 终态由外部 `engine.skill_wrapper` 停止 agent 后调用共享
   `engine.finalize`。本地进程组无法约束 `setsid()` 后代，因此当前内置
@@ -521,6 +529,23 @@ create-order ──→ pay/index ──→ payment-gateway ──→ callback
 **Result**：URL 编码单引号 + 原始 OR 关键字的组合绕过了 WAF。search.php SQLi 从阴性翻转为 confirmed（P2）。
 
 **关键教训**：`waf_bypass_retry` 规则确保 **WAF 拦截 ≠ "不存在漏洞"**。v8.3 中 WAF 拦截直接标记阴性并跳过；v8.4 的 Intent 机制将"WAF 拦截"视为一个**异常信号**而非终点，驱动 agent 系统性尝试编码变体。很多真实漏洞就藏在 WAF 的解码盲区中。
+
+---
+
+## 云 IDE / Agent 工具执行面（案例与速查）
+
+**认形态**（发现即生成 CANDIDATE）：云端 IDE / 算力工作台 / notebook 环境、带 command/exec/run 类参数的内部 RPC 或 WebSocket 端点、租户级长期 JWT（payload 含 tenant/uid 且缺少过期或可无限续签）、agent/自动化工具的执行接口（工具名 + 参数直接映射到宿主机命令或文件系统）。
+
+**链案例**（通用链形，去宿主化）：注册/弱口令低权账号 → 拿到租户级凭据 → 调用执行型 RPC（command/exec 类参数）→ 容器或宿主机命令执行 → 读取环境变量/挂载卷中的云凭据与模型密钥。每一步落盘请求/响应差分；"执行端点存在"是现象，"用租户凭据成功执行命令并读出凭据"才是结果（→ §灵魂金句，见核心文件）。
+
+**Agent 工具执行面认知清单**：① 工具调用参数注入——工具参数拼接进 shell/SQL/路径时按对应注入类测试；② 工具越权执行——低权身份调用高权工具（工具级授权缺失，role/object-pair 照常展开）；③ 执行结果回显差分——同一工具在不同身份/参数下的输出差异证明数据边界。
+
+**云凭据与对象存储速查行**（命中密钥实值后按 `secret-key-validation` 卡做结果化验证）：
+
+- STS 临时凭证策略通配：AssumeRole 下发的策略 Action/Resource 含 `*` 或对象 key 通配 → 越权拉取任意对象或执行任意操作。
+- 对象存储签名接口 `key=/`（key 为空 + prefix 语义）配合 ListBucket 类 Action → 列举全桶内容。
+- 预签名/签名校验不绑定 Host（签名串中无 host/bucket 成分）→ 同一签名换目标桶重放。
+- `response-content-type` / `response-content-disposition` 覆盖参数 → 上传 HTML/SVG 后强制以内联 text/html 渲染 → 存储 XSS；以对象存储为图床/静态站的业务可直接触发。
 
 ---
 

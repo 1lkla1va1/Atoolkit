@@ -19,6 +19,11 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
+try:
+    from ..throttle import HostThrottle
+except ImportError:  # pragma: no cover - direct script execution
+    from throttle import HostThrottle
+
 REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 MAX_REDIRECT_HOPS = 5
 USER_AGENT = "Atoolkit-Recon/10.0"
@@ -106,24 +111,18 @@ class Fetcher:
     ) -> None:
         self.audit = audit
         self.rps = float(rps)
-        self._min_interval = (1.0 / self.rps) if self.rps > 0 else 0.0
+        # v10.1 P2-7: throttle 原语提取为 engine/throttle.py 共享实现（reverify
+        # 同源复用），本类保留既有行为：per-host 间隔 ≥ 1/rps（含重定向每一跳）。
+        self._throttler = HostThrottle(rps=self.rps)
         self.max_file_bytes = int(max_file_bytes)
         self.timeout = float(timeout)
-        self._last_request: dict[str, float] = {}
         # 禁用环境代理：urllib 默认读 http_proxy/https_proxy，会把出站引流到
         # 未审计路径；本工具不允许。
         self.opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), _RedirectBlocker())
 
     def _throttle(self, host_key: str) -> None:
-        now = time.monotonic()
-        last = self._last_request.get(host_key)
-        if last is not None and self._min_interval > 0:
-            wait = self._min_interval - (now - last)
-            if wait > 0:
-                time.sleep(wait)
-                now = time.monotonic()
-        self._last_request[host_key] = now
+        self._throttler.throttle(host_key)
 
     def fetch(self, url: str, scope_gate, *, scope_label: str = "in") -> FetchOutcome:
         """GET 一个 URL；重定向逐跳手动跟随并逐跳过门。

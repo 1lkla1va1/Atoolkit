@@ -925,6 +925,168 @@ def _validate_chain(
         reasons.append("chain_feasible=true requires chain_assessment.status=proven")
 
 
+def _validate_replay(
+    finding: dict[str, Any], packets: list[dict[str, Any]], finding_dir: pathlib.Path,
+    run_base: pathlib.Path, reasons: list[str],
+) -> None:
+    """v10.1 verification.replay 段机器门（方案 §3.1）。
+
+    replay 段可选；存在时逐条强校验，任何一条不过即整包拒收（fail closed）。
+    marker 特异度门 + 原始 proof 响应命中 + 差分基线声明在此落死，重放执行
+    侧（engine/reverify.py）再做一次同门防御。
+    """
+    try:
+        from ..reverify import (
+            BODY_TRUNCATE_BYTES, IDEMPOTENT_METHODS, MARKER_PROBES,
+            REPLAY_KIND, marker_matches, probe_rejects,
+        )
+        from ..verify import IDEMPOTENT, extract_poc_from_file
+    except ImportError:  # pragma: no cover - standalone defensive fallback
+        from reverify import (  # type: ignore
+            BODY_TRUNCATE_BYTES, IDEMPOTENT_METHODS, MARKER_PROBES,
+            REPLAY_KIND, marker_matches, probe_rejects,
+        )
+        from verify import IDEMPOTENT, extract_poc_from_file  # type: ignore
+
+    verification = (
+        finding.get("verification") if isinstance(finding.get("verification"), dict) else {})
+    replay = verification.get("replay")
+    if replay is None:
+        return
+    label = "verification.replay"
+    if not isinstance(replay, dict):
+        reasons.append(f"{label} must be an object")
+        return
+    if str(replay.get("kind") or "") != REPLAY_KIND:
+        reasons.append(f"{label}.kind must be '{REPLAY_KIND}'")
+
+    # request_file：存在 + 可解析 + 幂等方法（非幂等 → 拒收，无例外）
+    request_file = str(replay.get("request_file") or "").strip()
+    if not request_file:
+        reasons.append(f"missing {label}.request_file")
+    else:
+        request_path = _exists(finding_dir, request_file, run_base, reasons,
+                               f"{label}.request_file")
+        if request_path is not None:
+            try:
+                request = extract_poc_from_file(request_path)
+            except OSError:
+                request = None
+            if request is None or not request.url:
+                reasons.append(f"{label}.request_file is not parseable as a request")
+            elif request.method.upper() not in IDEMPOTENT:
+                reasons.append(
+                    f"{label} only replays idempotent methods "
+                    f"{'/'.join(IDEMPOTENT_METHODS)}, got {request.method}")
+
+    # identity：必须存在于 identities.json；baseline 全类必填（默认 anon）且 ≠ identity
+    identities: dict[str, Any] = {}
+    identities_path = run_base / "identities.json"
+    if identities_path.is_file() and not identities_path.is_symlink():
+        try:
+            raw = json.loads(identities_path.read_text(encoding="utf-8"))
+            records = raw.get("identities") if isinstance(raw, dict) else raw
+            if isinstance(records, dict):
+                identities = records
+            elif isinstance(records, list):
+                identities = {
+                    str(row.get("label")): row.get("headers") or {}
+                    for row in records if isinstance(row, dict) and row.get("label")
+                }
+        except (OSError, ValueError, json.JSONDecodeError):
+            identities = {}
+    identity = str(replay.get("identity") or "").strip()
+    if not identity:
+        reasons.append(f"missing {label}.identity")
+    elif identity not in identities:
+        reasons.append(f"{label}.identity '{identity}' not present in identities.json")
+    baseline = replay.get("baseline_identity")
+    # 场景 6：baseline_identity 全类必填（缺省不静默默认）；显式值不在
+    # identities.json 时按空 auth（真匿名）处理——合法，不报错。
+    if baseline is None or not str(baseline).strip():
+        reasons.append(f"missing {label}.baseline_identity (all-class differential baseline)")
+        baseline_label = ""
+    else:
+        baseline_label = str(baseline).strip()
+    if baseline_label and baseline_label == identity:
+        reasons.append(f"{label}.baseline_identity must differ from identity")
+
+    # expectation
+    expectation = replay.get("expectation")
+    if not isinstance(expectation, dict):
+        reasons.append(f"missing {label}.expectation")
+        expectation = {}
+    status = expectation.get("status")
+    if not isinstance(status, int) or isinstance(status, bool) or status <= 0:
+        reasons.append(f"{label}.expectation.status must be a positive integer")
+    required_markers = expectation.get("required_markers")
+    if not isinstance(required_markers, list) or not [
+            str(m) for m in required_markers if str(m)]:
+        reasons.append(f"{label}.expectation.required_markers must be a non-empty list")
+        required_markers = []
+    absent_markers = expectation.get("absent_markers") or []
+    if not isinstance(absent_markers, list):
+        reasons.append(f"{label}.expectation.absent_markers must be a list")
+        absent_markers = []
+    markers = [str(m) for m in [*required_markers, *absent_markers] if str(m)]
+    for marker in markers:
+        try:
+            re.compile(marker)
+        except re.error as exc:
+            reasons.append(f"{label} marker {marker!r} is not a valid regex: {exc}")
+            continue
+        # 探针集拒绝：命中固定探针 = 恒真/弱模式（Gate-A P1-2）
+        if probe_rejects(marker):
+            reasons.append(
+                f"{label} marker {marker!r} matches a constant probe subject "
+                "(weak/always-true pattern)")
+            continue
+        # 去转义后字面长度 ≥ 4
+        literal = re.sub(r"\\[dDwWsSbBAZ]", "", marker).replace("\\", "")
+        literal = re.sub(r"[.*+?\[\]()|^${}]", "", literal)
+        if len(literal.strip()) < 4:
+            reasons.append(
+                f"{label} marker {marker!r} literal length < 4 after unescaping")
+    max_age = replay.get("max_age_hours", 72)
+    if not isinstance(max_age, (int, float)) or isinstance(max_age, bool) or max_age <= 0:
+        reasons.append(f"{label}.max_age_hours must be a positive number")
+    control_url = str(replay.get("control_url") or "").strip()
+    if control_url:
+        parsed_control = urlsplit(control_url)
+        if parsed_control.scheme not in {"http", "https"} or not parsed_control.netloc:
+            reasons.append(f"{label}.control_url must be an absolute http(s) URL")
+
+    # marker 必须命中原始 proof 响应（同口径 64KB 截断，Gate-A P2-1）
+    if markers and packets:
+        proof_bodies: list[str] = []
+        for packet in packets:
+            if not isinstance(packet, dict) or not packet.get("response_file"):
+                continue
+            response_path = _exists(
+                finding_dir, packet.get("response_file"), run_base, [],
+                f"{label}.proof_response")
+            if response_path is None:
+                continue
+            try:
+                proof_bodies.append(
+                    response_path.read_text(encoding="utf-8", errors="ignore")
+                    [:BODY_TRUNCATE_BYTES])
+            except OSError:
+                continue
+        if not proof_bodies:
+            reasons.append(f"{label} has no readable proof response to anchor markers")
+        else:
+            for marker in [str(m) for m in required_markers if str(m)]:
+                if not any(marker_matches(marker, body) for body in proof_bodies):
+                    reasons.append(
+                        f"{label} marker {marker!r} not found in any proof response")
+    elif markers and not packets:
+        reasons.append(f"{label} requires proof_packets to anchor markers")
+
+    # 变量规避未使用告警：MARKER_PROBES 经 probe_rejects 间接消费
+    _ = MARKER_PROBES
+
+
 def _validate_verification(
     finding: dict[str, Any], packets: list[dict[str, Any]], finding_dir: pathlib.Path,
     run_base: pathlib.Path, reasons: list[str],
@@ -1655,6 +1817,7 @@ def validate_finding(
     )
 
     _validate_verification(finding, packets, finding_dir, run_base, reasons)
+    _validate_replay(finding, packets, finding_dir, run_base, reasons)
     _validate_chain(finding, finding_dir, run_base, reasons)
     _validate_claims(finding, packets, finding_dir, run_base, reasons)
     demotions = _classify_phenomenon_demotions(
@@ -3719,12 +3882,16 @@ def validate_run_artifacts(
     source_run_dir: str | pathlib.Path | None = None,
     write_output: bool = True,
     write_sidecars: bool | None = None,
+    extra_sections: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Single library entry point used by both CLI and orchestrator.
 
     Sidecars follow the validation output only when that output is inside the
     run directory.  An external ``--output`` is diagnostic/read-only by
     default and cannot silently mutate the audited historical run.
+
+    v10.1: ``extra_sections``（如 checkpoint 升格链路的 ``reverify`` 段）在
+    ``validation_sha256`` 计算前并入结果——随自指摘要哈希覆盖（方案 §3.3）。
     """
     from .collect import collect_structured_findings
     try:
@@ -3943,6 +4110,11 @@ def validate_run_artifacts(
     # run-wide closure gate authoritative for both empty and non-empty runs.
     if canonical_count == 0:
         result["empty_gate"] = closure_gate
+    if extra_sections:
+        for name, value in extra_sections.items():
+            key = str(name or "").strip()
+            if key and key not in result:
+                result[key] = value
     result["validation_sha256"] = _canonical_digest(result)
     if write_output:
         output = pathlib.Path(output_path) if output_path else base / "finding_validation.json"

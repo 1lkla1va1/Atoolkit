@@ -1,5 +1,21 @@
 # Changelog
 
+## 10.1.0 - 2026-09-02
+
+- v10.1 跨 Run 复利解锁（证据复验信任根，IDE 无关；按 `design/迭代方案/迭代方案v10.1_跨Run复利解锁_证据复验信任根.md` v3 实施，Gate-A 三轮审核后批准）。
+- 新增 `engine/reverify.py` 复验执行器：finding 附 `verification.replay` 段（幂等回查请求 + 期望 marker + 全类差分基线声明），经 `engine/verify.py` 既有重放原语（零改动：`_guard` scope 门/幂等限制/Host 头一致性、`with_identity` 身份注入、`urllib_transport`）真实重放，四分类 match/mismatch/barrier/blocked；超时/5xx 恰好重试 1 次；403 细分（有同 host control_url 且对照可达 → mismatch，否则 barrier）、401 → barrier、scope 拒绝 → blocked（零请求）。复验证据落盘 `<project_dir>/sessions/<sid>/findings/<finding_id>/replay_<UTC毫秒>.http`（safe_io 原子写、0600、sha256 进当轮 reverify 段）。
+- `engine/throttle.py`：per-host 限速原语从 `recon/fetch.py` 提取共享（recon 改 import，行为不变；reverify 默认 1 rps）。
+- marker 特异度门（`reporting/validate.py` 新增 `_validate_replay`）：探针集恒真拒绝（`""/ok/success/true/status/200/error/null/{}`）+ 去转义字面长度 ≥4 + 必须命中原始 proof 响应（同 64KB 截断口径）+ `baseline_identity` 全类必填（缺省拒收，场景 6）且 ≠ identity；`identity` 必须在 `identities.json`；只放行幂等方法。normalize_finding 透传 replay 段。
+- `checkpoint --project-dir`（Direct 升格链路）：对本轮 guardian-accepted 且含 replay 段的 finding 执行复验 → 全 match 者连同 finding 包复制进 `<project_dir>/sessions/<sid>/findings/`（0600）→ 经 `ProjectStateStore.commit_run(trust_basis="evidence_reverified")` 入库；复验未过者逐条写进 `finding_validation.json` 新增 `reverify` 段（随 `validation_sha256` 自指哈希覆盖，`validate_run_artifacts` 新增 `extra_sections`）；commit delta 回显 + `root_findings` 增量 0 告警行（P2-b 可观测性）；重入安全：同 run_id 重跑按 finding 包内容比对（忽略 replay 证据文件）判幂等或 `commit_conflict`，不崩溃（Gate-A R2 P1-12）；commit 仅在当轮存在 ≥1 个新 match finding 时发生。`--project-dir` 缺省时 checkpoint 行为与现状逐字节一致。
+- `init --project-dir`（Direct 继承消费，Gate-A P1-6）：读取 project_state 中 `trust_basis=evidence_reverified` 的 confirmed cell → TTL（`max_age_hours`，默认 72h）内免复验直接继承，超 TTL 真实复验 → match 的 cell 以 `inherited` 标记注入 coverage-ledger（confirmed + `in_run_scope=False`，对齐 Engine `inherited_from_blackboard` 会计特判：不计入本轮已测分母，绕过冻结帽）并同步注入 inventory 行（P2-d）；mismatch → 不注入、记 revalidation_required；barrier → 不注入、保持 open。结果落盘 `state/inherited-reverify.json`。无 `--project-dir` 的 init 与现状逐字节一致。
+- 清除条件（Gate-A P1-3）：evidence 通道再入库命中 `revalidation_required` 记录时，须本轮 reverify=match **且** 差分基线重放不命中才清除；`revalidation_reason/conflicting_run` 禁 pop——追加进 `revalidation_history`（append-only，保留原值 + cleared_at/cleared_by_run/cleared_by），truth_conflict intent 仅条件满足时 completed 并追加 evidence_ref。
+- `finalize.py`：升格门 `project_truth_proof_pass = proof_pass and (authority_trusted or evidence_pass)`（新可选参数 `evidence_pass`，authority run 下显式 False，containment 通道逐字节不变）；commit 记录新增 `trust_basis`/`evidence_ref`/`last_reverified_at`（containment 通道记 `trust_basis=containment`，schema 3 追加字段，缺失=legacy）。
+- `orchestrator.py`：Engine 恢复路径对 `trust_basis=evidence_reverified` 的 confirmed cell 加 TTL 门（`_evidence_cell_within_ttl`）——TTL 内免复验继承，超 TTL fail-closed 为重测（不伪造 containment 语义）。
+- 信任分级如实声明（Gate-A P1-4）：evidence_reverified 在 Direct 下是**幻觉过滤器，不是完整性边界**（输入产物均在 agent 可写目录，自指 digest 防不了整体重写+重算）；只解锁跨 Run 记忆与跳测，不解锁 delivery/submission 资格。已写入 AGENTS.md（真相链 regen，root/codex 副本一致）与 reference（Finding 包结构节 replay 字段说明 + marker 写法指引 + request_file 剥离认证头指引）。
+- 新增 `tests/test_v101_reverify.py` 16 例（方案 §3.6 十三场景全覆盖 + §6.3 CLI 端到端/弱模式篡改拒收 + §6.4 authority_trusted 锚定 + §6.6 throttle 双方 import），本地 mock（transport 注入 + 127.0.0.1 靶端）零外网；锚定断言钉死 skill_runtime 新增 `authority_trusted` 字面量位于 `_promote_findings_to_project` 且带注释。全量 588 passed / 3 skipped（新增 16 例 + v10.0 期已落地的 secret_key_card 4 例）。
+- 实施偏差与已知限制（Gate-B 审核 MINOR-3/4/6 登记，方向均 fail-safe）：① Engine 恢复路径 evidence cell 超 TTL 直接 fail-closed 为重测，不在 orchestrator 内发起真实复验（无身份/预算管线，不伪造流量）；② Direct 继承 mismatch 只记进 run 侧 `state/inherited-reverify.json`，不回写 project cell（下一 Run 对同 cell 重复复验，预算内）；③ `finalize.evidence_pass` 分支为 Engine 侧未来接线点（当前无 caller、默认 False）；④ 复验预算口径为每命令调用 50 次（checkpoint 升格与 init 继承各 50，未跨命令合并）；⑤ containment 通道的 revalidation 字段由无条件 pop 改为保留（P1-3 禁 pop 全局化，保守方向，既有 v9.0 测试全绿）。
+- 版本对齐：v10.0 侦察采集器（`engine/recon/`，`skill_runtime recon` 子命令）已随前轮落地但未记 CHANGELOG/版本号，本条目起版本号追平至实际代码状态。
+
 ## 9.8.3 - 2026-08-31
 
 - AGENTS.md 二次瘦身（v3 源文件 416 → 264 行）：只留边界/纪律/报告标准。§0.0–0.4 引擎合同压缩为须知四条主线（细节移 reference「引擎合同附录」）；§5 测试信号门、§6 depth floor 细则/跨阶段重测族/数据预备/聚合缝隙、§3 假阴性陷阱与"不能为空"信号、§11 周期自检节奏移入 `skill/skillmode-reference.md`（新增「测试信号门」「depth floor 与阴性充分性」「测试速查（方法论）」「引擎合同附录」四节，529 → 641 行）；§7 决策树收敛为纯路由表（≤3.5KB 不变，指针逐一落点）。铁律、报告验证门七问、四终态标记、覆盖七状态、压缩锚点五"即写"等边界条款全部保留。

@@ -2663,6 +2663,32 @@ def _write_session_inventory(
     )
 
 
+def _evidence_cell_within_ttl(prior: dict, *, max_age_hours: float = 72.0) -> bool:
+    """v10.1 §3.4：evidence_reverified cell 的 TTL 检查（TTL 内免复验继承）。
+
+    Engine 恢复路径（_apply_project_cells）没有身份供给与复验预算管线，
+    超出 TTL 的 evidence cell 在此 fail-closed：不恢复跳测（重测方向），
+    不伪造 containment 语义。containment cell 不经过本检查（现状不变）。
+    """
+    from datetime import datetime, timezone as _tz
+
+    raw = str(prior.get("last_reverified_at") or "").strip()
+    if not raw:
+        return False
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            if fmt.endswith("%z"):
+                parsed = datetime.strptime(raw, fmt)
+            else:
+                parsed = datetime.strptime(raw, fmt).replace(tzinfo=_tz.utc)
+        except ValueError:
+            continue
+        age_hours = (datetime.now(_tz.utc) - parsed).total_seconds() / 3600.0
+        return 0.0 <= age_hours <= float(max_age_hours)
+    return False
+
+
 def _apply_project_cells(
     state: "CognitiveState", project_state: dict, primary_target: str,
     project_state_path: str = "project_state.json",
@@ -2695,6 +2721,11 @@ def _apply_project_cells(
             continue
         status = str(prior.get("status") or "")
         if status == "confirmed":
+            if str(prior.get("trust_basis") or "") == "evidence_reverified":
+                # v10.1 §3.4：evidence 通道 cell 用于跳测前必须继承复验
+                # match；TTL 内免复验直接继承，超 TTL fail-closed 为重测。
+                if not _evidence_cell_within_ttl(prior):
+                    continue
             cell.update({
                 "state": POSITIVE,
                 "reason": "inherited proof-confirmed exact project cell",

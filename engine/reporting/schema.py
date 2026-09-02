@@ -280,6 +280,11 @@ def normalize_finding(
     if isinstance(access_expectation, dict):
         for ref in access_expectation.get("proof_refs") or []:
             add_ref(ref)
+    # v10.1: replay 段原样透传（结构合法性由 validate._validate_replay 强校验）；
+    # checkpoint 升格链路据此定位回查请求与差分基线。
+    replay_section = (
+        verification.get("replay")
+        if isinstance(verification, dict) else None)
 
     role_values = finding_roles
     normalized_roles = _dedupe([
@@ -343,6 +348,9 @@ def normalize_finding(
         "threat_id": str(claim.get("threat_id") or finding.get("threat_id") or "").strip(),
         "source_candidate_id": claim.get("source_candidate_id", ""),
         "authorization_context": access_expectation,
+        "replay": (
+            dict(replay_section)
+            if isinstance(replay_section, dict) else None),
         "proven_impact_claims": proven_impacts,
         "chain_status": chain.get("status", "not_tested"),
         "chain_hypothesis": (
